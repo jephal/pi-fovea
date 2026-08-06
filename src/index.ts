@@ -139,7 +139,9 @@ export default function fovea(pi: ExtensionAPI) {
       return {
         content: [
           ...event.content,
-          text(`\n${result.text.replace(/^fovea focus/, "fovea graph")}`),
+          // No leading newline: consumers join content blocks with one, and
+          // native grep output already ends with one — one blank line total.
+          text(result.text.replace(/^fovea focus/, "fovea graph")),
         ],
         details: { ...details, backend: "hybrid", foveaAppended: true, query: pattern },
       };
