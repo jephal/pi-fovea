@@ -216,7 +216,7 @@ export default function fovea(pi: ExtensionAPI) {
       if (!cfg.sync.enabled) return;
       const outcome = await sync(
         ctx.cwd,
-        { files: [], budget: cfg.sync.budget, warmFileThreshold: cfg.sync.warmFileThreshold },
+        { files: [], budget: cfg.sync.budget, warmFileThreshold: cfg.sync.warmFileThreshold, pushFocus: cfg.sync.pushFocus },
         undefined,
         { probe: "cheap" },
       );
@@ -251,7 +251,7 @@ export default function fovea(pi: ExtensionAPI) {
       if (!cfg.sync.enabled) return;
       const outcome = await sync(
         ctx.cwd,
-        { files: rels, budget: cfg.sync.budget, warmFileThreshold: cfg.sync.warmFileThreshold },
+        { files: rels, budget: cfg.sync.budget, warmFileThreshold: cfg.sync.warmFileThreshold, pushFocus: cfg.sync.pushFocus },
         undefined,
         { probe: "cheap" },
       );

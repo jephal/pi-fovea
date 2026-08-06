@@ -129,7 +129,7 @@ Files over the size cap and extraction failures remain visible in `/fovea status
 
 Continuous sync is on by default. Before an agent starts, Fovea establishes its baseline or injects any out-of-band drift before the first model call. After every assistant turn it compares extracted symbols, calls, imports, literals, and anchors again. Content hashes keep the unchanged fast path cheap, while comment- and formatting-only edits do not wake the model.
 
-A meaningful change found before agent start is injected directly into that run. A post-turn route or dependency change is sent with `deliverAs: "steer"`; if the agent would otherwise settle, `triggerTurn` starts the continuation automatically. The compact update names directly changed files, route deltas, newly relevant files, causal channels such as calls, imports, shared literals, tests, or co-change history, and a suggested next focus probe so the update continues graph navigation. Clean turns remain silent unless `sync.ackClean` is enabled.
+A meaningful change found before agent start is injected directly into that run. A post-turn route or dependency change is sent with `deliverAs: "steer"`; if the agent would otherwise settle, `triggerTurn` starts the continuation automatically. The compact update names directly changed files, route deltas, newly relevant files, causal channels such as calls, imports, shared literals, tests, or co-change history, and—by default—the top drift target's refreshed focus context embedded inline (push). With `sync.pushFocus` off, the update ends in a suggested next focus probe instead (pull). Clean turns remain silent unless `sync.ackClean` is enabled.
 
 Runtime controls:
 
@@ -154,6 +154,7 @@ Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override 
 | `sync.budget` | `1024` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.warmFileThreshold` | `2` | newly relevant files that justify proactive model steering |
+| `sync.pushFocus` | `true` | embed a budgeted focus preview of the top drift target in red syncs |
 | `tools.defaultBudget` | `2000` | fallback maxTokens for the fovea_* tools |
 | `tools.replaceGrep` | `true` | install hybrid native-text / bare-query graph grep |
 

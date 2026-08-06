@@ -94,11 +94,77 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     expect(outcome.text).toContain("Changed: server/users.go");
     expect(outcome.text).toContain("Newly relevant files:");
     expect(outcome.text).toContain("Steer: account for this update");
-    expect(outcome.text).toContain('Next: fovea_focus "server/users.go" to see what it now connects to.');
+    expect(outcome.text).toContain('fovea focus "server/users.go"');
+    expect(outcome.text).not.toContain("Next:");
+    expect(outcome.details.pushedFocus).toBe("server/users.go");
     expect(outcome.text).not.toContain("undisclosed");
     expect(outcome.text).not.toMatch(/ · v [a-f0-9]+/);
     expect(outcome.details.semanticChangedFiles).toContain("server/users.go");
     expect(outcome.details.warmReasons).toBeTruthy();
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+  });
+
+  it("pull mode keeps the Next advisory instead of embedding focus", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1, pushFocus: false });
+    const users = join(root, "server/users.go");
+    const src = readFileSync(users, "utf8");
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1, pushFocus: false });
+    expect(outcome.red).toBe(true);
+    expect(outcome.text).toContain('Next: fovea_focus "server/users.go" to see what it now connects to.');
+    expect(outcome.text).not.toContain('fovea focus "server/users.go"');
+    expect(outcome.details.pushedFocus).toBeUndefined();
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1, pushFocus: false });
+  });
+
+  it("embeds focus detail once per drift target", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    const users = join(root, "server/users.go");
+    const src = readFileSync(users, "utf8");
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    rmSync(join(root, "web/types.ts"));
+    const first = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(first.red).toBe(true);
+    expect(first.text).toContain('fovea focus "server/users.go"');
+    expect(first.details.pushedFocus).toBe("server/users.go");
+    execSync("git checkout -- web/types.ts", { cwd: root });
+    writeFileSync(users, readFileSync(users, "utf8").replace("return SaveUser(id)", "return LoadUser(id)"));
+    rmSync(join(root, "pages/api/health.ts"));
+    const second = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(second.red).toBe(true);
+    expect(second.text).not.toContain('fovea focus "server/users.go"');
+    expect(second.text).toContain('Next: fovea_focus "server/users.go"');
+    expect(second.details.pushedFocus).toBeUndefined();
+    execSync("git checkout -- server/users.go pages/api/health.ts", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+  });
+
+  it("follows the worktree when a dirty file returns to porcelain-clean", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    const users = join(root, "server/users.go");
+    const base = await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    const pristineVersion = String(base.details.version);
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    const dirty = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(dirty.red).toBe(true);
+    expect(dirty.details.version).not.toBe(pristineVersion);
+    execSync("git checkout -- server/users.go", { cwd: root });
+    const restored = await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    expect(restored.details.version).toBe(pristineVersion);
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    const again = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(again.structural).toBe(true);
+    expect(again.details.semanticChangedFiles).toContain("server/users.go");
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
     await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
@@ -147,7 +213,8 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     rmSync(join(root, "web/types.ts"));
     const outcome = await sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
     expect(outcome.red).toBe(true);
-    expect(outcome.text).toContain("1 deleted file");
+    expect(outcome.text).toContain("deleted web/types.ts");
+    expect(outcome.text).not.toContain("Next:");
     expect(outcome.details.deletedFiles).toContain("web/types.ts");
     execSync("git checkout -- web/types.ts", { cwd: root });
     resetSyncBaselines();

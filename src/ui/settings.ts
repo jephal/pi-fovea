@@ -254,6 +254,11 @@ const buildItems = (
       "How many newly relevant files justify steering the model. Higher means fewer continuations; route changes always steer.",
     submenu: numericSubmenu(theme, THRESHOLDS, "Relevance threshold", "Newly relevant file count that steers the model."),
   }),
+  setting("sync.pushFocus", "Push focus detail", config.sync.pushFocus ? "true" : "false", {
+    description:
+      "Embed a budgeted focus preview of the top drift target in red sync messages so no extra probe turn is needed. Off keeps the Next: advisory. Default on.",
+    values: BOOLEANS,
+  }),
   setting("tools.replaceGrep", "Hybrid grep", config.tools.replaceGrep ? "true" : "false", {
     description:
       "Preserve native grep for scoped/regex/text searches and use Fovea only for bare symbol queries. Default on; changing it reloads extensions.",

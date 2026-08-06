@@ -17,6 +17,9 @@ interface FoveaSyncConfig {
   ackClean: boolean;
   /** Number of newly relevant files that justifies proactive steering on its own. */
   warmFileThreshold: number;
+  /** Push (default): red syncs embed a budgeted focus preview of the top drift
+   * target. Pull: the update ends in a Next: advisory the model may follow. */
+  pushFocus: boolean;
 }
 
 interface FoveaToolsConfig {
@@ -37,6 +40,7 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
     budget: 1024,
     ackClean: false,
     warmFileThreshold: 2,
+    pushFocus: true,
   },
   tools: {
     defaultBudget: 2000,
@@ -89,6 +93,7 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
       budget: intValue("sync.budget", sync.budget, base.sync.budget),
       ackClean: boolValue(sync.ackClean, base.sync.ackClean),
       warmFileThreshold: intValue("sync.warmFileThreshold", sync.warmFileThreshold, base.sync.warmFileThreshold),
+      pushFocus: boolValue(sync.pushFocus, base.sync.pushFocus),
     },
     tools: {
       defaultBudget: intValue("tools.defaultBudget", tools.defaultBudget, base.tools.defaultBudget),

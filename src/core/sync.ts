@@ -12,7 +12,7 @@
 // and /fovea reset alongside focus sessions.
 
 import { ROOT_CACHE_LIMIT, forEachChunked } from "./asyncutil.js";
-import { ensureState, ensureStateBackground, getInflight, getState, impact, isTestScope } from "./ops.js";
+import { ensureState, ensureStateBackground, focus, getInflight, getState, impact, isTestScope } from "./ops.js";
 import type { RepoState } from "./ops.js";
 import { getSession } from "./session.js";
 
@@ -25,6 +25,8 @@ interface SyncBaseline {
   semantics: Map<string, string>;
   /** Previously reported undisclosed warmth, for delta delivery. */
   warmed?: Set<string>;
+  /** Drift targets already push-embedded in this baseline chain (embed-once). */
+  pushed?: Set<string>;
 }
 
 const baselines = new Map<string, SyncBaseline>();
@@ -50,6 +52,8 @@ export interface SyncParams {
   files?: string[];
   budget: number;
   warmFileThreshold: number;
+  /** Push vs pull (default push): embed the top file target's focus context. */
+  pushFocus?: boolean;
 }
 
 export interface SyncOutcome {
@@ -168,7 +172,8 @@ export const sync = async (
       : [...warmNow].filter((file) => !prev.warmed!.has(file));
   }
 
-  setBaseline(root, { ...(await snapshot(state)), warmed: warmNow });
+  const pushed = new Set(prev.pushed ?? []);
+  setBaseline(root, { ...(await snapshot(state)), warmed: warmNow, pushed });
 
   // Extraction failures leave fact gaps that look like anchor *removals* —
   // never escalate red on removals while degraded; the degraded note is
@@ -196,7 +201,7 @@ export const sync = async (
   const changedSummary = files.length
     ? `${files.slice(0, 4).join(", ")}${files.length > 4 ? ` (+${files.length - 4} more)` : ""}`
     : deleted.length
-      ? `${deleted.length} deleted file${deleted.length === 1 ? "" : "s"}`
+      ? `deleted ${deleted.slice(0, 4).join(", ")}${deleted.length > 4 ? ` (+${deleted.length - 4} more)` : ""}`
       : "route structure";
   const orderedWarm = [...warmNew].sort((a, b) =>
     Number(isTestScope(a)) - Number(isTestScope(b)) || a.localeCompare(b));
@@ -207,23 +212,48 @@ export const sync = async (
   for (const id of added.filter((anchor) => !newlyImplicit.includes(anchor)).slice(0, 6)) {
     lines.push(`Route added: ${id}`);
   }
-  for (const id of removed.slice(0, 6)) lines.push(`Route removed: ${id}`);
+  // Degraded removals are suspect (extraction gaps look like removals); the
+  // escalation gate already distrusts them, so the message does too.
+  if (!degraded) for (const id of removed.slice(0, 6)) lines.push(`Route removed: ${id}`);
   if (orderedWarm.length) {
     lines.push("Newly relevant files:");
     for (const file of orderedWarm.slice(0, 8)) {
       lines.push(`  ${file} — ${(warmReasons[file] ?? ["graph path"]).join(", ")}`);
     }
   }
-  // Hand the model a next probe, not just a verdict: point focus at the
-  // most consequential consequence of the drift (new route > changed file >
-  // newly warm file), so the update continues graph navigation.
+  // Push vs pull on the consequence probe. A file target gets its refreshed
+  // focus context embedded inline (the embed discloses it, so any follow-up
+  // probe is a session delta and nearly free); each target embeds at most
+  // once per baseline chain. Route targets keep the advisory pending route
+  // fuzzy-match quality, and the no-target case stays verdict-only. Pull
+  // mode renders the advisory unconditionally.
   const focusTarget = added.find((id) => !newlyImplicit.includes(id))?.replace(/^\w+\s+(?=\/)/, "")
     ?? files[0]
     ?? orderedWarm[0];
-  lines.push(focusTarget
-    ? `Next: fovea_focus ${JSON.stringify(focusTarget)} to see what it now connects to.`
-    : "Next: fovea_sketch for the updated silhouette.");
-  lines.push("Steer: account for this update before continuing.");
+  const pushFocus = params.pushFocus !== false;
+  const steerLine = "Steer: account for this update before continuing.";
+  let embedded = false;
+  if (pushFocus && focusTarget && focusTarget in state.facts && !pushed.has(focusTarget)) {
+    const detailBudget = params.budget - Math.ceil([...lines, steerLine].join("\n").length / 4);
+    if (detailBudget >= 128) {
+      try {
+        const detail = await focus(root, focusTarget, detailBudget);
+        if (detail.text.trim()) {
+          lines.push(...detail.text.split("\n"));
+          pushed.add(focusTarget);
+          embedded = true;
+        }
+      } catch {
+        // Focus is best-effort context; fall through to the advisory.
+      }
+    }
+  }
+  if (!embedded && (!pushFocus || focusTarget)) {
+    lines.push(focusTarget
+      ? `Next: fovea_focus ${JSON.stringify(focusTarget)} to see what it now connects to.`
+      : "Next: fovea_sketch for the updated silhouette.");
+  }
+  lines.push(steerLine);
   while (lines.length > 3 && Math.ceil(lines.join("\n").length / 4) > params.budget) {
     lines.splice(lines.length - 2, 1);
   }
@@ -239,6 +269,7 @@ export const sync = async (
       warmNew: orderedWarm,
       warmReasons,
       deletedFiles: deleted,
+      ...(embedded ? { pushedFocus: focusTarget } : {}),
       ...(degraded ? { extractionDegraded: true } : {}),
     },
   };

@@ -36,7 +36,7 @@ describe("Fovea settings", () => {
             () => resolve(),
           );
           expect(component.render(100).join("\n")).toContain("Hybrid grep");
-          for (let index = 0; index < 4; index++) component.handleInput("\u001b[B");
+          for (let index = 0; index < 5; index++) component.handleInput("\u001b[B");
           component.handleInput("\r");
           component.handleInput("\u001b");
         }),

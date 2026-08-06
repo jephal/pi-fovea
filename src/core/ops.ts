@@ -5,7 +5,7 @@
 
 import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
-import { posix } from "node:path";
+import { join, posix } from "node:path";
 import { hasAstGrepAsync } from "./astgrep.js";
 import {
   assembleGraphWithIndex,
@@ -55,6 +55,11 @@ export interface RepoState {
   probedAt: number;
   walkedAt: number;
   sweptAt: number;
+  /** Porcelain-dirty paths at last probe. Porcelain diffs the worktree against
+   * HEAD, but facts track the last seen worktree: a file reverting to
+   * porcelain-clean with unmoved HEAD would otherwise keep serving its dirty
+   * facts until the next edit. */
+  dirty: Set<string>;
 }
 
 // State lifecycle: background builds, probe-gated refreshes, LRU eviction.
@@ -126,6 +131,7 @@ const assembleState = async (
   extraction: ExtractionReport,
   gitKind: "git" | "plain",
   head: string | undefined,
+  dirty: Set<string>,
 ): Promise<RepoState> => {
   // Snapshot the generation: refresh replaces fact records wholesale, so the
   // Record view stays a stable witness for baselines (sync).
@@ -148,7 +154,7 @@ const assembleState = async (
     list.sort((a, b) => Number(a.kind === "contains") - Number(b.kind === "contains") || b.w - a.w || a.to - b.to);
   }
   const stamp = Date.now();
-  return { root, version, graph, csr, joinIndex, facts, extraction, adjacency, store, files, gitKind, head, probedAt: stamp, walkedAt: stamp, sweptAt: stamp };
+  return { root, version, graph, csr, joinIndex, facts, extraction, adjacency, store, files, gitKind, head, dirty, probedAt: stamp, walkedAt: stamp, sweptAt: stamp };
 };
 
 const buildState = async (root: string): Promise<RepoState> => {
@@ -163,7 +169,8 @@ const buildState = async (root: string): Promise<RepoState> => {
   const gitKind: RepoState["gitKind"] = probe ? "git" : "plain";
   const files = await listFiles(root, routeRes);
   const { store, report } = await factPass(() => loadFacts(root, files));
-  return assembleState(root, files, store, report, gitKind, probe?.head);
+  return assembleState(root, files, store, report, gitKind, probe?.head,
+    new Set(probe ? probe.changes.map((c) => c.path).filter((p) => p && !p.endsWith("/")) : []));
 };
 
 const refreshState = async (state: RepoState, hints: string[] = [], force = false): Promise<RepoState> => {
@@ -205,6 +212,25 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
           }
         }
       }
+      const nowDirty = new Set(
+        probe.changes.map((c) => c.path).filter((p) => p && !p.endsWith("/")),
+      );
+      if (!headMoved && !needsList) {
+        // Porcelain-clean with unmoved HEAD hides reverts: a previously dirty
+        // file vanishes from the probe while its captured facts stay dirty.
+        // Resurrect it once so the snapshot follows the worktree (covers
+        // checkout/restore and untracked files that disappear).
+        for (const p of state.dirty) {
+          if (nowDirty.has(p)) continue;
+          // stat is the arbiter: a restored file whose facts were dropped
+          // with the deletion must come back through changed, not sit
+          // deleted until its next porcelain-visible edit.
+          const onDisk = await stat(join(state.root, p)).then((s) => s.isFile(), () => false);
+          if (onDisk) changed.push(p);
+          else if (store.facts.has(p) || store.failedSha.has(p)) deleted.push(p);
+        }
+      }
+      state.dirty = nowDirty;
     } else {
       // .git vanished (moved/renamed out from under us): degrade to plain.
       state.gitKind = "plain";
@@ -237,7 +263,7 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
     state.files = files;
     return state;
   }
-  const fresh = await assembleState(state.root, files, store, report, state.gitKind, state.head);
+  const fresh = await assembleState(state.root, files, store, report, state.gitKind, state.head, state.dirty);
   states.set(state.root, fresh);
   return fresh;
 };
