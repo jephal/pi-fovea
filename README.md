@@ -17,7 +17,12 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 </div>
 
-pi-fovea hands the model a map of your repo on every prompt. The repo compiles once into a code graph across languages, where symbols, files, and route anchors join into one network. Each question becomes an interest vector that diffuses over the graph as heat. The renderer converts the field into a token-capped view: exact source locations and full signatures near your task, typed one-hop relationships next, and a skeleton of the rest.
+pi-fovea gives the model a map of your repo on every prompt. The repo compiles
+once into a cross-language graph of code. Symbols, files, and route anchors
+share one network. Your question becomes an interest vector that diffuses
+through the graph as heat. The renderer caps the field inside a token budget.
+Near the question you get exact source locations and full signatures. One hop
+out you get typed relationships. Past that the repo collapses to a skeleton.
 
 When a session starts, Fovea records a baseline of the repo. If files
 changed while Pi was idle, those changes enter context before the first model
@@ -39,13 +44,12 @@ their own tools.
 
 ## When not to reach for fovea
 
-A map costs more than the territory when the territory is small: on repos of a
-few dozen files, reading the files directly beats sketching them. Fovea pays
-for itself when the working set exceeds context — cross-language monorepos,
-unfamiliar long-lived codebases, routes woven through config and client code.
-It narrows **what** you read to the suggested windows; it does not replace
-reading them, the project's own format/lint/typecheck/test commands, or CI as
-the final verification layer.
+Skip Fovea on small repos. A repo of a few dozen files reads faster than it
+sketches. Fovea earns its cost when the working set outgrows the context
+window. Cross-language monorepos hit that wall early. A long-lived codebase you
+have never opened hits it too. Fovea narrows your reading to suggested windows.
+Open those windows yourself, and keep the project's format, lint, typecheck,
+and test commands in your loop. CI has the final say.
 
 ## What the model gets
 
@@ -57,9 +61,19 @@ the final verification layer.
 | `fovea_impact` | what does this touch? | warms everything a file, symbol, or PR base reaches across languages |
 | `grep` *(default hybrid)* | graph or text? | bare identifiers, qualified symbols, repo paths, and routes use Fovea; search options and obvious regex retain native grep |
 
-Focus normalizes camelCase and common inflections, so an approximate name such as `switchServer` can resolve `switchingServers`. If a query is still uncertain, Fovea returns nearby symbols with locations instead of a dead miss. Direct graph edges are labeled (caller, callee, route, shared literal, co-change), while unrelated same-file siblings remain collapsed.
+Focus normalizes camelCase and common inflections. An approximate name such as
+`switchServer` can still resolve `switchingServers`. A query with no certain
+match returns the nearest symbols plus their locations. Direct graph edges
+carry labels such as caller, callee, route, shared literal, and co-change.
+Symbols that merely share a file stay collapsed.
 
-The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`, `grep({ pattern: "Controller.create" })`, and route paths can navigate the graph. Calls with text-search options and obvious regexes delegate to Pi's native grep unchanged; a graph miss falls back to native text, and a graph error (for example a broken ast-grep) degrades the same way with a one-line note marking the result as native. Disable the toggle for a purely native slot. Changing it reloads extensions so Pi and pi-fabric capture the same behavior.
+The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`,
+`grep({ pattern: "Controller.create" })`, and route paths travel through the
+graph. Calls that carry text-search options or obvious regexes go to Pi's
+native grep. A graph miss falls back to native text. A graph error, such as a
+broken ast-grep, falls back the same way and adds a one-line note marking the
+result as native. Turn the toggle off to recover a purely native grep. A toggle
+change reloads extensions, so Pi and pi-fabric capture the same behavior.
 
 ### pi-fabric
 
@@ -78,7 +92,8 @@ if (!action) return "Fovea is not captured";
 return tools.call({ ref: action.ref, args: { query: "CreateUserHandler" } });
 ```
 
-The stable explicit ref is `extensions.fovea_focus`, not bare `fovea_focus` or `fovea.fovea_focus`.
+The stable explicit ref is `extensions.fovea_focus`. The bare forms
+`fovea_focus` and `fovea.fovea_focus` will miss.
 
 Runtime slash controls:
 
@@ -127,9 +142,15 @@ fovea status /path/to/repo
 
 ## Large workspaces and startup
 
-Indexing is kicked into the background at `session_start`; submitting the first prompt never waits for ast-grep, hashing, or graph assembly. A cold sync hook reports indexing while the shared build continues, and later calls reuse it.
+Indexing runs in the background at `session_start`. Your first prompt never
+waits for ast-grep, hashing, or graph assembly. A cold sync hook reports the
+progress. Later calls reuse the same shared build.
 
-A non-Git umbrella directory treats every nested `.git` directory or worktree marker as a project boundary, so a folder of clones is not merged into one graph. Cold work is additionally bounded by streamed JSONL cache I/O, 64-file extraction batches, adaptive ast-grep chunk splitting, a two-root resident LRU, and these environment overrides:
+A non-Git umbrella directory treats each nested `.git` directory or worktree
+marker as a project boundary. A folder of clones becomes many separate graphs.
+Cold runs stay bounded through streamed JSONL cache I/O, 64-file extraction
+batches, adaptive ast-grep chunk splitting, and a two-root resident LRU. The
+limits accept environment overrides:
 
 | Variable | Default | Meaning |
 | --- | :---: | --- |
@@ -139,20 +160,34 @@ A non-Git umbrella directory treats every nested `.git` directory or worktree ma
 | `FOVEA_SPAWN_CONCURRENCY` | `3` | concurrent ast-grep/git child processes |
 | `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
 
-Files over the size cap and extraction failures remain visible in `/fovea status` and tool details instead of silently thinning the graph.
+Files over the size cap keep their place in the model's view of the repo.
+Failed extractions do the same. You find both in `/fovea status` and in tool
+details.
 
 ## Turn sync
 
-Continuous sync is on by default. Before an agent starts, Fovea establishes its baseline or injects any out-of-band drift before the first model call. After every assistant turn it compares extracted symbols, calls, imports, literals, and anchors again. Content hashes keep the unchanged fast path cheap, while comment- and formatting-only edits do not wake the model.
+Continuous sync is on by default. Before an agent starts, Fovea establishes its
+baseline or injects any outside drift ahead of the first model call. After
+every assistant turn it compares symbols, calls, imports, literals, and anchors
+again. Content hashes keep the unchanged fast path cheap. Edits that touch only
+comments or formatting raise no signal.
 
-A meaningful change found before agent start is injected directly into that run. A post-turn route or dependency change is sent with `deliverAs: "steer"`; if the agent would otherwise settle, `triggerTurn` starts the continuation automatically. The compact update names directly changed files, route deltas, newly relevant files, causal channels such as calls, imports, shared literals, tests, or co-change history, and—by default—the top drift target's refreshed focus context embedded inline (push). With `sync.pushFocus` off, the update ends in a suggested next focus probe instead (pull). Clean turns remain silent unless `sync.ackClean` is enabled.
+A meaningful change found before agent start lands inside that run's context. A
+post-turn route or dependency change ships with `deliverAs: "steer"`. When the
+agent is about to settle, `triggerTurn` starts the continuation. The compact
+update names the changed files, the route deltas, and the newly relevant files.
+It lists the causal channels behind each link: calls, imports, shared literals,
+tests, or co-change history. By default it also embeds the refreshed focus
+context of the top drift target (push). With `sync.pushFocus` off, the update
+ends with a suggested focus probe for the next call (pull). Clean turns stay
+silent. Enable `sync.ackClean` if you want an ack for those.
 
 Runtime controls:
 
-- `/fovea status` — loaded package/ast-grep versions, indexed coverage, anchor scopes, sync and grep modes.
-- `/fovea reset` — clear focus disclosure/depth and establish a fresh sync baseline.
-- `/fovea reload` — hot-reload extensions and activate newly installed source.
-- `/fovea settings` — configure sync, budgets, and hybrid grep.
+- `/fovea status`: loaded package and ast-grep versions, indexed coverage, anchor scopes, sync and grep modes
+- `/fovea reset`: clear focus disclosure and depth, then establish a fresh sync baseline
+- `/fovea reload`: hot-reload extensions and activate newly installed source
+- `/fovea settings`: configure sync, budgets, and hybrid grep
 
 Turn sync off per repo or globally through settings, or with:
 
@@ -162,7 +197,9 @@ FOVEA_TURN_SYNC=off pi
 
 ## Configuration
 
-Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override sits in `<repo>/.pi/fovea.json`. Two scopes, the same model pi-fabric uses with `fabric.json`.
+Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override
+sits in `<repo>/.pi/fovea.json`. These are the same two scopes pi-fabric uses
+with `fabric.json`.
 
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
@@ -176,7 +213,8 @@ Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override 
 
 ## How routes are found
 
-Route anchors come from port shapes, and five shapes cover almost the whole ecosystem:
+Route anchors come from five port shapes. Together they cover most of the
+ecosystem:
 
 | Port shape | Examples |
 |---|---|
@@ -186,11 +224,19 @@ Route anchors come from port shapes, and five shapes cover almost the whole ecos
 | verb as first string argument | chi `r.Method("GET", path, h)`, aiohttp `router.add_route("GET", path, h)` |
 | receiver-less DSL macros | Rails `routes.rb`, Phoenix `router.ex`, Django `path()`, Ktor `routing { get("/x") {} }` |
 
-File-convention routers declare paths nowhere in code. Next.js App Router, Pages Router, SvelteKit, Nuxt, and Astro anchors therefore derive from file paths, with the verb read off exported handler names or filename suffixes.
+File-convention routers keep their paths in the file tree. Next.js App Router,
+Pages Router, SvelteKit, Nuxt, and Astro work this way. Fovea derives their
+anchors from file paths. The verb comes from exported handler names or filename
+suffixes.
 
 ### Discovery mode
 
-When a repo writes routes in a shape fovea has never seen, the literal pass harvests every call shape and promotes statistically solid ones into implicit rules. Discovered anchors carry half the conductance of declared ones and appear with a `△` sigil. Turn sync reports their churn without letting an unconfirmed hypothesis turn the verdict red. A hub upgrades to first-class the moment a known rule matches any of its sites.
+A repo may write routes in a shape fovea has never seen. The literal pass
+harvests every call shape in it. Shapes with solid statistics get promoted into
+implicit rules. A discovered anchor carries half the conductance of a declared
+one and shows a `△` sigil. Turn sync reports the churn. An unconfirmed
+hypothesis cannot turn the verdict red. Once a known rule matches any site of a
+hub, that hub upgrades to first-class.
 
 ```sh
 fovea anchors <root> --discovered   # the △ hypothesis hubs only
@@ -209,37 +255,63 @@ fovea rules <root> --adopt          # persist promotions into .fovea/rules.json
 }
 ```
 
-A rule may declare `prefixPattern` so a class-level prefix like `@Controller('api/airports')` composes with per-method paths. Changing the rules file invalidates the anchor extraction cache alone; parsed facts above it carry over.
+A rule may declare `prefixPattern`. A class-level prefix such as
+`@Controller('api/airports')` then composes with per-method paths. A change to
+the rules file invalidates the anchor extraction cache. The parsed facts above
+the cache carry over.
 
-**Blind spots**, logged in `src/core/anchors.ts`: Rust proc-macro attributes (actix `#[get("/x")]`), constructor-assigned prefixes (Flask Blueprint, FastAPI `APIRouter(prefix=…)`, chi `Mount`, Express `Router` mounts), `scope` and `namespace` nesting in Phoenix, Rails, or Django `include()`, and tRPC/GraphQL/gRPC (no path token exists to anchor on).
+**Blind spots** are logged in `src/core/anchors.ts`. The current list covers
+Rust proc-macro attributes (actix `#[get("/x")]`), constructor-assigned
+prefixes (Flask Blueprint, FastAPI `APIRouter(prefix=…)`, chi `Mount`, Express
+`Router` mounts), `scope` and `namespace` nesting in Phoenix, Rails, or Django
+`include()`, and tRPC, GraphQL, and gRPC, whose call sites carry no path token
+to anchor on.
 
 ## How it works
 
-The repo compiles to a typed graph. Your question is a source vector $s$ over its nodes, and the field the model receives is the heat kernel at time $t$ over the Laplacian $L$:
+The repo compiles to a typed graph. Your question becomes a source vector $s$
+over the nodes. The field the model receives is the heat kernel at time $t$
+over the Laplacian $L$:
 
 $$
 v(t) = e^{-tL} \cdot s \quad \text{with} \quad L = I - D^{-1/2} W D^{-1/2}
 $$
 
-The four tools are the same operator at four timescales: sketch at $t=16$ with production hub and anchor seeds, focus at $t=2$ with your query as seed, dwell doubling $t$ within that focus, and impact using changed files as seeds. Changing focus resets to the sharp timescale and its own disclosure scope.
+The four tools run one operator at four timescales. Sketch runs at $t=16$ with
+production hubs and anchors as seeds. Focus drops to $t=2$, seeded by your
+query. Dwell doubles $t$ inside the current focus. Impact takes changed files
+as its seed. A change of focus resets the sharp timescale and the disclosure
+scope.
 
-The kernel is evaluated with a Chebyshev expansion. Rescale $M = L - I$ so the spectrum sits in $[-1,1]$; then with $T_k$ the Chebyshev polynomials and $I_k$ the modified Bessel functions:
+A Chebyshev expansion evaluates the kernel. Rescale $M = L - I$ so the spectrum
+sits in $[-1,1]$. With $T_k$ as the Chebyshev polynomials and $I_k$ as the
+modified Bessel functions:
 
 $$
 e^{-tL} = e^{-t} \left[ I_0(t) T_0(M) + 2 \sum_{k\ge 1} (-1)^k I_k(t) T_k(M) \right]
 $$
 
-The vectors $T_k(M) s$ are cached in the session. A new timescale costs coefficient recombination, never a second graph walk.
+The vectors $T_k(M) s$ stay cached in the session. A new timescale reuses those
+vectors and pays only for fresh coefficients. The graph walk happens once.
 
-Discovery asks how often the argument at one slot of one call shape carries a route path, and promotes the shape past a Jeffreys-smoothed posterior:
+Discovery measures how often the argument at one slot of a call shape carries a
+route path. Shapes earn promotion past a Jeffreys-smoothed posterior:
 
 $$
 \hat{p} = \frac{\mathrm{pathN} + \frac{1}{2}}{\mathrm{n} + 1} \ge 0.55 \quad \text{with} \quad \mathrm{n} \ge 4 \text{ sites and} \ge 2 \text{ files}
 $$
 
-Measured against eight cloned projects, corpus junk sits below $\hat{p} \approx 0.27$ and real route shapes above $\hat{p} \approx 0.75$. The cutoff stays mid-cliff regardless of repo size.
+Tests on eight cloned projects put corpus junk below $\hat{p} \approx 0.27$.
+Real route shapes land above $\hat{p} \approx 0.75$. The cutoff sits mid-cliff
+at any repo size.
 
-Lineage: spectral-graph wavelets evaluated by shared Chebyshev recurrence, progressive image coding where the budget is a bitrate over significance-ordered coefficients, and foveated rendering. Aider's PageRank repo map is the fixed-timescale special case of this field. The full walkthrough of conductance tiers, specificity bridges, hub gravity, and inferred regions lives in [docs/heat-diffusion.md](docs/heat-diffusion.md).
+The method draws on spectral-graph wavelets evaluated by shared Chebyshev
+recurrence. Progressive image coding contributes the budget-as-bitrate view
+over significance-ordered coefficients. Foveated rendering supplies the sharp
+center and the coarse rim. Aider's PageRank repo map is the fixed-timescale
+special case of this field. [docs/heat-diffusion.md](docs/heat-diffusion.md)
+walks through conductance tiers, specificity bridges, hub gravity, and inferred
+regions.
 
 ## Languages
 
@@ -255,7 +327,12 @@ pnpm run check        # typecheck + full vitest suite
 pnpm run bench        # rate–distortion bench against ../pi-fabric
 ```
 
-pi loads the extension straight from `src/` via jiti; there is no build step. Per-repo JSONL caches live in `$TMPDIR` behind per-file content sha1 + stat manifests. Cache I/O is streamed, only dirty files re-run ast-grep, and unchanged extraction failures retain fact-free hash markers so they stay visible without being retried every launch. Bump `CACHE_VERSION` in `src/core/build.ts` whenever extractor semantics change.
+pi loads the extension straight from `src/` through jiti, so nothing needs
+building. Per-repo JSONL caches live in `$TMPDIR`, guarded by per-file content
+sha1 values and stat manifests. Cache I/O streams. Only dirty files re-run
+ast-grep. Failed extractions keep fact-free hash markers that stay visible
+across launches. Those files skip the retry on each start. Bump `CACHE_VERSION`
+in `src/core/build.ts` whenever extractor semantics change.
 
 ## Acknowledgments
 
