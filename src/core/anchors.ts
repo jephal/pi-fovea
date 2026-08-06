@@ -31,6 +31,15 @@ export const DEFAULT_PACK: AnchorRule[] = [
     kind: "route",
   },
   {
+    // Single-arg verb call: axios.get("/me") — client call sites only become
+    // feature hubs when they reference a real path (validated below).
+    id: "http-verb-single-arg",
+    langs: ["TypeScript", "Tsx", "JavaScript"],
+    pattern: '$R.$M("$P")',
+    methods: "^(?i:get|post|put|delete|patch)$",
+    kind: "route",
+  },
+  {
     id: "http-route-call-singlequote",
     langs: ["TypeScript", "Tsx", "JavaScript"],
     pattern: "$R.$M('$P', $$$H)",

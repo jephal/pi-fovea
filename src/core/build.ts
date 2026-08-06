@@ -102,7 +102,8 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
     cached = undefined;
   }
   const { pack: anchorPack, sha: rulesSha } = loadRepoRules(root);
-  if (cached && (cached.version !== CACHE_VERSION || cached.root !== root || cached.rulesSha !== rulesSha)) cached = undefined;
+  const rulesChanged = cached !== undefined && cached.rulesSha !== rulesSha;
+  if (cached && (cached.version !== CACHE_VERSION || cached.root !== root)) cached = undefined;
   const facts: Record<string, FileFacts> = {};
   const dirty: string[] = [];
   for (const rel of files) {
@@ -130,10 +131,25 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
     putByFile(extractImports(code, root), (f, v) => f.imports.push(v));
     putByFile(extractCalls(code, root), (f, v) => f.calls.push(v));
     putByFile(extractLiterals(dirty, root), (f, v) => f.literals.push(v));
-    // Anchors need enclosing-symbol resolution within the (possibly dirty) file.
+  }
+  // Anchors need enclosing-symbol resolution. Symbols, imports, calls and
+  // literals are rules-independent — when only the rule pack changed, re-run
+  // anchor extraction over every code file against cached symbols and keep
+  // every other fact (green-node reuse one level up).
+  const anchorTargets = rulesChanged
+    ? files.filter((f) => !isConfigFile(f))
+    : dirty.filter((f) => !isConfigFile(f));
+  if (anchorTargets.length) {
+    const putByFile = <T extends { file: string }>(arr: T[], sink: (f: FileFacts, v: T) => void): void => {
+      for (const v of arr) {
+        const f = facts[v.file];
+        if (f) sink(f, v);
+      }
+    };
     const symsByFile = new Map<string, SymbolRec[]>();
-    for (const rel of dirty) {
-      symsByFile.set(rel, facts[rel]!.symbols);
+    for (const rel of anchorTargets) {
+      symsByFile.set(rel, facts[rel]?.symbols.length ? facts[rel]!.symbols : (cached?.facts[rel]?.symbols ?? []));
+      if (rulesChanged) facts[rel] && (facts[rel]!.anchors = []);
     }
     const enclosingId = (file: string, line: number): string | undefined => {
       const syms = symsByFile.get(file) ?? [];
@@ -141,7 +157,7 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
       for (const s of syms) if (s.line <= line && (!best || s.line > best.line)) best = s;
       return best ? `${best.name}@${best.file}` : `file:${file}`;
     };
-    putByFile(extractAnchors(code, root, enclosingId, anchorPack), (f, v) => f.anchors.push(v));
+    putByFile(extractAnchors(anchorTargets, root, enclosingId, anchorPack), (f, v) => f.anchors.push(v));
   }
   try {
     mkdirSync(dirname(cacheFile), { recursive: true });
