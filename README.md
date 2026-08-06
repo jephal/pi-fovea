@@ -34,7 +34,7 @@ pi install /path/to/pi-fovea          # local path
 pi install npm:pi-fovea
 ```
 
-Then, in any repo session: `/fovea-status` shows graph stats; the model gets the four `fovea_*` tools.
+Then, in any repo session: `/fovea status` shows graph stats, `/fovea settings` opens the overlay; the model gets the four `fovea_*` tools.
 
 ### CLI
 
