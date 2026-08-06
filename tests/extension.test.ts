@@ -333,6 +333,9 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(result.content[0]!.text).toContain("func GetUserHandler");
     expect(result.content[1]!.text).toContain("fovea graph");
     expect(result.content[1]!.text).toContain("server/users.go");
+    // Renderer-agnostic separator: consumers join blocks with one newline,
+    // and the handler pads so the total gap is exactly one blank line.
+    expect(result.content.map((c) => c.text).join("\n")).toContain("{\n\nfovea graph");
     expect(result.details).toMatchObject({
       matches: 1,
       backend: "hybrid",

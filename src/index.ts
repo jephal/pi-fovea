@@ -136,12 +136,18 @@ export default function fovea(pi: ExtensionAPI) {
         typeof event.details === "object" && event.details !== null && !Array.isArray(event.details)
           ? (event.details as Record<string, unknown>)
           : {};
+      // Consumers join content blocks with one newline; pad from our side so
+      // the native and fovea graph sections end up one blank line apart no
+      // matter how the native block terminates.
+      const head = event.content
+        .filter((c) => c.type === "text")
+        .map((c) => (c as { text?: string }).text ?? "")
+        .join("");
+      const gap = head.endsWith("\n") ? "" : "\n";
       return {
         content: [
           ...event.content,
-          // No leading newline: consumers join content blocks with one, and
-          // native grep output already ends with one — one blank line total.
-          text(result.text.replace(/^fovea focus/, "fovea graph")),
+          text(gap + result.text.replace(/^fovea focus/, "fovea graph")),
         ],
         details: { ...details, backend: "hybrid", foveaAppended: true, query: pattern },
       };
