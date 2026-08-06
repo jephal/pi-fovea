@@ -32,8 +32,9 @@ Sync is **mutation-path agnostic**: pi's edit/write tools, a pi-fabric `fabric_e
 
 When writing or editing code **inside a `fabric_exec` program**, the fovea tools exist but the fabric sandbox has no built-in knowledge of them (it lazy-loads tools). Key points:
 
-- Inside `fabric_exec`, discover them once with `await tools.search("fovea")` and call them through `tools.call({ ref, args })` — e.g. `{ ref: "fovea_focus", args: { query: "CreateUserHandler" } }`. They are ordinary pi tools; there is no fabric-specific wrapper.
-- Prefer a single `fovea_impact` call over hand-rolled grep fan-outs when computing what an edit touches — the graph already resolved imports/calls across Go, TypeScript, Python, and Java.
+- Inside `fabric_exec`, captured extension tools use the `extensions` provider. For a known action call `await extensions.fovea_focus({ query: "CreateUserHandler", maxTokens: 6000 })`.
+- For dynamic discovery, use `const hits = await tools.search({ query: "fovea_focus" })`, then call the returned namespaced ref with `tools.call({ ref: hits[0].ref, args: { query: "CreateUserHandler", maxTokens: 6000 } })`. The stable explicit ref is `extensions.fovea_focus`; bare `fovea_focus` and `fovea.fovea_focus` are invalid.
+- Prefer a single `extensions.fovea_impact(...)` call over hand-rolled grep fan-outs when computing what an edit touches — the graph already resolved imports/calls across Go, TypeScript, Python, and Java.
 - Any file mutation performed by the program (including `pi.edit`/`pi.write` calls inside the sandbox) is picked up by turn sync automatically, so post-edit verification does not need a re-sketch.
 - The sketch `details` field carries counts (`files`, `nodes`, `anchors`); the hot-node list is the graph's highest-value entry points. On an unfamiliar repo, fetch it once and reuse instead of rediscovering entry points per call.
 
@@ -43,4 +44,4 @@ The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON
 
 ## Settings
 
-`/fovea settings` in the TUI, or `fovea.config.json` at repo or user level. Relevant knobs: `sync.enabled`, `sync.budget`, `sync.warmFileThreshold` (files that must escape before a red sync fires), `tools.defaultBudget`.
+`/fovea settings` in the TUI, or `fovea.json` under `~/.pi/agent/` or a trusted repo's `.pi/` directory. Relevant knobs: `sync.enabled`, `sync.budget`, `sync.warmFileThreshold` (files that must escape before a red sync fires), `tools.defaultBudget`, and `tools.replaceGrep` (default on; installs a grep-compatible Fovea override and reloads extensions).

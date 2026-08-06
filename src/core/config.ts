@@ -22,6 +22,8 @@ interface FoveaSyncConfig {
 interface FoveaToolsConfig {
   /** Budget applied when a fovea_* tool call omits maxTokens. */
   defaultBudget: number;
+  /** Replace Pi's grep slot with a graph-backed fovea_focus adapter. */
+  replaceGrep: boolean;
 }
 
 export interface FoveaConfig {
@@ -38,6 +40,7 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   },
   tools: {
     defaultBudget: 2000,
+    replaceGrep: true,
   },
 };
 
@@ -81,6 +84,7 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
     },
     tools: {
       defaultBudget: intValue("tools.defaultBudget", tools.defaultBudget, base.tools.defaultBudget),
+      replaceGrep: boolValue(tools.replaceGrep, base.tools.replaceGrep),
     },
   };
 };

@@ -194,6 +194,11 @@ const buildItems = (
         "How many undisclosed files must warm up during sync to justify a red message. Higher = fewer interruptions; route anchor shifts always escalate.",
       submenu: numericSubmenu(theme, THRESHOLDS, "Warm file threshold", "Disclosed-file warming count that escalates sync to red."),
     }),
+    setting("tools.replaceGrep", "Replace grep", config.tools.replaceGrep ? "true" : "false", {
+      description:
+        "Register a grep-compatible tool backed by fovea_focus instead of literal text search. Default on; changing it reloads extensions so Pi and Fabric see the new tool slot.",
+      values: BOOLEANS,
+    }),
     setting("tools.defaultBudget", "Default tool budget", String(config.tools.defaultBudget), {
       description: "Token budget applied when a fovea_* tool call omits maxTokens.",
       submenu: numericSubmenu(theme, BUDGETS, "Default tool budget", "Fallback maxTokens for fovea tools."),
@@ -206,13 +211,17 @@ export interface FoveaSettingsDeps {
   onConfigApplied?: () => void;
 }
 
+export interface FoveaSettingsResult {
+  grepRegistrationChanged: boolean;
+}
+
 export const openFoveaSettings = async (
   context: ExtensionContext,
   deps: FoveaSettingsDeps = {},
-): Promise<void> => {
+): Promise<FoveaSettingsResult> => {
   if (context.mode !== "tui") {
     context.ui.notify("Fovea settings are available in TUI mode", "warning");
-    return;
+    return { grepRegistrationChanged: false };
   }
   const agentDir = getAgentDir();
   const scopes = {
@@ -221,6 +230,7 @@ export const openFoveaSettings = async (
     projectTrusted: context.isProjectTrusted(),
   };
   let config = loadFoveaConfig(scopes);
+  const initialReplaceGrep = config.tools.replaceGrep;
   let dirty = false;
 
   const apply = (id: string, value: unknown): void => {
@@ -249,6 +259,7 @@ export const openFoveaSettings = async (
   });
 
   if (dirty) context.ui.notify("Fovea settings saved.", "info");
+  return { grepRegistrationChanged: config.tools.replaceGrep !== initialReplaceGrep };
 };
 
 // Local in-place merge so subsequent edits in the same overlay start from the

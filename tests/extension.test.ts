@@ -1,63 +1,155 @@
-// The extension entry as pi sees it: register the four tools, execute one
-// through the pi tool contract (TypeBox params, ctx.cwd), get contract-shaped
-// results.
+// The extension entry as pi sees it: register the graph tools, optionally
+// replace grep, and execute through Pi's TypeBox tool contract.
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import extension from "../src/index.js";
 import { resetSessions } from "../src/core/session.js";
 import { hasAstGrep } from "../src/core/astgrep.js";
+import { DEFAULT_FOVEA_CONFIG } from "../src/core/config.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
 
 interface ToolDef {
   name: string;
   parameters: unknown;
-  execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: unknown, ctx: { cwd: string }) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+  execute: (
+    id: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal,
+    onUpdate: unknown,
+    ctx: { cwd: string; isProjectTrusted: () => boolean },
+  ) => Promise<{
+    content: Array<{ text: string }>;
+    details: Record<string, unknown>;
+    isError?: boolean;
+  }>;
 }
 
-// Command/tool execute ctx must satisfy the parts the extension uses: cwd
-// plus trust lookup for per-root config scoping (config stays global here).
-const fakeCtx = (cwd: string) => ({ cwd, isProjectTrusted: () => false });
+type EventHandler = (event: Record<string, unknown>, ctx: ReturnType<typeof fakeCtx>) => unknown;
+
+const fakeCtx = (cwd: string, trusted = false) => ({
+  cwd,
+  isProjectTrusted: () => trusted,
+});
 
 const load = () => {
   const tools = new Map<string, ToolDef>();
   const commands: string[] = [];
+  const handlers = new Map<string, EventHandler[]>();
   extension({
-    on: () => {},
+    on: (name: string, handler: EventHandler) => {
+      handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+    },
     sendMessage: async () => {},
-    registerTool: (d: ToolDef) => tools.set(d.name, d),
+    registerTool: (definition: ToolDef) => tools.set(definition.name, definition),
     registerCommand: (name: string) => commands.push(name),
   } as never);
-  return { tools, commands };
+  const emit = async (
+    name: string,
+    event: Record<string, unknown>,
+    ctx: ReturnType<typeof fakeCtx>,
+  ): Promise<void> => {
+    for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
+  };
+  return { tools, commands, emit };
 };
 
-describe.skipIf(!hasAstGrep())("extension entry", () => {
-  it("registers the four ops as pi tools plus the /fovea command", () => {
+const enableGrep = async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-grep-"));
+  mkdirSync(path.join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    path.join(root, ".pi", "fovea.json"),
+    JSON.stringify({ tools: { replaceGrep: true } }),
+  );
+  const loaded = load();
+  await loaded.emit("session_start", { reason: "reload" }, fakeCtx(root, true));
+  return { root, ...loaded };
+};
+
+describe("extension entry", () => {
+  it("registers four graph tools and /fovea before session startup", () => {
     const { tools, commands } = load();
     for (const name of ["fovea_sketch", "fovea_focus", "fovea_dwell", "fovea_impact"]) {
       expect(tools.has(name), name).toBe(true);
     }
+    expect(tools.has("grep")).toBe(false);
     expect(commands).toContain("fovea");
+    expect(DEFAULT_FOVEA_CONFIG.tools.replaceGrep).toBe(true);
   });
 
-  it("fovea_focus executes through the pi tool contract", async () => {
+  it("registers an exact grep-compatible schema when the project setting is enabled", async () => {
+    const loaded = await enableGrep();
+    try {
+      const grep = loaded.tools.get("grep");
+      expect(grep).toBeDefined();
+      const schema = grep!.parameters as { properties: Record<string, unknown>; required: string[] };
+      expect(Object.keys(schema.properties)).toEqual([
+        "pattern",
+        "path",
+        "glob",
+        "ignoreCase",
+        "literal",
+        "context",
+        "limit",
+      ]);
+      expect(schema.required).toEqual(["pattern"]);
+    } finally {
+      rmSync(loaded.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!hasAstGrep())("extension execution", () => {
+  it("fovea_focus executes through the Pi tool contract", async () => {
     resetSessions();
     const { tools } = load();
     const focusTool = tools.get("fovea_focus")!;
-    const res = await focusTool.execute("t1", { query: "GetUserHandler" }, new AbortController().signal, undefined, fakeCtx(FIXTURE));
-    const text = res.content[0]!.text;
-    expect(text).toContain("fovea focus");
-    expect(text).toContain("server/users.go");
-    expect(Number(res.details.shown)).toBeGreaterThan(0);
+    const result = await focusTool.execute(
+      "t1",
+      { query: "GetUserHandler" },
+      new AbortController().signal,
+      undefined,
+      fakeCtx(FIXTURE),
+    );
+    expect(result.content[0]!.text).toContain("fovea focus");
+    expect(result.content[0]!.text).toContain("server/users.go");
+    expect(Number(result.details.shown)).toBeGreaterThan(0);
+  });
+
+  it("the grep override delegates its pattern to Fovea", async () => {
+    resetSessions();
+    const loaded = await enableGrep();
+    try {
+      const result = await loaded.tools.get("grep")!.execute(
+        "t-grep",
+        { pattern: "GetUserHandler", path: "server" },
+        new AbortController().signal,
+        undefined,
+        fakeCtx(FIXTURE),
+      );
+      expect(result.content[0]!.text).toContain("fovea grep");
+      expect(result.content[0]!.text).toContain("server/users.go");
+      expect(result.details).toMatchObject({ backend: "fovea", query: "GetUserHandler" });
+    } finally {
+      rmSync(loaded.root, { recursive: true, force: true });
+    }
   });
 
   it("fovea_impact executes and respects the what-if mode", async () => {
     resetSessions();
     const { tools } = load();
     const impactTool = tools.get("fovea_impact")!;
-    const res = await impactTool.execute("t2", { symbols: ["LoadUser"], includeUncommitted: false, maxTokens: 1200 }, new AbortController().signal, undefined, fakeCtx(FIXTURE));
-    const text = res.content[0]!.text;
-    expect(text).toContain("fovea impact");
-    expect(text).toContain("web/api.ts");
+    const result = await impactTool.execute(
+      "t2",
+      { symbols: ["LoadUser"], includeUncommitted: false, maxTokens: 1200 },
+      new AbortController().signal,
+      undefined,
+      fakeCtx(FIXTURE),
+    );
+    expect(result.content[0]!.text).toContain("fovea impact");
+    expect(result.content[0]!.text).toContain("web/api.ts");
   });
 });

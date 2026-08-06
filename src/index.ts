@@ -17,6 +17,15 @@ const BudgetParam = Type.Optional(
 const RootParam = Type.Optional(
   Type.String({ description: "Repo root to map. Defaults to the session working directory." }),
 );
+const GrepParams = Type.Object({
+  pattern: Type.String({ description: "Symbol, route, environment key, or file query for the Fovea code graph." }),
+  path: Type.Optional(Type.String({ description: "Compatibility path hint. Used as a fallback graph seed when pattern finds no node." })),
+  glob: Type.Optional(Type.String({ description: "Accepted for grep-call compatibility; Fovea navigation is graph-based rather than glob-filtered." })),
+  ignoreCase: Type.Optional(Type.Boolean({ description: "Accepted for grep-call compatibility; Fovea symbol matching is already case-insensitive." })),
+  literal: Type.Optional(Type.Boolean({ description: "Accepted for grep-call compatibility; the pattern is interpreted as a graph query." })),
+  context: Type.Optional(Type.Number({ description: "Accepted for grep-call compatibility; graph neighbors replace line context." })),
+  limit: Type.Optional(Type.Number({ description: "Accepted for grep-call compatibility; output is controlled by tools.defaultBudget." })),
+});
 
 const text = (s: string) => ({ type: "text" as const, text: s });
 
@@ -31,11 +40,54 @@ export default function fovea(pi: ExtensionAPI) {
     return cfg;
   };
 
-  pi.on("session_start", async (event) => {
+  let grepOverrideRegistered = false;
+  const registerGrepOverride = (): void => {
+    if (grepOverrideRegistered) return;
+    grepOverrideRegistered = true;
+    pi.registerTool({
+      name: "grep",
+      label: "grep (Fovea)",
+      description:
+        "Navigate the pi-fovea code graph through grep's familiar argument shape. Finds symbols, routes, environment keys, files, and their warm dependencies; it does not perform literal line matching. Use bash with rg only when exact text or regex matches are required.",
+      promptSnippet: "Navigate the Fovea code graph with a grep-compatible query",
+      promptGuidelines: [
+        "Use grep for graph-backed repository navigation before exact text search; when the Fovea override is active, grep centers the code graph on pattern and returns warm dependencies rather than matching lines.",
+        "Use bash with rg only when an exact literal or regular-expression text match is required after the Fovea-backed grep result.",
+      ],
+      parameters: GrepParams,
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        const root = ctx.cwd;
+        const budget = configFor(root, ctx.isProjectTrusted()).tools.defaultBudget;
+        const pattern = params.pattern.trim();
+        const pathHint = params.path?.replace(/^@/, "").trim();
+        let query = pattern || pathHint || params.pattern;
+        try {
+          let result = focus(root, query, budget);
+          if (Number(result.details.seeds ?? 0) === 0 && pathHint && pathHint !== "." && pathHint !== query) {
+            query = pathHint;
+            result = focus(root, query, budget);
+          }
+          return {
+            content: [text(result.text.replace(/^fovea focus/, "fovea grep"))],
+            details: { ...result.details, backend: "fovea", query },
+          };
+        } catch (error) {
+          return {
+            content: [text(String(error instanceof Error ? error.message : error))],
+            details: { backend: "fovea", query },
+            isError: true,
+          };
+        }
+      },
+    });
+  };
+
+  pi.on("session_start", async (event, ctx) => {
     if (event.reason === "new" || event.reason === "fork") {
       resetSessions();
       resetSyncBaselines();
     }
+    if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.replaceGrep) registerGrepOverride();
   });
 
   // Turn-sync loop. The tracker below is a hint accumulator only: pi's
@@ -179,14 +231,18 @@ export default function fovea(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/)[0] ?? "status";
       if (sub === "settings") {
-        await openFoveaSettings(ctx, { onConfigApplied: () => configs.clear() });
+        const result = await openFoveaSettings(ctx, { onConfigApplied: () => configs.clear() });
+        if (result.grepRegistrationChanged) {
+          ctx.ui.notify("Reloading extensions to apply the grep tool change…", "info");
+          await ctx.reload();
+        }
         return;
       }
       try {
         const s = sketch(ctx.cwd, 256);
         const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
         ctx.ui.notify(
-          `pi-fovea: ${s.details.files ?? 0} files, ${s.details.nodes ?? 0} nodes, ${s.details.anchors ?? 0} anchors · sync ${cfg.sync.enabled ? "on" : "off"}`,
+          `pi-fovea: ${s.details.files ?? 0} files, ${s.details.nodes ?? 0} nodes, ${s.details.anchors ?? 0} anchors · sync ${cfg.sync.enabled ? "on" : "off"} · grep ${cfg.tools.replaceGrep ? "fovea" : "native"}`,
           "info",
         );
       } catch (e) {

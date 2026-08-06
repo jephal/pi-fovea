@@ -29,6 +29,28 @@ After each assistant turn the map re-syncs incrementally. Detection reads conten
 | `fovea_focus` | what is this? | centered on a symbol, route path, or env key: hot nodes as signatures, neighbors as one-liners |
 | `fovea_dwell` | what else? | diffuses the field one step further and returns the delta |
 | `fovea_impact` | what does this touch? | warms everything a file, symbol, or PR base reaches across languages |
+| `grep` *(default override)* | where does this concept lead? | the same graph-backed focus through grep's familiar `pattern/path/glob/...` signature |
+
+The **Replace grep** toggle makes Fovea own Pi's `grep` tool slot. It is on by default. Familiar calls such as `grep({ pattern: "CreateUser", path: "src" })` navigate the code graph first; use `bash` with `rg` only when you need exact matching lines. Disable the toggle to restore the previous grep implementation. Changing the toggle reloads extensions so pi-fabric captures the same override and `pi.grep(...)` follows it inside `fabric_exec`.
+
+### pi-fabric
+
+Captured extension tools live under Fabric's `extensions` provider. Use the direct proxy when the action is known:
+
+```ts
+const result = await extensions.fovea_focus({ query: "CreateUserHandler", maxTokens: 2000 });
+return result.text;
+```
+
+For dynamic discovery, pass an object to `tools.search` and keep the returned namespaced ref:
+
+```ts
+const [action] = await tools.search({ query: "fovea_focus", limit: 5 });
+if (!action) return "Fovea is not captured";
+return tools.call({ ref: action.ref, args: { query: "CreateUserHandler" } });
+```
+
+The stable explicit ref is `extensions.fovea_focus`, not bare `fovea_focus` or `fovea.fovea_focus`.
 
 Two slash commands on top:
 
@@ -99,6 +121,7 @@ Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override 
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.warmFileThreshold` | `2` | warmed files unseen by the model that justify turning red |
 | `tools.defaultBudget` | `2000` | fallback maxTokens for the fovea_* tools |
+| `tools.replaceGrep` | `true` | replace Pi's grep slot with graph-backed Fovea navigation |
 
 ## How routes are found
 
