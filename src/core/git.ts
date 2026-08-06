@@ -3,7 +3,7 @@
 // so even a 50ms spawnSync per turn is a hang tax we no longer pay.
 
 import { execFile } from "node:child_process";
-import { spawnGate } from "./asyncutil.js";
+import { ROOT_CACHE_LIMIT, spawnGate } from "./asyncutil.js";
 
 const GIT_TIMEOUT = 15_000;
 
@@ -63,16 +63,23 @@ export interface GitProbe {
 }
 
 const gitPrefixes = new Map<string, string>();
-const gitPrefix = async (root: string): Promise<string | undefined> => {
-  if (gitPrefixes.has(root)) return gitPrefixes.get(root)!;
+export const gitPrefix = async (root: string): Promise<string | undefined> => {
+  if (gitPrefixes.has(root)) {
+    const hit = gitPrefixes.get(root)!;
+    gitPrefixes.delete(root);
+    gitPrefixes.set(root, hit);
+    return hit;
+  }
   const out = await gitOut(root, ["rev-parse", "--show-prefix"]);
   if (out === undefined) return undefined;
   const prefix = out.trim().replace(/\\/g, "/");
+  gitPrefixes.delete(root);
   gitPrefixes.set(root, prefix);
+  while (gitPrefixes.size > ROOT_CACHE_LIMIT) gitPrefixes.delete(gitPrefixes.keys().next().value!);
   return prefix;
 };
 
-const underRoot = (path: string, prefix: string): string | undefined => {
+export const gitRelativePath = (path: string, prefix: string): string | undefined => {
   const normalized = path.replace(/\\/g, "/");
   if (!prefix) return normalized;
   return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : undefined;
@@ -95,7 +102,7 @@ export const gitProbe = async (root: string): Promise<GitProbe | undefined> => {
       continue;
     }
     const code = field.slice(0, 2);
-    const path = underRoot(field.slice(3), prefix);
+    const path = gitRelativePath(field.slice(3), prefix);
     if (!path) {
       relist = true;
       continue;
@@ -117,7 +124,7 @@ export const uncommittedFiles = async (root: string): Promise<string[]> => {
   return out
     .split("\0")
     .filter(Boolean)
-    .map((entry) => underRoot(entry.slice(3), prefix))
+    .map((entry) => gitRelativePath(entry.slice(3), prefix))
     .filter((path): path is string => !!path);
 };
 
@@ -126,6 +133,6 @@ export const prFiles = async (root: string, base: string): Promise<string[]> => 
   if (prefix === undefined) return [];
   const out = await gitOut(root, ["diff", "--name-only", `${base}...HEAD`, "--", "."]);
   return out
-    ? out.split("\n").map((s) => underRoot(s.trim(), prefix)).filter((s): s is string => !!s)
+    ? out.split("\n").map((s) => gitRelativePath(s.trim(), prefix)).filter((s): s is string => !!s)
     : [];
 };

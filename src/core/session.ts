@@ -3,6 +3,7 @@
 // periphery, while a new seed/scope resets to sharp context. Cached Chebyshev
 // vectors keep dwell cheap across wider timescales within that focus.
 
+import { ROOT_CACHE_LIMIT } from "./asyncutil.js";
 import type { NodeKind } from "./types.js";
 
 export interface FocusScope {
@@ -27,7 +28,6 @@ export const FOCUS_T0 = 2;
 export const TK_ORDER = 80; // covers dwell up to t ~ 33 with full accuracy
 
 const sessions = new Map<string, FoveaSession>();
-const MAX_SESSION_ROOTS = 2;
 
 export const getSession = (root: string): FoveaSession => {
   const hit = sessions.get(root);
@@ -48,7 +48,7 @@ export const getSession = (root: string): FoveaSession => {
     tkKey: "",
   };
   sessions.set(root, s);
-  while (sessions.size > MAX_SESSION_ROOTS) sessions.delete(sessions.keys().next().value!);
+  while (sessions.size > ROOT_CACHE_LIMIT) sessions.delete(sessions.keys().next().value!);
   return s;
 };
 

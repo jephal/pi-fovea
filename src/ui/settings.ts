@@ -220,40 +220,36 @@ const coerceValue = (id: string, value: string, config: FoveaConfig): unknown =>
 const buildItems = (
   theme: Theme,
   config: FoveaConfig,
-  apply: (id: string, value: unknown) => void,
-): SettingItem[] => {
-  const persist = (id: string, newValue: string): void => apply(id, coerceValue(id, newValue, config));
-  return [
-    setting("sync.enabled", "Continuous sync", config.sync.enabled ? "true" : "false", {
-      description:
-        "Check semantic drift before agent start and after every turn; inject or steer before the model continues. FOVEA_TURN_SYNC=off overrides.",
-      values: BOOLEANS,
-    }),
-    setting("sync.budget", "Sync budget", String(config.sync.budget), {
-      description: "Max tokens for proactive repository steering sent to the model.",
-      submenu: numericSubmenu(theme, BUDGETS, "Sync budget", "Max tokens for proactive repository steering."),
-    }),
-    setting("sync.ackClean", "Ack clean turns", config.sync.ackClean ? "true" : "false", {
-      description:
-        "Show a brief notification after changed-but-actionless turns. Default off; clean turns spend no model tokens.",
-      values: BOOLEANS,
-    }),
-    setting("sync.warmFileThreshold", "Steer threshold", String(config.sync.warmFileThreshold), {
-      description:
-        "How many newly relevant files justify steering the model. Higher means fewer continuations; route changes always steer.",
-      submenu: numericSubmenu(theme, THRESHOLDS, "Relevance threshold", "Newly relevant file count that steers the model."),
-    }),
-    setting("tools.replaceGrep", "Hybrid grep", config.tools.replaceGrep ? "true" : "false", {
-      description:
-        "Preserve native grep for scoped/regex/text searches and use Fovea only for bare symbol queries. Default on; changing it reloads extensions.",
-      values: BOOLEANS,
-    }),
-    setting("tools.defaultBudget", "Default tool budget", String(config.tools.defaultBudget), {
-      description: "Token budget applied when a fovea_* tool call omits maxTokens.",
-      submenu: numericSubmenu(theme, BUDGETS, "Default tool budget", "Fallback maxTokens for fovea tools."),
-    }),
-  ];
-};
+): SettingItem[] => [
+  setting("sync.enabled", "Continuous sync", config.sync.enabled ? "true" : "false", {
+    description:
+      "Check semantic drift before agent start and after every turn; inject or steer before the model continues. FOVEA_TURN_SYNC=off overrides.",
+    values: BOOLEANS,
+  }),
+  setting("sync.budget", "Sync budget", String(config.sync.budget), {
+    description: "Max tokens for proactive repository steering sent to the model.",
+    submenu: numericSubmenu(theme, BUDGETS, "Sync budget", "Max tokens for proactive repository steering."),
+  }),
+  setting("sync.ackClean", "Ack clean turns", config.sync.ackClean ? "true" : "false", {
+    description:
+      "Show a brief notification after changed-but-actionless turns. Default off; clean turns spend no model tokens.",
+    values: BOOLEANS,
+  }),
+  setting("sync.warmFileThreshold", "Steer threshold", String(config.sync.warmFileThreshold), {
+    description:
+      "How many newly relevant files justify steering the model. Higher means fewer continuations; route changes always steer.",
+    submenu: numericSubmenu(theme, THRESHOLDS, "Relevance threshold", "Newly relevant file count that steers the model."),
+  }),
+  setting("tools.replaceGrep", "Hybrid grep", config.tools.replaceGrep ? "true" : "false", {
+    description:
+      "Preserve native grep for scoped/regex/text searches and use Fovea only for bare symbol queries. Default on; changing it reloads extensions.",
+    values: BOOLEANS,
+  }),
+  setting("tools.defaultBudget", "Default tool budget", String(config.tools.defaultBudget), {
+    description: "Token budget applied when a fovea_* tool call omits maxTokens.",
+    submenu: numericSubmenu(theme, BUDGETS, "Default tool budget", "Fallback maxTokens for fovea tools."),
+  }),
+];
 
 export interface FoveaSettingsDeps {
   /** Re-read config after a change (tool executors hold a per-root cache). */
@@ -299,7 +295,7 @@ export const openFoveaSettings = async (
   };
 
   await context.ui.custom<void>((tui, theme, _keybindings, done) => {
-    const items = buildItems(theme, config, apply);
+    const items = buildItems(theme, config);
     return new FoveaSettingsComponent(
       theme,
       items,

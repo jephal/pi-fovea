@@ -14,7 +14,7 @@ import { performance } from "node:perf_hooks";
 import { existsSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { cachePathFor } from "../src/core/build.js";
-import { ensureState, focus } from "../src/core/ops.js";
+import { ensureState, evictState, focus } from "../src/core/ops.js";
 import { resetSessions } from "../src/core/session.js";
 
 const root = resolve(process.argv[2] ?? join(import.meta.dirname, "..", "..", "pi-fabric"));
@@ -29,7 +29,8 @@ let t0 = performance.now();
 let state = await ensureState(root);
 const coldMs = performance.now() - t0;
 
-// Warm build (cached facts).
+// Warm build in a fresh resident state (disk-cached facts).
+evictState(root);
 t0 = performance.now();
 state = await ensureState(root);
 const warmMs = performance.now() - t0;

@@ -8,6 +8,7 @@ import { createGrepTool, type ExtensionAPI } from "@earendil-works/pi-coding-age
 import { Type } from "typebox";
 import { defaultAgentDir, loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
+import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
 import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
 import { resetSyncBaselines, sync } from "./core/sync.js";
@@ -72,9 +73,14 @@ export default function fovea(pi: ExtensionAPI) {
   const configs = new Map<string, FoveaConfig>();
   const configFor = (root: string, trusted = false, agentDir?: string): FoveaConfig => {
     const hit = configs.get(root);
-    if (hit) return hit;
+    if (hit) {
+      configs.delete(root);
+      configs.set(root, hit);
+      return hit;
+    }
     const cfg = loadFoveaConfig({ cwd: root, agentDir: agentDir ?? defaultAgentDir(), projectTrusted: trusted });
     configs.set(root, cfg);
+    while (configs.size > ROOT_CACHE_LIMIT) configs.delete(configs.keys().next().value!);
     return cfg;
   };
 

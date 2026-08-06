@@ -464,6 +464,6 @@ export const loadRepoRules = async (root: string): Promise<{ pack: AnchorRule[];
     const fileRoutes = (parsed.fileRoutes ?? []).filter((r) => r && typeof r.re === "string" && typeof r.verbs === "string");
     return { pack: [...DEFAULT_PACK, ...rules], fileRoutes: [...DEFAULT_FILE_ROUTES, ...fileRoutes], sha };
   } catch {
-    return { pack: DEFAULT_PACK, fileRoutes: DEFAULT_FILE_ROUTES, sha: createHash("sha1").update(raw).digest("hex") };
+    return { pack: DEFAULT_PACK, fileRoutes: DEFAULT_FILE_ROUTES, sha };
   }
 };

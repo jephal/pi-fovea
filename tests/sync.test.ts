@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { ensureState } from "../src/core/ops.js";
+import type { RepoState } from "../src/core/ops.js";
 import { resetSyncBaselines, sync } from "../src/core/sync.js";
 import { resetSessions } from "../src/core/session.js";
 
@@ -24,6 +25,33 @@ beforeAll(async () => {
 afterAll(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 
 describe.skipIf(!hasAstGrep())("turn sync", () => {
+  it("yields while fingerprinting a large baseline", async () => {
+    resetSyncBaselines();
+    const facts: RepoState["facts"] = {};
+    for (let i = 0; i < 600; i++) {
+      facts[`src/file-${i}.ts`] = {
+        sha1: String(i),
+        symbols: [],
+        imports: [],
+        calls: [],
+        literals: [{ file: `src/file-${i}.ts`, line: 1, text: `/route/${i}` }],
+        anchors: [],
+      };
+    }
+    const state = {
+      version: "synthetic-baseline",
+      facts,
+      graph: { anchors: [] },
+    } as unknown as RepoState;
+    let yielded = false;
+    setImmediate(() => { yielded = true; });
+
+    const outcome = await sync("/synthetic-baseline", { budget: 512, warmFileThreshold: 2 }, state);
+
+    expect(outcome.details.baseline).toBe("established");
+    expect(yielded).toBe(true);
+  });
+
   it("baseline establishes silently, then clean edits stay silent", async () => {
     resetSyncBaselines();
     resetSessions();

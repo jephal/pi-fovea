@@ -8,7 +8,7 @@ import { stat } from "node:fs/promises";
 import { posix } from "node:path";
 import { hasAstGrepAsync } from "./astgrep.js";
 import {
-  assembleGraph,
+  assembleGraphWithIndex,
   clearPersistTimer,
   filterSupported,
   listFiles,
@@ -19,13 +19,13 @@ import {
   type FileFacts,
 } from "./build.js";
 import { gitProbe, prFiles, uncommittedFiles } from "./git.js";
-import { envInt, yieldToLoop } from "./asyncutil.js";
+import { ROOT_CACHE_LIMIT, envInt, yieldToLoop } from "./asyncutil.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
 import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine, type RevealedNode } from "./render.js";
 import { FOCUS_T0, getSession, TK_ORDER } from "./session.js";
 import { detectBasins } from "./basins.js";
-import { classifyLiteral, normalizeLiteral, buildJoinIndex, type JoinIndex } from "./join.js";
+import { classifyLiteral, normalizeLiteral, type JoinIndex } from "./join.js";
 import { isTestFile } from "./extract.js";
 import type { Graph, NodeKind, NodeRec } from "./types.js";
 
@@ -63,9 +63,8 @@ export interface RepoState {
 
 const states = new Map<string, RepoState>(); // insertion order doubles as LRU order
 const inflight = new Map<string, Promise<RepoState>>();
-// Each resident root holds a full fact store + graph; two warm roots is the
-// right default for mega-folder hopping (override with FOVEA_MAX_ROOTS).
-const MAX_ROOTS = envInt("FOVEA_MAX_ROOTS", 2, 1, 32);
+// Each resident root holds a full fact store + graph; all heavyweight root
+// caches use ROOT_CACHE_LIMIT so one override cannot leave hidden retainers.
 const WALK_GAP_MS = envInt("FOVEA_WALK_GAP_MS", 4000, 500, 300_000);
 const SWEEP_GAP_MS = envInt("FOVEA_SWEEP_GAP_MS", 20_000, 2000, 600_000);
 
@@ -79,7 +78,7 @@ const touch = (root: string): RepoState | undefined => {
 };
 
 const evictLru = (): void => {
-  while (states.size > MAX_ROOTS) {
+  while (states.size > ROOT_CACHE_LIMIT) {
     const oldest = states.keys().next().value!;
     states.delete(oldest);
     inflight.delete(oldest);
@@ -134,20 +133,9 @@ const assembleState = async (
   for (const [k, v] of store.facts) facts[k] = v;
   await yieldToLoop();
   const version = graphVersion(facts);
-  const graph = await assembleGraph(root, files, store.facts);
+  const { graph, joinIndex } = await assembleGraphWithIndex(root, files, store.facts);
   await yieldToLoop();
   const csr = buildCsr(graph);
-  await yieldToLoop();
-  const sites = Object.values(facts).flatMap((f) => f.literals);
-  const joinIndex = buildJoinIndex(sites, (file, line) => {
-    const arr = graph.byFile.get(file) ?? [];
-    let best = arr[0];
-    for (const idx of arr) {
-      const n = graph.nodes[idx]!;
-      if (n.kind !== "file" && n.line <= line) best = idx;
-    }
-    return best;
-  });
   await yieldToLoop();
   const adjacency = new Map<number, Array<{ to: number; kind: string; w: number }>>();
   for (const e of graph.edges) {
@@ -251,7 +239,6 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
   }
   const fresh = await assembleState(state.root, files, store, report, state.gitKind, state.head);
   states.set(state.root, fresh);
-  state.probedAt = Date.now();
   return fresh;
 };
 
@@ -270,10 +257,10 @@ export const ensureState = (root: string, opts: { hints?: string[]; force?: bool
         return state;
       })();
   inflight.set(root, p);
-  p.then(
-    () => inflight.delete(root),
-    () => inflight.delete(root),
-  );
+  const clear = (): void => {
+    if (inflight.get(root) === p) inflight.delete(root);
+  };
+  p.then(clear, clear);
   return p;
 };
 

@@ -24,12 +24,6 @@ export type Shape = "recv" | "bare" | "dec";
 // Compacted per-file histogram: sigKey -> [totalSites, pathSites]
 export type FileSigs = Record<string, [number, number]>;
 
-const QUOTED = /^[rbfuRBFU]{0,3}(["'`])([\s\S]*)\1$/;
-const unquote = (s: string): string | undefined => {
-  const m = QUOTED.exec(s.trim());
-  return m ? m[2] : undefined;
-};
-
 // Line-local call scan: grabs the callee shape (recv chain, bare, decorator)
 // and the raw arg list of every `X(...)` on the line. Multi-line calls still
 // land because route strings overwhelmingly sit on the call's first line.

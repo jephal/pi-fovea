@@ -2,14 +2,14 @@
 // end-to-end promotion against the fixture's made-up jobm DSL.
 
 import { describe, expect, it } from "vitest";
-import { aggregateFiles, harvestFile, posterior, promote, synthesize } from "../src/core/discover.js";
+import { aggregateFiles, harvestFile, promote, synthesize } from "../src/core/discover.js";
 import { ensureState } from "../src/core/ops.js";
 import { resetSessions } from "../src/core/session.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
 
 describe("harvest", () => {
-  it("extracts callee/shape/argIdx and scores path-ness", async () => {
+  it("extracts callee/shape/argIdx and scores path-ness", () => {
     const py = 'jobm.schedule("/ops/defrag", defrag)\nprint(jobm.note("no slash here"))\n';
     const sigs = harvestFile("Python", py);
     expect(sigs["Python|recv|schedule|0"]).toEqual([1, 1]);
@@ -17,12 +17,12 @@ describe("harvest", () => {
     expect(sigs["Python|recv|note|0"]).toEqual([1, 0]);
   });
 
-  it("tools with fewer than 4 sites or 2 files stay un-promoted", async () => {
+  it("tools with fewer than 4 sites or 2 files stay un-promoted", () => {
     const one = aggregateFiles({ "a.py": { "Python|recv|rare|0": [3, 3] } });
     expect(promote(one)).toEqual([]);
   });
 
-  it("junk with great frequency is rejected by precision", async () => {
+  it("junk with great frequency is rejected by precision", () => {
     const sigs = aggregateFiles({
       "a.kt": { "Kotlin|bare|assertEquals|0": [120, 30] },
       "b.kt": { "Kotlin|bare|assertEquals|0": [115, 31] },
@@ -40,7 +40,7 @@ describe("harvest", () => {
 });
 
 describe("synthesize", () => {
-  it("puts $P at the proven arg position and offers an arity tail variant", async () => {
+  it("puts $P at the proven arg position and offers an arity tail variant", () => {
     const s = aggregateFiles({
       "a.ts": { "TypeScript|recv|deliver|2": [6, 6] },
       "b.ts": { "TypeScript|recv|deliver|2": [4, 4] },

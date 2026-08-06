@@ -119,7 +119,7 @@ A non-Git umbrella directory treats every nested `.git` directory or worktree ma
 | --- | :---: | --- |
 | `FOVEA_MAX_FILES` | `8000` | maximum indexed files in one graph |
 | `FOVEA_MAX_FILE_BYTES` | `1048576` | maximum bytes extracted from one source file |
-| `FOVEA_MAX_ROOTS` | `2` | resident fact-store/graph roots |
+| `FOVEA_MAX_ROOTS` | `2` | resident graph, fact, session, sync, and root-metadata caches |
 | `FOVEA_SPAWN_CONCURRENCY` | `3` | concurrent ast-grep/git child processes |
 | `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
 

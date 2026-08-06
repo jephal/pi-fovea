@@ -11,6 +11,7 @@
 // The first sync establishes the baseline. Baselines reset on /new, /fork,
 // and /fovea reset alongside focus sessions.
 
+import { ROOT_CACHE_LIMIT, forEachChunked } from "./asyncutil.js";
 import { ensureState, ensureStateBackground, getInflight, getState, impact, isTestScope } from "./ops.js";
 import type { RepoState } from "./ops.js";
 import { getSession } from "./session.js";
@@ -27,7 +28,6 @@ interface SyncBaseline {
 }
 
 const baselines = new Map<string, SyncBaseline>();
-const MAX_BASELINE_ROOTS = 2;
 const getBaseline = (root: string): SyncBaseline | undefined => {
   const hit = baselines.get(root);
   if (hit) {
@@ -39,7 +39,7 @@ const getBaseline = (root: string): SyncBaseline | undefined => {
 const setBaseline = (root: string, baseline: SyncBaseline): void => {
   baselines.delete(root);
   baselines.set(root, baseline);
-  while (baselines.size > MAX_BASELINE_ROOTS) baselines.delete(baselines.keys().next().value!);
+  while (baselines.size > ROOT_CACHE_LIMIT) baselines.delete(baselines.keys().next().value!);
 };
 
 export const resetSyncBaselines = (): void => baselines.clear();
@@ -62,27 +62,39 @@ export interface SyncOutcome {
   details: Record<string, unknown>;
 }
 
+type SemanticFact = RepoState["facts"][string];
+const semanticCache = new WeakMap<SemanticFact, string>();
+
 const semanticFacts = (state: RepoState, file: string): string => {
   const facts = state.facts[file];
   if (!facts) return "";
-  const sorted = (rows: unknown[][]): unknown[][] => rows.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const cached = semanticCache.get(facts);
+  if (cached !== undefined) return cached;
+  const stable = (rows: unknown[][]): string[] => rows.map((row) => JSON.stringify(row)).sort();
   const compactSig = (sig: string): string => sig.replace(/\s+/g, " ").trim();
-  return JSON.stringify({
-    symbols: sorted(facts.symbols.map((symbol) => [symbol.name, symbol.kind, compactSig(symbol.sig), symbol.lang])),
-    imports: sorted(facts.imports.map((site) => [site.spec])),
-    calls: sorted(facts.calls.map((site) => [site.callee])),
-    literals: sorted(facts.literals.map((site) => [site.text])),
-    anchors: sorted(facts.anchors.map((anchor) => [anchor.id, anchor.kind, anchor.nodeId, anchor.implicit === true])),
+  const value = JSON.stringify({
+    symbols: stable(facts.symbols.map((symbol) => [symbol.name, symbol.kind, compactSig(symbol.sig), symbol.lang])),
+    imports: stable(facts.imports.map((site) => [site.spec])),
+    calls: stable(facts.calls.map((site) => [site.callee])),
+    literals: stable(facts.literals.map((site) => [site.text])),
+    anchors: stable(facts.anchors.map((anchor) => [anchor.id, anchor.kind, anchor.nodeId, anchor.implicit === true])),
     sigs: Object.entries(facts.sigs ?? {}).sort(([a], [b]) => a.localeCompare(b)),
   });
+  semanticCache.set(facts, value);
+  return value;
 };
 
-const snapshot = (state: RepoState): SyncBaseline => ({
-  version: state.version,
-  anchors: new Set(state.graph.anchors.map((anchor) => anchor.id)),
-  shas: new Map(Object.entries(state.facts).map(([file, facts]) => [file, facts.sha1])),
-  semantics: new Map(Object.keys(state.facts).map((file) => [file, semanticFacts(state, file)])),
-});
+const snapshot = async (state: RepoState): Promise<SyncBaseline> => {
+  const anchors = new Set<string>();
+  await forEachChunked(state.graph.anchors, 256, (anchor) => anchors.add(anchor.id));
+  const shas = new Map<string, string>();
+  const semantics = new Map<string, string>();
+  await forEachChunked(Object.entries(state.facts), 256, ([file, facts]) => {
+    shas.set(file, facts.sha1);
+    semantics.set(file, semanticFacts(state, file));
+  });
+  return { version: state.version, anchors, shas, semantics };
+};
 
 export const sync = async (
   root: string,
@@ -107,7 +119,7 @@ export const sync = async (
     return { structural: false, red: false, tokens: 0, details: { version: state.version } };
   }
   if (!prev) {
-    setBaseline(root, snapshot(state));
+    setBaseline(root, await snapshot(state));
     return {
       structural: true, red: false, tokens: 0,
       details: { version: state.version, baseline: "established", anchors: state.graph.anchors.length },
@@ -156,7 +168,7 @@ export const sync = async (
       : [...warmNow].filter((file) => !prev.warmed!.has(file));
   }
 
-  setBaseline(root, { ...snapshot(state), warmed: warmNow });
+  setBaseline(root, { ...(await snapshot(state)), warmed: warmNow });
 
   // Extraction failures leave fact gaps that look like anchor *removals* —
   // never escalate red on removals while degraded; the degraded note is

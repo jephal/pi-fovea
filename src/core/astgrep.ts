@@ -3,8 +3,7 @@
 //
 // Everything is async and gated: a cold build fans chunk invocations out to
 // SPAWN_CONCURRENCY processes instead of serializing spawnSync behind the
-// TUI's event loop. On a 348-file repo that alone takes cold builds from
-// ~27s to ~4s, and the loop never stalls waiting on a child.
+// TUI's event loop; the loop never stalls waiting on a child process.
 
 import { execFile, spawnSync } from "node:child_process";
 import { SPAWN_CONCURRENCY, mapLimit, spawnGate } from "./asyncutil.js";
@@ -222,7 +221,7 @@ const runChunked = async (
 // Expanded JSON preserves each member's own range and signature. Return
 // undefined when the installed ast-grep predates this interface so callers can
 // fall back without presenting parent locations as exact member locations.
-export const outlineStructured = async (files: string[], lang: string, cwd: string): Promise<OutlineFile[] | undefined> => {
+export const outlineStructured = async (files: string[], _lang: string, cwd: string): Promise<OutlineFile[] | undefined> => {
   const out: OutlineFile[] = [];
   // A subprocess failure here is NOT recorded: extractSymbols falls back to
   // the text outline for old ast-grep versions, and that text run is what
@@ -242,7 +241,6 @@ export const outlineStructured = async (files: string[], lang: string, cwd: stri
       return undefined;
     }
   }
-  void lang;
   return out;
 };
 
@@ -292,9 +290,13 @@ export const patternRun = async (
     try {
       parsed = JSON.parse(result.stdout) as RawMatch[];
     } catch {
+      recordFailure("run", chunk, lang);
       continue;
     }
-    if (!Array.isArray(parsed)) continue;
+    if (!Array.isArray(parsed)) {
+      recordFailure("run", chunk, lang);
+      continue;
+    }
     for (const m of parsed) {
       const single: Record<string, string> = {};
       const multi: Record<string, string[]> = {};
@@ -321,8 +323,3 @@ export const patternRunAll = async (
   for (const matches of perPattern) for (const m of matches) out.push(m);
   return out;
 };
-
-// Spread-pushing big arrays overflows the argument-list limit, so
-// concatenate manually.
-const pushAll = <T>(out: T[], more: T[]): void => { for (const x of more) out.push(x); };
-void pushAll;

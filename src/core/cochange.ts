@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join as joinPath } from "node:path";
-import { gitHead, gitOut } from "./git.js";
+import { gitHead, gitOut, gitPrefix, gitRelativePath } from "./git.js";
 
 const LOG_COMMITS = 400;
 const MAX_FILES_PER_COMMIT = 24; // squashed monsters carry no pair signal
@@ -26,6 +26,8 @@ const cachePath = (root: string): string =>
 export const coChangePairs = async (root: string, filesInGraph: string[]): Promise<Array<[string, string, number]>> => {
   const head = (await gitHead(root)) ?? "";
   if (!head) return []; // not a git repo
+  const prefix = await gitPrefix(root);
+  if (prefix === undefined) return [];
   const tracked = new Set(filesInGraph);
   const key = createHash("sha1").update([...tracked].sort().join("\n")).digest("hex").slice(0, 12);
   const cp = cachePath(root);
@@ -57,7 +59,9 @@ export const coChangePairs = async (root: string, filesInGraph: string[]): Promi
     if (line.includes("\0")) { flush(); continue; }
     const tab = line.indexOf("\t");
     if (tab < 0) continue;
-    const file = line.slice(line.indexOf("\t", tab + 1) + 1).trim();
+    const secondTab = line.indexOf("\t", tab + 1);
+    if (secondTab < 0) continue;
+    const file = gitRelativePath(line.slice(secondTab + 1).trim(), prefix);
     if (file) cur.push(file);
   }
   flush();

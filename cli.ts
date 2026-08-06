@@ -58,9 +58,13 @@ try {
     const s = await sketch(rootAt(0), 256);
     const testAnchors = Number(s.details.testAnchors ?? 0);
     const failed = Number(s.details.extractionFailures ?? 0);
+    const unreadable = Array.isArray(s.details.extractionUnreadable) ? s.details.extractionUnreadable.length : 0;
+    const oversized = Array.isArray(s.details.extractionOversized) ? s.details.extractionOversized.length : 0;
     out = `${s.details.files} files, ${s.details.nodes} symbols, ${s.details.productionAnchors ?? s.details.anchors} production anchors` +
       (testAnchors ? `, ${testAnchors} test/fixture anchors collapsed` : "") +
-      (failed ? `, !${failed} files failed extraction` : "");
+      (failed ? `, !${failed} files failed extraction` : "") +
+      (unreadable ? `, !${unreadable} files unreadable` : "") +
+      (oversized ? `, !${oversized} files over size cap` : "");
   } else if (cmd === "sketch") {
     const root = rootAt(0);
     const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 1400;
@@ -69,7 +73,7 @@ try {
     const root = rootAt(0);
     const q = pos[0] !== root ? pos[0] : pos[1];
     if (!q) { console.error("fovea focus <query>"); process.exit(2); }
-    let bi = pos.indexOf(q) + 1;
+    const bi = pos.indexOf(q) + 1;
     out = (await focus(root, q, numAt(bi) ?? 2000)).text;
   } else if (cmd === "dwell") {
     const root = rootAt(0);

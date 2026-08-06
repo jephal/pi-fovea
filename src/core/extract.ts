@@ -284,23 +284,26 @@ IMPORT_PATTERNS.JavaScript = IMPORT_PATTERNS.TypeScript!;
 IMPORT_PATTERNS.Tsx = IMPORT_PATTERNS.TypeScript!;
 
 export const extractImports = async (files: string[], cwd: string): Promise<ImportSite[]> => {
-  const out: ImportSite[] = [];
-  await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+  const perLang = await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+    const local: ImportSite[] = [];
     const matches = await patternRunAll(IMPORT_PATTERNS[lang] ?? [], lang, langFiles, cwd);
     for (const m of matches) {
       const spec = m.single.M;
       if (spec) {
-        out.push({ file: m.file, spec, line: m.line });
+        local.push({ file: m.file, spec, line: m.line });
         continue;
       }
       // Go import block: pull quoted specs out of the captured block text.
       for (const blockText of [m.text, ...(m.multi.S ?? [])]) {
         for (const sm of blockText.matchAll(/"([^"\n]+)"/g)) {
-          out.push({ file: m.file, spec: sm[1]!, line: m.line });
+          local.push({ file: m.file, spec: sm[1]!, line: m.line });
         }
       }
     }
+    return local;
   }));
+  const out: ImportSite[] = [];
+  for (const local of perLang) pushAll(out, local);
   return dedupe(out, (i) => `${i.file}|${i.spec}|${i.line}`);
 };
 
@@ -341,17 +344,20 @@ const isTestFile = (file: string): boolean =>
 export { isTestFile };
 
 export const extractCalls = async (files: string[], cwd: string): Promise<CallSite[]> => {
-  const out: CallSite[] = [];
-  await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+  const perLang = await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+    const local: CallSite[] = [];
     const matches = await patternRunAll(CALL_PATTERNS, lang, langFiles, cwd);
     for (const m of matches) {
       const callee = m.single.M ?? m.single.F;
       if (!callee) continue;
       const name = callee.trim();
       if (CALL_WARDS.has(name.toLowerCase())) continue;
-      out.push({ file: m.file, line: m.line, callee: name });
+      local.push({ file: m.file, line: m.line, callee: name });
     }
+    return local;
   }));
+  const out: CallSite[] = [];
+  for (const local of perLang) pushAll(out, local);
   return out.filter((c) => c.callee && c.callee.length > 1);
 };
 
@@ -420,14 +426,17 @@ const stripQuotes = (text: string): string => {
 };
 
 export const extractLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
-  const out: LiteralSite[] = [];
-  await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+  const perLang = await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+    const local: LiteralSite[] = [];
     const matches = await patternRunAll(STRING_PATTERNS[lang] ?? [], lang, langFiles, cwd);
     for (const m of matches) {
       const t = stripQuotes(m.text);
-      if (t) out.push({ file: m.file, line: m.line, text: t });
+      if (t) local.push({ file: m.file, line: m.line, text: t });
     }
+    return local;
   }));
+  const out: LiteralSite[] = [];
+  for (const local of perLang) pushAll(out, local);
   pushAll(out, await extractConfigLiterals(files, cwd, source));
   const codeFiles = files.filter((f) => !isConfigFile(f));
   const templateSites = await mapLimit(codeFiles, SOURCE_SCAN_CONCURRENCY, async (f) => {

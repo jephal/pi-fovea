@@ -13,7 +13,7 @@
 // serve the live session (a thin graph beats none) but are never persisted,
 // so one bad invocation can't poison warm starts forever.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
@@ -23,9 +23,9 @@ import { IO_CONCURRENCY, envInt, forEachChunked, mapLimit, yieldToLoop } from ".
 import { gitOut } from "./git.js";
 import { LANG_BY_EXT, drainExtractionFailures, isBinaryExt, isConfigFile, langOf } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
-import { buildJoinIndex } from "./join.js";
+import { buildJoinIndex, type JoinIndex } from "./join.js";
 import { extractAnchors, extractFileRoutes, loadRepoRules } from "./anchors.js";
-import { aggregateFiles, harvestFile, promote, type FileSigs, type SynthesizedRule } from "./discover.js";
+import { aggregateFiles, harvestFile, promote, type FileSigs } from "./discover.js";
 import { makeFileSource } from "./source.js";
 import type { CallSite, Edge, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
@@ -265,7 +265,7 @@ const persistDebounce = new Map<string, ReturnType<typeof setTimeout>>();
 export const persistFacts = async (store: FactStore): Promise<void> => {
   const header = JSON.stringify({ fovea: CACHE_VERSION, root: store.root, rulesSha: store.rulesSha } satisfies CacheHeader);
   const target = cachePathFor(store.root);
-  const tmpName = `${target}.tmp-${process.pid}`;
+  const tmpName = `${target}.tmp-${process.pid}-${randomUUID()}`;
   try {
     await mkdir(dirname(target), { recursive: true });
     const handle = await open(tmpName, "w");
@@ -307,7 +307,6 @@ export const persistFacts = async (store: FactStore): Promise<void> => {
   }
 };
 
-/** Debounced persistence: refreshes during active editing coalesce. */
 /** Drop any pending debounced persist (root eviction) without writing. */
 export const clearPersistTimer = (root: string): void => {
   const timer = persistDebounce.get(root);
@@ -319,6 +318,7 @@ export const clearPersistTimer = (root: string): void => {
 export const filterSupported = (files: readonly string[], routeRes?: RegExp[]): string[] =>
   files.filter((f) => supported(f, routeRes) && !isJunk(f));
 
+/** Debounced persistence: refreshes during active editing coalesce. */
 export const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
   if (persistDebounce.has(store.root)) return;
   const wait = Math.max(0, store.savedAt + minGapMs - Date.now());
@@ -334,7 +334,7 @@ export const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
  * Run all extraction stages for a batch of files, replacing their records in
  * the store. Stages are concurrent (they write disjoint fields); subprocess
  * concurrency stays bounded by the spawn gate. Taint is tracked per file so
- * failed passes never reach disk.
+ * partial facts from failed passes never reach disk; only hash/stat markers do.
  */
 const EXTRACTION_BATCH = 64;
 
@@ -653,7 +653,7 @@ export const refreshFacts = async (
   for (const gone of deletedPaths) {
     if ((store.facts.has(gone) || store.failedSha.has(gone) || store.unreadable.has(gone) || store.oversized.has(gone)) && !deleted.includes(gone)) removeFile(gone);
   }
-  const added = files.filter((f) => !store.facts.has(f));
+  const added = files.filter((f) => !knownFiles.has(f));
   const candidates = new Set<string>([...changed, ...added]);
   for (const gone of deleted) candidates.delete(gone);
   // Known failures pay one stat per refresh; only a content/stat change
@@ -706,7 +706,8 @@ export const refreshFacts = async (
   // Dirty files had anchors extracted under the base pack; clean files kept
   // the stored pack's. Staleness is judged against whichever actually ran.
   await applyRulePack(root, store, files, dirty.length ? base.sha : store.rulesSha);
-  settleTaint(store, candidates);
+  // A rules change can re-anchor clean files too; retain those failures.
+  settleTaint(store, new Set(files));
 
   for (const f of unreadable) {
     store.unreadable.add(f);
@@ -868,8 +869,13 @@ const addNode = (nodes: NodeRec[], seen: Map<string, number>, rec: NodeRec): num
   return idx;
 };
 
-export const assembleGraph = async (root: string, files: string[], factsMap: Map<string, FileFacts> | Record<string, FileFacts>): Promise<Graph> => {
-  void root;
+export interface GraphAssembly { graph: Graph; joinIndex: JoinIndex }
+
+export const assembleGraphWithIndex = async (
+  root: string,
+  files: string[],
+  factsMap: Map<string, FileFacts> | Record<string, FileFacts>,
+): Promise<GraphAssembly> => {
   const facts = (file: string): FileFacts | undefined =>
     factsMap instanceof Map ? factsMap.get(file) : factsMap[file];
   const factValues = (): Iterable<FileFacts> =>
@@ -994,7 +1000,7 @@ export const assembleGraph = async (root: string, files: string[], factsMap: Map
 
   // Literal join edges (the cross-language bridge).
   const allSites: LiteralSite[] = [];
-  for (const f of factValues()) allSites.push(...f.literals);
+  for (const f of factValues()) for (const literal of f.literals) allSites.push(literal);
   const joinIdx = buildJoinIndex(allSites, (file, line) => enclosingIdx(file, line));
   for (const je of joinIdx.edges) pushEdge(je.a, je.b, "join", je.w);
 
@@ -1005,7 +1011,7 @@ export const assembleGraph = async (root: string, files: string[], factsMap: Map
   const drafts: AnchorDraft[] = [];
   for (const rel of files) {
     const f = facts(rel);
-    if (f) drafts.push(...f.anchors);
+    if (f) for (const anchor of f.anchors) drafts.push(anchor);
   }
   const draftsByLabel = new Map<string, AnchorDraft[]>();
   for (const a of drafts) {
@@ -1048,5 +1054,11 @@ export const assembleGraph = async (root: string, files: string[], factsMap: Map
     if (ia !== undefined && ib !== undefined) pushEdge(ia, ib, "cochange", w);
   }
 
-  return { nodes, edges, byName, byFile, anchors, files };
+  return { graph: { nodes, edges, byName, byFile, anchors, files }, joinIndex: joinIdx };
 };
+
+export const assembleGraph = async (
+  root: string,
+  files: string[],
+  factsMap: Map<string, FileFacts> | Record<string, FileFacts>,
+): Promise<Graph> => (await assembleGraphWithIndex(root, files, factsMap)).graph;

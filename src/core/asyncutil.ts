@@ -14,6 +14,8 @@ export const envInt = (name: string, dflt: number, min: number, max: number): nu
 export const SPAWN_CONCURRENCY = envInt("FOVEA_SPAWN_CONCURRENCY", 3, 1, 32);
 /** Max concurrent file reads/stats. */
 export const IO_CONCURRENCY = envInt("FOVEA_IO_CONCURRENCY", 32, 4, 512);
+/** Heavy per-root caches share one retention budget. */
+export const ROOT_CACHE_LIMIT = envInt("FOVEA_MAX_ROOTS", 2, 1, 32);
 
 /** Run fn over items with a global concurrency cap, preserving input order. */
 export const mapLimit = async <T, R>(
