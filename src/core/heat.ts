@@ -6,6 +6,13 @@
 // high-conductance edges until the whole subsystem is warm (the periphery
 // appears as a smooth, low-acuity field).
 //
+// No Jackson damping window on the coefficients, deliberately: SGWT applies
+// windowing because its wavelet-frame kernels are compactly-supported bumps
+// (Gibbs ringing at the support edge). The heat kernel e^{-t(1+mu)} is smooth
+// on [-1,1], so plain truncation error decays superalgebraically (measured
+// ~6e-9 vs a scaled-Taylor reference at the orders we use); a Jackson window
+// would *reduce* pointwise accuracy. Ringing is checked in tests/heat.test.ts.
+//
 // We evaluate e^{-tL} by a Chebyshev expansion, the SGWT trick: rescale to
 // M = L - I = -P~ (spectrum [-1,1]); then
 //

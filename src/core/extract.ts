@@ -52,7 +52,29 @@ const SIG_RULES: Record<string, Array<{ re: RegExp; kind: NodeKind; parentGroup?
     RX(/\bstruct\s+([A-Za-z_]\w*)/, "class"),
     RX(/\b(?:trait|enum|mod)\s+([A-Za-z_]\w*)/, "type"),
   ],
+  Elixir: [
+    RX(/^\s*defmodule\s+([\w.]+)/, "class"),
+    RX(/^\s*defprotocol\s+([\w.]+)/, "interface"),
+    // Named function heads carry arity (name/2): strip it for stable ids.
+    RX(/^\s*def(?:p|macro|macrop)?\s+([a-z_]\w*[!?=]?)/, "function"),
+  ],
+  Ruby: [
+    RX(/^\s*(?:class|module)\s+([\w:]+)/, "class"),
+    RX(/^\s*def\s+(?:self\.)?([\w!?=]+)/, "function"),
+  ],
+  C: [
+    RX(/^[A-Za-z_][\w\s*]*?\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?/, "function"),
+    RX(/^\s*(?:struct|enum|union)\s+([A-Za-z_]\w*)/, "class"),
+  ],
+  "C++": [],
+  Java: [
+    RX(/\b(?:class|interface|enum|record)\s+([A-Za-z_]\w*)/, "class"),
+  ],
+  Kotlin: [],
+  Lua: [RX(/\bfunction\s+([\w.:]+)/, "function")],
 };
+SIG_RULES["C++"] = SIG_RULES.C!;
+SIG_RULES.Kotlin = SIG_RULES.Java!;
 SIG_RULES.JavaScript = SIG_RULES.TypeScript!;
 SIG_RULES.Tsx = SIG_RULES.TypeScript!;
 
@@ -86,6 +108,7 @@ const parseOutlineText = (text: string, lang: string): SymbolRec[] => {
   let top: SymbolRec | undefined;
   for (const raw of text.split("\n")) {
     if (!raw.trim()) continue;
+    if (/^\s*@\w/.test(raw)) continue; // decorator lines are not declarations
     const entry = /^\s*(\d+):\s(.*)$/.exec(raw);
     const child = /^(\s+)(method|field):\s(.+)$/.exec(raw);
     if (entry) {

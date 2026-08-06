@@ -9,7 +9,25 @@ export const LANG_BY_EXT: Record<string, string> = {
   py: "Python",
   go: "Go",
   rs: "Rust",
+  // Second tier: symbols via ast-grep outline; name derivation is heuristic.
+  ex: "Elixir", exs: "Elixir",
+  rb: "Ruby",
+  c: "C", h: "C",
+  cc: "C++", cpp: "C++", cxx: "C++", hpp: "C++", hh: "C++",
+  java: "Java",
+  kt: "Kotlin", kts: "Kotlin",
+  lua: "Lua",
+  php: "Php",
+  swift: "Swift",
+  scala: "Scala",
+  hs: "Haskell",
+  sh: "Bash",
 };
+
+// Compiled artifacts masquerading as source extensions.
+const BINARY_EXTS = new Set(["beam", "pyc", "o", "obj", "so", "a", "d"]);
+export const isBinaryExt = (file: string): boolean =>
+  BINARY_EXTS.has(file.split(".").pop()?.toLowerCase() ?? "");
 
 // Non-code files: literals are regex-extracted so config/spec files can join.
 export const CONFIG_EXTS = new Set(["yaml", "yml", "json", "toml", "env", "tf", "hcl", "md"]);

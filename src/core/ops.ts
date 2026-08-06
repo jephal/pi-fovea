@@ -12,6 +12,7 @@ import { assembleGraph, listFiles, loadFacts, type FileFacts } from "./build.js"
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
 import { revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "./render.js";
 import { getSession, TK_ORDER } from "./session.js";
+import { detectBasins } from "./basins.js";
 import { classifyLiteral, normalizeLiteral, buildJoinIndex, type JoinIndex } from "./join.js";
 import type { Graph } from "./types.js";
 
@@ -164,9 +165,38 @@ export const sketch = (root: string, budget?: number): OpResult => {
     return { text: "fovea sketch: empty graph (no supported files matched)", tokens: 0, details: { files: 0 } };
   }
 
-  // Feature groups: anchor closure = anchor node + 1-hop neighborhood.
+  // Feature groups: anchors first; where the repo declares few routes,
+  // infer basins — greedy conductance-cut regions around self-dense seeds
+  // (implicit features on non-web repos: CLIs, libraries, kernels).
   const claimed = new Set<number>();
   const groups: GroupLine[] = [];
+  const basins = g.anchors.length < 6 && g.nodes.length >= 48
+    ? detectBasins(
+        state.adjacency,
+        conductance,
+        g.nodes.length,
+        (i) => g.nodes[i]!.kind !== "file" && g.nodes[i]!.kind !== "anchor",
+      )
+    : [];
+  for (const b of basins) {
+    let mass = 0;
+    const bfiles = new Set<string>();
+    for (const j of b.members) {
+      mass += field[j] ?? 0;
+      bfiles.add(g.nodes[j]!.file);
+    }
+    const topName = b.members
+      .map((j) => [field[j] ?? 0, j] as const)
+      .filter(([, j]) => g.nodes[j]!.kind !== "file")
+      .sort((a, b2) => b2[0] - a[0])[0];
+    groups.push({
+      label: `◈ basin ${topName ? g.nodes[topName[1]]!.name : g.nodes[b.seed]!.name}`,
+      mass,
+      detail: `${b.members.length} nodes · ${bfiles.size} files · seed ${g.nodes[b.seed]!.file}`,
+    });
+    for (const j of b.members) claimed.add(j);
+  }
+
   for (const i of anchorIdx) {
     const closure = [i, ...(state.adjacency.get(i) ?? []).map((e) => e.to)];
     let mass = 0;

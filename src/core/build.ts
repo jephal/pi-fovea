@@ -8,7 +8,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { basename, dirname, join as joinPath, posix } from "node:path";
 import { spawnSync } from "node:child_process";
-import { LANG_BY_EXT, isConfigFile } from "./astgrep.js";
+import { LANG_BY_EXT, isBinaryExt, isConfigFile } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
 import { buildJoinIndex } from "./join.js";
 import { extractAnchors, loadRepoRules } from "./anchors.js";
@@ -26,7 +26,7 @@ export interface FileFacts {
 }
 
 const CACHE_VERSION = 3; // bump when extractor semantics change
-const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea"]);
+const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods"]);
 const MAX_FILES = 24000;
 // Generated dependency manifests are enormous and carry no first-class routes.
 const LOCKFILE_NAMES = new Set([
@@ -43,7 +43,7 @@ const isJunk = (f: string): boolean => {
 
 const supported = (f: string): boolean => {
   const ext = f.split(".").pop()?.toLowerCase() ?? "";
-  return ext in LANG_BY_EXT || isConfigFile(f);
+  return !isBinaryExt(f) && (ext in LANG_BY_EXT || isConfigFile(f));
 };
 
 export const listFiles = (root: string): string[] => {
@@ -178,7 +178,10 @@ export const resolveImportToFile = (
 ): string | undefined => {
   const fam = langFamily(fromFile);
   if (spec.startsWith("./") || spec.startsWith("../")) {
-    const base = posix.normalize(posix.join(posix.dirname(fromFile), spec));
+    let base = posix.normalize(posix.join(posix.dirname(fromFile), spec));
+    // NodeNext convention: TS files import "./sibling.js" — the .js refers to
+    // the .ts source. Strip a runtime extension before probing.
+    base = base.replace(/\.(?:[cm]?js|jsx)$/, "");
     for (const ext of CODE_EXTS_BY_LANGFAMILY[fam] ?? []) {
       if (fileSet.has(base + ext)) return base + ext;
       if (fileSet.has(`${base}/index${ext}`)) return `${base}/index${ext}`;
