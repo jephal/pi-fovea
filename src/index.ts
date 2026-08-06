@@ -4,9 +4,9 @@
 // incremental across sessions.
 
 import { readFileSync } from "node:fs";
-import { createGrepTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createGrepTool, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { defaultAgentDir, loadFoveaConfig, type FoveaConfig } from "./core/config.js";
+import { loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
 import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
@@ -78,7 +78,7 @@ export default function fovea(pi: ExtensionAPI) {
       configs.set(root, hit);
       return hit;
     }
-    const cfg = loadFoveaConfig({ cwd: root, agentDir: agentDir ?? defaultAgentDir(), projectTrusted: trusted });
+    const cfg = loadFoveaConfig({ cwd: root, agentDir: agentDir ?? getAgentDir(), projectTrusted: trusted });
     configs.set(root, cfg);
     while (configs.size > ROOT_CACHE_LIMIT) configs.delete(configs.keys().next().value!);
     return cfg;
@@ -104,6 +104,7 @@ export default function fovea(pi: ExtensionAPI) {
     throw error instanceof Error ? error : new Error(String(error));
   };
 
+  let lifecycleEpoch = 0;
   let grepOverrideRegistered = false;
   const registerGrepOverride = (): void => {
     if (grepOverrideRegistered) return;
@@ -152,11 +153,13 @@ export default function fovea(pi: ExtensionAPI) {
     });
   };
 
-  pi.on("session_start", async (event, ctx) => {
-    if (event.reason === "new" || event.reason === "fork") {
-      resetSessions();
-      resetSyncBaselines();
-    }
+  pi.on("session_start", async (_event, ctx) => {
+    const epoch = ++lifecycleEpoch;
+    // pi 0.84 replaces extension runtimes on resume/fork/new/reload. Core
+    // module caches may outlive one factory instance, but disclosure and sync
+    // baselines are session-local and must never cross that boundary.
+    resetSessions();
+    resetSyncBaselines();
     if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.replaceGrep) registerGrepOverride();
     // Kick indexing in the background — the very first prompt must never
     // wait on hashing/ast-grep. Slow cold builds surface a ready notice so
@@ -168,12 +171,14 @@ export default function fovea(pi: ExtensionAPI) {
       // unhandled rejection when ast-grep is unavailable.
       void kick.promise.then(
         (st) => {
+          if (epoch !== lifecycleEpoch) return;
           const ms = Date.now() - t0;
           if (kick.started && ctx.hasUI && ms > 4000) {
             ctx.ui.notify(`Fovea index ready — ${st.graph.files.length} files (${(ms / 1000).toFixed(1)}s)`, "info");
           }
         },
         (error) => {
+          if (epoch !== lifecycleEpoch) return;
           if (kick.started && ctx.hasUI) {
             ctx.ui.notify(`Fovea index failed: ${error instanceof Error ? error.message : error}`, "warning");
           }
@@ -190,6 +195,13 @@ export default function fovea(pi: ExtensionAPI) {
   // conversation turns exit at zero cost through the version fast path.
   let turnFiles: string[] = [];
   let lastSyncError: string | undefined;
+  pi.on("session_shutdown", () => {
+    lifecycleEpoch++;
+    turnFiles = [];
+    lastSyncError = undefined;
+    resetSessions();
+    resetSyncBaselines();
+  });
   pi.on("turn_start", () => {
     turnFiles = [];
   });

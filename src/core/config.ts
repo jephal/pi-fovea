@@ -1,11 +1,11 @@
 // pi-fovea configuration. Mirrors pi-fabric's two-scope model: a global file
-// under the pi agent dir (~/.pi/agent/fovea.json) and a project override at
-// <repo>/.pi/fovea.json when the project is trusted. Settings merge over
+// under the pi agent dir and a trusted project override beneath pi's
+// configurable project resource directory. Settings merge over
 // defaults; the FOVEA_TURN_SYNC=off environment variable always wins, the
 // same way PI_FABRIC_* overrides win over stored fabric config.
 
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 interface FoveaSyncConfig {
@@ -59,7 +59,7 @@ export interface FoveaConfigScopes {
 }
 
 export const globalFoveaConfigPath = (agentDir: string): string => path.join(agentDir, "fovea.json");
-export const projectFoveaConfigPath = (cwd: string): string => path.join(cwd, ".pi", "fovea.json");
+export const projectFoveaConfigPath = (cwd: string): string => path.join(cwd, CONFIG_DIR_NAME, "fovea.json");
 
 const BOUNDS: Record<string, [number, number]> = {
   "sync.budget": [128, 8192],
@@ -150,8 +150,6 @@ export const saveFoveaConfig = (
   fs.renameSync(tmp, targetPath);
   return { scope, path: targetPath };
 };
-
-export const defaultAgentDir = (): string => path.join(os.homedir(), ".pi", "agent");
 
 /** Dotted-id helper used by the settings UI -> saveFoveaConfig partials. */
 export const buildPartialFromId = (id: string, value: unknown): Record<string, unknown> => {

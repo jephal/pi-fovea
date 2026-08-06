@@ -2,9 +2,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text, type SettingItem } from "@earendil-works/pi-tui";
+import { Text, type KeybindingsManager, type SettingItem } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import { FoveaSettingsComponent, openFoveaSettings } from "../src/ui/settings.js";
+
+const keybindings = {
+  matches: (data: string, keybinding: string) => keybinding === "app.editor.external" && data === "\x07",
+  getKeys: () => ["ctrl+g"],
+} as unknown as Pick<KeybindingsManager, "matches" | "getKeys">;
 
 describe("Fovea settings", () => {
   it("renders and persists the Hybrid grep toggle", async () => {
@@ -27,7 +32,7 @@ describe("Fovea settings", () => {
           const component = factory(
             { requestRender: () => {} },
             theme,
-            {},
+            keybindings,
             () => resolve(),
           );
           expect(component.render(100).join("\n")).toContain("Hybrid grep");
@@ -69,7 +74,7 @@ describe("Fovea settings", () => {
       ui: {
         notify: vi.fn(),
         custom: async (factory: (...args: any[]) => any) => {
-          const component = factory({ requestRender }, theme, {}, () => {});
+          const component = factory({ requestRender }, theme, keybindings, () => {});
           component.handleInput("\x07");
           const list = component.settingsList as any;
           list.selectedIndex = list.items.findIndex(
@@ -123,6 +128,7 @@ describe("FoveaSettingsComponent save scope", () => {
   it("toggles save scope with Ctrl+G from the root and active submenus", () => {
     const scopes: string[] = [];
     const component = new FoveaSettingsComponent(theme, buildItems(), () => {}, () => {}, {
+      keybindings,
       initialSaveScope: "project",
       projectScopeAvailable: true,
       onSaveScopeChange: (scope) => scopes.push(scope),
@@ -148,6 +154,7 @@ describe("FoveaSettingsComponent save scope", () => {
   it("keeps untrusted projects global-only", () => {
     const onSaveScopeChange = vi.fn();
     const component = new FoveaSettingsComponent(theme, buildItems(), () => {}, () => {}, {
+      keybindings,
       initialSaveScope: "global",
       projectScopeAvailable: false,
       onSaveScopeChange,

@@ -2,10 +2,11 @@
 // settings component structure (SettingsList in a bordered Container,
 // SelectList submenus, dotted-id coercion) so both extensions feel like one
 // settings surface. Persistence: fovea.json under the pi agent dir, with a
-// project override at <repo>/.pi/fovea.json for trusted projects; Ctrl+G in
-// the overlay toggles which scope the next change saves to.
+// project override beneath pi's configured project resource directory; the
+// external-editor keybinding toggles which scope the next change saves to.
 
 import {
+  CONFIG_DIR_NAME,
   DynamicBorder,
   getAgentDir,
   type ExtensionContext,
@@ -14,8 +15,7 @@ import {
 import {
   Container,
   type Component,
-  Key,
-  matchesKey,
+  type KeybindingsManager,
   SelectList,
   type SelectItem,
   type SelectListLayoutOptions,
@@ -43,7 +43,6 @@ const SELECT_LAYOUT: SelectListLayoutOptions = {
   maxPrimaryColumnWidth: 32,
 };
 
-const SAVE_SCOPE_SHORTCUT = Key.ctrl("g");
 
 type SettingsSubmenu = (currentValue: string, done: (selectedValue?: string) => void) => Component;
 
@@ -123,7 +122,13 @@ const numericSubmenu = (
   );
 };
 
+const formatKey = (key: string): string => key
+  .split("+")
+  .map((part) => part === "ctrl" ? "Ctrl" : part === "alt" ? "Alt" : part === "shift" ? "Shift" : part.toUpperCase())
+  .join("+");
+
 export interface FoveaSettingsComponentOptions {
+  keybindings?: Pick<KeybindingsManager, "matches" | "getKeys">;
   initialSaveScope?: FoveaConfigScope;
   projectScopeAvailable?: boolean;
   onSaveScopeChange?: (scope: FoveaConfigScope) => void;
@@ -132,6 +137,7 @@ export interface FoveaSettingsComponentOptions {
 export class FoveaSettingsComponent extends Container {
   readonly settingsList: SettingsList;
   private readonly theme: Theme;
+  private readonly keybindings: Pick<KeybindingsManager, "matches" | "getKeys"> | undefined;
   private readonly saveScopeText: Text;
   private readonly projectScopeAvailable: boolean;
   private readonly onSaveScopeChange: (scope: FoveaConfigScope) => void;
@@ -146,6 +152,7 @@ export class FoveaSettingsComponent extends Container {
   ) {
     super();
     this.theme = theme;
+    this.keybindings = options.keybindings;
     this.projectScopeAvailable = options.projectScopeAvailable ?? true;
     this.saveScope = options.initialSaveScope === "global" || !this.projectScopeAvailable
       ? "global"
@@ -164,7 +171,7 @@ export class FoveaSettingsComponent extends Container {
   }
 
   handleInput(data: string): void {
-    if (matchesKey(data, SAVE_SCOPE_SHORTCUT)) {
+    if (this.keybindings?.matches(data, "app.editor.external")) {
       if (!this.projectScopeAvailable) return;
       this.saveScope = this.saveScope === "project" ? "global" : "project";
       this.updateSaveScopeText();
@@ -174,12 +181,19 @@ export class FoveaSettingsComponent extends Container {
     this.settingsList.handleInput(data);
   }
 
+  override invalidate(): void {
+    super.invalidate();
+    this.updateSaveScopeText();
+  }
+
   private updateSaveScopeText(): void {
     const destination = this.saveScope === "project"
-      ? "Project (.pi/fovea.json)"
-      : "Global (~/.pi/agent/fovea.json)";
+      ? `Project (${CONFIG_DIR_NAME}/fovea.json)`
+      : `Global (~/${CONFIG_DIR_NAME}/agent/fovea.json)`;
+    const keys = this.keybindings?.getKeys("app.editor.external") ?? [];
+    const shortcut = keys.map(formatKey).join("/");
     const hint = this.projectScopeAvailable
-      ? " · Ctrl+G toggles save scope"
+      ? shortcut ? ` · ${shortcut} toggles save scope` : " · scope toggle key unavailable"
       : " · project scope unavailable for untrusted projects";
     this.saveScopeText.setText(
       this.theme.fg("muted", "Save scope: ") +
@@ -294,7 +308,7 @@ export const openFoveaSettings = async (
     deps.onConfigApplied?.();
   };
 
-  await context.ui.custom<void>((tui, theme, _keybindings, done) => {
+  await context.ui.custom<void>((tui, theme, keybindings, done) => {
     const items = buildItems(theme, config);
     return new FoveaSettingsComponent(
       theme,
@@ -302,6 +316,7 @@ export const openFoveaSettings = async (
       (id, newValue) => apply(id, coerceValue(id, newValue, config)),
       () => done(),
       {
+        keybindings,
         initialSaveScope: saveScope,
         projectScopeAvailable: scopes.projectTrusted,
         onSaveScopeChange: (scope) => {

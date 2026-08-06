@@ -145,6 +145,25 @@ describe("extension entry", () => {
     }
   });
 
+  it("honors PI_CODING_AGENT_DIR for global runtime configuration", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-agent-dir-"));
+    const agentDir = path.join(root, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(path.join(agentDir, "fovea.json"), JSON.stringify({ tools: { replaceGrep: false } }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const loaded = load();
+    try {
+      await loaded.emit("session_start", { reason: "startup" }, fakeCtx(root, true));
+      expect(loaded.tools.has("grep")).toBe(false);
+      await getInflight(root)?.catch(() => undefined);
+    } finally {
+      vi.unstubAllEnvs();
+      evictState(root);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cachePathFor(root), { force: true });
+    }
+  });
+
   it("degrades bare-query grep to native text with a note when the graph backend errors", async () => {
     const loaded = await enableGrep();
     // Real native grep answers the query; only the graph backend is broken.
@@ -328,6 +347,38 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     }
   });
 
+
+  it("re-baselines instead of leaking drift across a resumed session", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-resume-"));
+    cpSync(FIXTURE, root, { recursive: true });
+    execSync("git init -qb main && git add -A", { cwd: root });
+    execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    const loaded = load();
+    const ctx = fakeCtx(root);
+    try {
+      await ensureState(root);
+      await loaded.emit("session_start", { reason: "startup" }, ctx);
+      await loaded.emit("before_agent_start", { prompt: "first session" }, ctx);
+      const main = path.join(root, "server/main.go");
+      writeFileSync(
+        main,
+        readFileSync(main, "utf8").replace(
+          'r.POST("/api/users", server.CreateUserHandler)',
+          'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/resumed", server.GetUserHandler)',
+        ),
+      );
+
+      await loaded.emit("session_shutdown", { reason: "resume" }, ctx);
+      await loaded.emit("session_start", { reason: "resume", previousSessionFile: "/old/session.jsonl" }, ctx);
+      const results = await loaded.emit("before_agent_start", { prompt: "resumed session" }, ctx);
+
+      expect(results.filter((result) => result !== undefined)).toEqual([]);
+    } finally {
+      evictState(root);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cachePathFor(root), { force: true });
+    }
+  });
 
   it("delivers continuous sync intelligence as an immediate steer", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-steer-"));
