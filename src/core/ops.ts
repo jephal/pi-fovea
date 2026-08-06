@@ -691,8 +691,16 @@ export const sketch = async (root: string, budget?: number): Promise<OpResult> =
   };
 };
 
-export const focus = async (root: string, query: string, budget?: number, options: FocusOptions = {}): Promise<OpResult> => {
-  const state = await ensureState(root);
+export const focus = async (
+  root: string,
+  query: string,
+  budget?: number,
+  options: FocusOptions = {},
+  ensured?: RepoState,
+): Promise<OpResult> => {
+  // ensured lets verdict renderers reuse the exact state a warm/inline compute
+  // already built, so an embed never triggers its own probe/rebuild.
+  const state = ensured ?? (await ensureState(root));
   const g = state.graph;
   const session = getSession(root);
   const B = clampBudget(budget, 2000);

@@ -11,9 +11,12 @@
 // The first sync establishes the baseline. Baselines reset on /new, /fork,
 // and /fovea reset alongside focus sessions.
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ROOT_CACHE_LIMIT, forEachChunked } from "./asyncutil.js";
+import { ROOT_CACHE_LIMIT, envInt, forEachChunked } from "./asyncutil.js";
+import { gitProbe } from "./git.js";
 import { ensureState, ensureStateBackground, focus, getInflight, getState, impact, isTestScope } from "./ops.js";
 import type { RepoState } from "./ops.js";
 import { getSession } from "./session.js";
@@ -51,6 +54,43 @@ const setBaseline = (root: string, baseline: SyncBaseline): void => {
 export const resetSyncBaselines = (): void => {
   baselines.clear();
   warmCache.clear();
+  lastProbe.clear();
+};
+
+// Send-path drift probe TTL. The at-most-once-per-window git porcelain probe
+// on before_agent_start trades external-edit freshness for responsiveness:
+// consecutive pure-conversation sends inside the window cost ~0ms, and any
+// positive hit defers the full compute to turn_end — the correctness backstop
+// that always re-probes and re-builds. A miss in the window just means the
+// next turn_end sees the drift a few hundred ms later, not a send-path hang.
+const PROBE_TTL_MS = envInt("FOVEA_PROBE_TTL_MS", 1200, 200, 60_000);
+const lastProbe = new Map<string, number>();
+
+/**
+ * Compare porcelain against the baseline's recorded content hashes. The raw
+ * probe answers "dirty vs HEAD", which keeps firing after a warm verdict has
+ * already absorbed the same uncommitted edit. Hashing only the porcelain
+ * dirty files answers the question the send path needs: is there drift we
+ * have not yet told the model about?
+ */
+const gitDriftSince = async (root: string, shas: Map<string, string>): Promise<boolean> => {
+  const probe = await gitProbe(root);
+  if (!probe) return false; // non-git roots fall back to turn_end's walk probe
+  if (probe.relist) return true;
+  for (const change of probe.changes) {
+    const rel = change.path;
+    if (rel.endsWith("/")) return true; // collapsed untracked dir: drift
+    try {
+      const buf = await readFile(join(root, rel));
+      const sha = createHash("sha1").update(buf).digest("hex");
+      if (shas.get(rel) !== sha) return true;
+    } catch {
+      // A still-listed file that cannot be hashed is deleted or raced: real
+      // drift when the baseline knew it.
+      if (shas.has(rel)) return true;
+    }
+  }
+  return false;
 };
 
 // Channel priors for the surprise gate. A cascade whose only evidence is a
@@ -208,7 +248,7 @@ export const sync = async (
   root: string,
   params: SyncParams,
   now?: RepoState,
-  opts?: { probe?: "cheap" | "full" },
+  opts?: { probe?: "cheap" | "full" | "defer" },
 ): Promise<SyncOutcome> => {
   let state = now;
   if (!state) {
@@ -220,7 +260,27 @@ export const sync = async (
       if (!getInflight(root)) ensureStateBackground(root);
       return { structural: false, red: false, tokens: 0, details: { indexing: true } };
     }
-    state = await ensureState(root, { hints: params.files, force: opts?.probe !== "cheap" });
+    if (opts?.probe === "defer") {
+      // The user-perceived send path never rebuilds. Nothing materialized
+      // since the baseline: run the TTL-bounded porcelain probe to spot
+      // out-of-band drift, and defer any hit to turn_end instead of paying
+      // re-extraction + re-assembly while the UI waits. Materialized drift
+      // (a background warm already rebuilt the resident state) falls through
+      // to the normal verdict-or-defer logic below.
+      const prev = getBaseline(root);
+      if (prev && prev.version === warm.version) {
+        const due = Date.now() - (lastProbe.get(root) ?? 0) >= PROBE_TTL_MS;
+        if (due && (await gitDriftSince(root, prev.shas))) {
+          lastProbe.set(root, Date.now());
+          return { structural: true, red: false, tokens: 0, details: { version: warm.version, deferred: true } };
+        }
+        if (due) lastProbe.set(root, Date.now());
+        return { structural: false, red: false, tokens: 0, details: { version: warm.version } };
+      }
+      state = warm;
+    } else {
+      state = await ensureState(root, { hints: params.files, force: opts?.probe !== "cheap" });
+    }
   }
   const prev = getBaseline(root);
   if (prev && prev.version === state.version) {
@@ -290,6 +350,11 @@ export const sync = async (
       warmNow = new Set(prepared.warmedFiles.filter(
         (file) => !disclosedFiles.has(file) && !files.includes(file),
       ));
+    } else if (opts?.probe === "defer") {
+      // No prepared verdict and real drift on the send path: never run the
+      // impact cascade under the TUI's finger. Leave the baseline untouched
+      // so turn_end's full sync (the cheap backstop) reports and steers it.
+      return { structural: true, red: false, tokens: 0, details: { version: state.version, deferred: true } };
     } else {
       const result = await impact(root, { files, includeUncommitted: false, budget: params.budget });
       const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
@@ -408,7 +473,10 @@ export const sync = async (
     const detailBudget = params.budget - Math.ceil([...lines, steerLine].join("\n").length / 4);
     if (detailBudget >= 128) {
       try {
-        const detail = await focus(root, focusTarget, detailBudget);
+        // Reuse the state this verdict was computed against: both the warmed
+        // path and the inline path hold a current build, and the embed must
+        // not trigger its own probe/rebuild under the send path.
+        const detail = await focus(root, focusTarget, detailBudget, undefined, state);
         if (detail.text.trim()) {
           lines.push(...detail.text.split("\n"));
           pushed.add(focusTarget);

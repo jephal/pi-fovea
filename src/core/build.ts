@@ -433,14 +433,23 @@ const runAnchorPass = async (
 
 /**
  * Re-derive the implicit (tier-3 discovered) rule set for the current sigs
- * and, when it (or the base pack) changed, re-run anchors over every code
- * file — the same rules invalidation the monolithic build applied.
+ * and re-anchor exactly what the pack left stale. Anchors extract under the
+ * BASE pack during a fact pass because tier-3 promotions depend on sigs
+ * harvested mid-pass, so a pass leaves its dirty batch only base-anchored.
+ * The re-pass scope is therefore:
+ *  - the full code-file set only when the discovered pack actually changed
+ *    (previous anchors carry a different rulesSha — fresh builds included,
+ *    where the stored sha is ""), and
+ *  - just the dirty batch when the pack is unchanged but synthesizes implicit
+ *    rules the fact pass did not apply to them. Previously EVERY dirty refresh
+ *    re-ran ast-grep anchor extraction over every code file, which dominated
+ *    drift refreshes on repos with discovered rules.
  */
 const applyRulePack = async (
   root: string,
   store: FactStore,
   files: string[],
-  extractedWithSha: string | undefined,
+  dirty: string[],
 ): Promise<void> => {
   const base = await loadRepoRules(root);
   const sigsByFile: Record<string, FileSigs | undefined> = {};
@@ -450,14 +459,14 @@ const applyRulePack = async (
   const rulesSha = implicitRules.length
     ? createHash("sha1").update(base.sha).update(JSON.stringify(implicitRules.map((r) => r.id).sort())).digest("hex")
     : base.sha;
-  // Anchors extract under the BASE pack during a fact pass because tier-3
-  // promotions depend on sigs harvested mid-pass. Stale against what they
-  // actually ran with (fresh builds included, where stored rulesSha is "").
-  const anchorsStale = rulesSha !== (extractedWithSha ?? store.rulesSha);
+  const prevSha = store.rulesSha;
   store.rulesSha = rulesSha;
-  if (anchorsStale) {
+  if (rulesSha !== prevSha) {
     const codeFiles = files.filter((f) => !isConfigFile(f) && store.facts.has(f));
     await runAnchorPass(root, store, codeFiles, { pack, fileRoutes: base.fileRoutes });
+  } else if (rulesSha !== base.sha && dirty.length) {
+    const dirtyCode = dirty.filter((f) => !isConfigFile(f) && store.facts.has(f));
+    await runAnchorPass(root, store, dirtyCode, { pack, fileRoutes: base.fileRoutes });
   }
 };
 
@@ -581,7 +590,7 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
   clearTaint(store, dirty);
   await extractInto(root, store, dirty, contents, { pack: base.pack, fileRoutes: base.fileRoutes });
   settleTaint(store, new Set(files));
-  await applyRulePack(root, store, files, dirty.length ? base.sha : store.rulesSha);
+  await applyRulePack(root, store, files, dirty);
   // Anchor extraction failures implicate their files too (drained inside settleTaint
   // ran before applyRulePack; capture anchor-stage failures as a second drain).
   settleTaint(store, new Set(files));
@@ -704,8 +713,8 @@ export const refreshFacts = async (
   await extractInto(root, store, dirty, contents, { pack: base.pack, fileRoutes: base.fileRoutes });
   settleTaint(store, candidates);
   // Dirty files had anchors extracted under the base pack; clean files kept
-  // the stored pack's. Staleness is judged against whichever actually ran.
-  await applyRulePack(root, store, files, dirty.length ? base.sha : store.rulesSha);
+  // the stored pack's. applyRulePack re-anchors exactly what that leaves stale.
+  await applyRulePack(root, store, files, dirty);
   // A rules change can re-anchor clean files too; retain those failures.
   settleTaint(store, new Set(files));
 

@@ -315,7 +315,12 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
   });
 
 
-  it("injects out-of-band drift before the next model call", async () => {
+  it("defers hintless out-of-band drift instead of blocking the send", async () => {
+    // A raw filesystem write (bash / external editor / fabric_exec) has no
+    // tool-event warm, so the send path must NOT pay re-extraction +
+    // re-assembly inline. The TTL-bounded probe spots it, before_agent_start
+    // returns fast with nothing injected, and turn_end (the correctness
+    // backstop) rebuilds once, off the send path, and steers.
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-before-agent-"));
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
@@ -336,11 +341,54 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
         ),
       );
       const results = await loaded.emit("before_agent_start", { prompt: "continue" }, ctx);
+      expect(results.filter((result) => result !== undefined)).toEqual([]);
+      expect(loaded.messages).toHaveLength(0);
+      await loaded.emit("turn_end", {}, ctx);
+      expect(loaded.messages).toHaveLength(1);
+      expect(loaded.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+      expect(String(loaded.messages[0]!.message.content)).toContain("GET /api/users/{*}/idle");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still injects a warmed verdict before the agent starts", async () => {
+    // When the tool-edit warm landed before the user sends, the prepared
+    // verdict renders on the send path — fast, no rebuild — and steers
+    // pre-prompt exactly as before.
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-warm-agent-"));
+    cpSync(FIXTURE, root, { recursive: true });
+    execSync("git init -qb main && git add -A", { cwd: root });
+    execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    resetSessions();
+    resetSyncBaselines();
+    const loaded = load();
+    const ctx = fakeCtx(root);
+    try {
+      await ensureState(root);
+      await loaded.emit("before_agent_start", { prompt: "first" }, ctx);
+      await loaded.emit("turn_start", {}, ctx);
+      const main = path.join(root, "server/main.go");
+      await loaded.emit(
+        "tool_execution_start",
+        { toolCallId: "t1", toolName: "edit", args: { path: main } },
+        ctx,
+      );
+      writeFileSync(
+        main,
+        readFileSync(main, "utf8").replace(
+          'r.POST("/api/users", server.CreateUserHandler)',
+          'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/warmnext", server.GetUserHandler)',
+        ),
+      );
+      await loaded.emit("tool_execution_end", { toolCallId: "t1", toolName: "edit" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 600)); // debounce warm lands
+      const results = await loaded.emit("before_agent_start", { prompt: "continue" }, ctx);
       const injected = results.find((result) => typeof result === "object" && result !== null) as {
         message: Record<string, unknown>;
       };
       expect(injected.message).toMatchObject({ customType: "pi-fovea-sync", display: true });
-      expect(String(injected.message.content)).toContain("GET /api/users/{*}/idle");
+      expect(String(injected.message.content)).toContain("GET /api/users/{*}/warmnext");
       expect(loaded.messages).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });

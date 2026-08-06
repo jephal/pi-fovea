@@ -176,6 +176,16 @@ export default function fovea(pi: ExtensionAPI) {
           if (kick.started && ctx.hasUI && ms > 4000) {
             ctx.ui.notify(`Index ready — ${st.graph.files.length} files (${(ms / 1000).toFixed(1)}s)`, "info");
           }
+          // Pre-establish the sync baseline in the background so the very
+          // first prompt fast-paths instead of paying the snapshot on the
+          // send path. A /new, /fork, or reload bumps the epoch and clears it.
+          const pre = configFor(ctx.cwd, ctx.isProjectTrusted());
+          void sync(
+            ctx.cwd,
+            { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus },
+            st,
+            { probe: "full" },
+          ).catch(() => {});
         },
         (error) => {
           if (epoch !== lifecycleEpoch) return;
@@ -245,7 +255,10 @@ export default function fovea(pi: ExtensionAPI) {
         ctx.cwd,
         { files: [], budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus },
         undefined,
-        { probe: "cheap" },
+        // Respond to the Enter key, never block on it: the TTL-bounded probe
+        // detects out-of-band drift, a prepared warm verdict steers pre-prompt,
+        // and everything else defers to turn_end's full sync.
+        { probe: "defer" },
       );
       lastSyncError = undefined;
       if (outcome.red && outcome.text) {
@@ -258,7 +271,7 @@ export default function fovea(pi: ExtensionAPI) {
           },
         };
       }
-      if (outcome.structural && !outcome.details.baseline && cfg.sync.ackClean && ctx.hasUI) {
+      if (outcome.structural && !outcome.details.baseline && !outcome.details.deferred && cfg.sync.ackClean && ctx.hasUI) {
         ctx.ui.notify("Checked repository changes; no new action is needed.", "info");
       }
     } catch (error) {
@@ -443,6 +456,7 @@ export default function fovea(pi: ExtensionAPI) {
         return;
       }
       if (sub === "reset") {
+        lifecycleEpoch++;
         resetSessions();
         resetSyncBaselines();
         ctx.ui.notify("Fovea focus history and sync baseline reset.", "info");

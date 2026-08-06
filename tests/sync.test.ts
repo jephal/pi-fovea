@@ -396,4 +396,90 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
       rmSync(plain, { recursive: true, force: true });
     }
   });
+
+  it("defer mode keeps pure-conversation sends on the quick path", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await ensureState(root);
+    const first = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    expect(first.details.baseline).toBe("established");
+    const second = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    const third = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    // Nothing drifted and nothing rebuilt: both sends are silent no-ops, and
+    // the resident version is reported without a rebuild or baseline advance.
+    expect(second.structural).toBe(false);
+    expect(third.structural).toBe(false);
+    expect(third.details.version).toBe(first.details.version);
+  });
+
+  it("defer mode never rebuilds for hintless drift and leaves it to the backstop", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await ensureState(root);
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    const main = join(root, "server/main.go");
+    writeFileSync(main, readFileSync(main, "utf8").replace(
+      'r.POST("/api/users", server.CreateUserHandler)',
+      'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/defercheck", server.GetUserHandler)',
+    ));
+    // Hintless edit: the send-path verdict is deferred (no rebuild, no inline
+    // cascade) and the baseline stays untouched so turn_end still sees it.
+    const deferred = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    expect(deferred.details.deferred).toBe(true);
+    expect(deferred.red).toBe(false);
+    // The turn_end backstop (default full probe) reports and steers it.
+    const follow = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    expect(follow.red).toBe(true);
+    expect(follow.text).toContain("GET /api/users/{*}/defercheck");
+    execSync("git checkout -- server/main.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
+
+  it("defer mode renders a prepared warm verdict on the send path", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    const users = join(root, "server/users.go");
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    await warmSync(root, { files: ["server/users.go"], budget: 512 });
+    const out = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    expect(out.red).toBe(true);
+    expect(out.text).toContain("Steer: account for this update");
+    expect(out.text).toContain("server/users.go");
+    // Rendering the warm verdict advanced the baseline; the next send is a
+    // no-op quick path.
+    const again = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    expect(again.structural).toBe(false);
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
+
+  it("warm-embedded focus reuses the verdict state (no double probe)", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    const users = join(root, "server/users.go");
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    const inline = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
+    const inlineRed = inline.red;
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    await warmSync(root, { files: ["server/users.go"], budget: 512 });
+    const warmed = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }, undefined, { probe: "defer" });
+    // The warm verdict renders on the send path and embeds focus from the
+    // exact state the warm built — red like the inline compute, focus pushed
+    // (not a pull advisory), steer line present.
+    expect(warmed.red).toBe(inlineRed);
+    expect(String(warmed.text)).toContain('fovea focus "server/users.go"');
+    expect(String(warmed.text)).not.toContain("Next:");
+    expect(String(warmed.text)).toContain("Steer: account for this update");
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
 });
