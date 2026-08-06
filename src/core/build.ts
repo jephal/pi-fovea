@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import { LANG_BY_EXT, isBinaryExt, isConfigFile } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
 import { buildJoinIndex } from "./join.js";
-import { extractAnchors, loadRepoRules } from "./anchors.js";
+import { extractAnchors, extractFileRoutes, loadRepoRules } from "./anchors.js";
 import type { CallSite, Edge, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
 import { coChangePairs } from "./cochange.js";
@@ -25,7 +25,7 @@ export interface FileFacts {
   anchors: AnchorDraft[];
 }
 
-const CACHE_VERSION = 4; // bump when extractor semantics change
+const CACHE_VERSION = 5; // bump when extractor semantics change
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods"]);
 const MAX_FILES = 24000;
 // Generated dependency manifests are enormous and carry no first-class routes.
@@ -41,12 +41,14 @@ const isJunk = (f: string): boolean => {
   return LOCKFILE_NAMES.has(base) || base.endsWith(".lock");
 };
 
-const supported = (f: string): boolean => {
+const supported = (f: string, routeRes?: RegExp[]): boolean => {
   const ext = f.split(".").pop()?.toLowerCase() ?? "";
-  return !isBinaryExt(f) && (ext in LANG_BY_EXT || isConfigFile(f));
+  if (!isBinaryExt(f) && (ext in LANG_BY_EXT || isConfigFile(f))) return true;
+  // File-convention routers use extensions with no ast-grep lang (.svelte, .mdx).
+  return routeRes?.some((re) => re.test(f)) ?? false;
 };
 
-export const listFiles = (root: string): string[] => {
+export const listFiles = (root: string, routeRes?: RegExp[]): string[] => {
   const res = spawnSync("git", ["-C", root, "ls-files", "-co", "--exclude-standard"], {
     encoding: "utf8",
     timeout: 30_000,
@@ -67,14 +69,14 @@ export const listFiles = (root: string): string[] => {
         const rel = prefix ? `${prefix}/${e.name}` : e.name;
         if (e.isDirectory()) {
           if (!IGNORE_DIRS.has(e.name)) walk(joinPath(dir, e.name), rel);
-        } else if (e.isFile() && supported(rel)) {
+        } else if (e.isFile() && supported(rel, routeRes)) {
           files.push(rel);
         }
       }
     };
     walk(root, "");
   }
-  files = files.filter((f) => supported(f) && !isJunk(f));
+  files = files.filter((f) => supported(f, routeRes) && !isJunk(f));
   files.sort();
   return files.slice(0, MAX_FILES);
 };
@@ -101,7 +103,7 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
   } catch {
     cached = undefined;
   }
-  const { pack: anchorPack, sha: rulesSha } = loadRepoRules(root);
+  const { pack: anchorPack, fileRoutes, sha: rulesSha } = loadRepoRules(root);
   const rulesChanged = cached !== undefined && cached.rulesSha !== rulesSha;
   if (cached && (cached.version !== CACHE_VERSION || cached.root !== root)) cached = undefined;
   const facts: Record<string, FileFacts> = {};
@@ -158,6 +160,9 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
       return best ? `${best.name}@${best.file}` : `file:${file}`;
     };
     putByFile(extractAnchors(anchorTargets, root, enclosingId, anchorPack), (f, v) => f.anchors.push(v));
+    // File-convention routes (Next/SvelteKit/Nuxt): the route path is derived
+    // from the file path; verbs come from exported handler names or suffix.
+    putByFile(extractFileRoutes(anchorTargets, root, fileRoutes), (f, v) => f.anchors.push(v));
   }
   try {
     mkdirSync(dirname(cacheFile), { recursive: true });

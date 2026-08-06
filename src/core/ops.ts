@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { posix } from "node:path";
 import { hasAstGrep } from "./astgrep.js";
 import { assembleGraph, listFiles, loadFacts, type FileFacts } from "./build.js";
+import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
 import { revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "./render.js";
 import { getSession, TK_ORDER } from "./session.js";
@@ -49,7 +50,9 @@ export const ensureState = (root: string): RepoState => {
       "fovea: `ast-grep` binary not found on PATH (set FOVEA_AST_GREP to override). Install: https://ast-grep.github.io/",
     );
   }
-  const files = listFiles(root);
+  const { fileRoutes } = loadRepoRules(root);
+  const routeRes = fileRoutes.map((r) => new RegExp(r.re));
+  const files = listFiles(root, routeRes);
   const facts = loadFacts(root, files);
   const version = graphVersion(facts);
   const cached = states.get(root);

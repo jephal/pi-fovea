@@ -5,12 +5,13 @@
 //   fovea focus [root] <query> [budget]
 //   fovea dwell [root] [factor] [budget]     (deepens the in-process focus)
 //   fovea impact [root] [--files a,b] [--symbols x,y] [--base ref] [--no-uncommitted] [budget]
+//   fovea anchors [root] [filter]             (every feature anchor, sorted)
 //
 // The CLI is stateless across invocations (dwell needs a prior focus in the
 // same process — combine ops inside pi, where sessions persist); stdout is
 // the rendered field, nothing else, so it composes with head/grep/$().
 
-import { sketch, focus, dwell, impact } from "./src/core/ops.js";
+import { ensureState, sketch, focus, dwell, impact } from "./src/core/ops.js";
 
 const [, , cmd = "status", ...argv] = process.argv;
 
@@ -71,6 +72,14 @@ try {
       includeUncommitted: !flags.has("no-uncommitted"),
       budget: B ?? 2000,
     }).text;
+  } else if (cmd === "anchors") {
+    const root = rootAt(0);
+    const filter = pos.find((p) => p !== root);
+    const rows = ensureState(root).graph.anchors
+      .map((a) => `${a.kind}\t${a.id}\t${a.file}:${a.line}`)
+      .filter((r) => !filter || r.includes(filter))
+      .sort();
+    out = rows.join("\n");
   } else {
     console.error(`unknown command: ${cmd}`);
     process.exit(2);

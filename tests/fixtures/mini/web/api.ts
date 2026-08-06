@@ -14,3 +14,6 @@ export async function createUser(name: string): Promise<User> {
 	const res = await fetch("/api/users", { method: "POST" });
 	return res.json();
 }
+declare const axios: { get: (url: string) => Promise<unknown> };
+export const fetchOrder = (id: string) => axios.get(`/api/orders/${id}`);
+

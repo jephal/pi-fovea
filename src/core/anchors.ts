@@ -1,8 +1,19 @@
 // Feature anchors: where a feature touches the outside world. Anchors are
 // extracted by a declarative rule pack (ast-grep patterns + metadata), so new
-// frameworks are added as data. A route registration is the canonical anchor:
-// one pattern shape covers express/koa (TS), gin/echo/chi (Go), flask/fastapi
-// decorators (Python), and axum-style chains (Rust).
+// frameworks are added as data. The pack covers five port shapes:
+//
+//   1. recv.verb("path", handlers...)        express/koa/gin/echo/chi(net style)
+//   2. verb-annotation on handler            Nest/Flask/FastAPI(+class prefix)
+//   3. verb embedded in the path string      Go 1.22 mux.HandleFunc("GET /x", h)
+//   4. receiver-less route DSL               Rails, Phoenix, Django
+//   5. file-convention routes                Next/SvelteKit/Nuxt (extractFileRoutes)
+//
+// Every captured token still has to validate as a path before it can become a
+// hub — the route string is the real discriminator, the call shape is flavor.
+// Known blind spots (documented in README): Rust proc-macro attributes
+// (actix/rocket) — ast-grep cannot parameterize attribute paths; frameworks
+// with constructor-assigned prefixes (Flask Blueprint, FastAPI APIRouter,
+// chi Mount); tRPC/GraphQL/gRPC have no path token to anchor at all.
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -24,15 +35,45 @@ export interface AnchorRule {
    * prefix + suffix so the anchor id is the full router-visible path.
    */
   prefixPattern?: string[];
+  /** Metavar name that carries the HTTP verb (e.g. chi `r.Method("GET", …)`). */
+  verbFrom?: string;
+  /** Idiom writes paths mount-relative (Django `path("users/")`): root them. */
+  mountRoot?: boolean;
 }
 
-const PLACEHOLDER_ONLY = /^(:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$/;
+const HTTP_VERB_RE = /^(?i:get|post|put|delete|patch|head|options)$/;
+
+// Verbs-in-path: Go 1.22 net/http ServeMux writes the verb inside the pattern.
+const VERB_IN_PATH = /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\/\S*)$/;
+
+// Arg-node captures land with their quote chars (and Python prefixes):
+// '"/users"', "'/items'", '`/users/${id}`', 'f"/users/{id}"' → inner content.
+const QUOTED_RE = /^[rbfuRBFU]{0,3}(["'`])([\s\S]*)\1$/;
+const unquote = (s: string): string => {
+  const m = QUOTED_RE.exec(s.trim());
+  return m ? m[2]! : s.trim();
+};
+
+const PLACEHOLDER_ONLY = /^(:[A-Za-z_]\w*|\{[A-Za-z_]\w*\}|\[[A-Za-z_]\w*\])$/;
+
+// Method names that are mounts, not verbs: Django urls, Rails match/root,
+// Spring's umbrella RequestMapping. They anchor as ANY so the hub exists
+// without pretending a verb was declared.
+const NON_VERB_METHODS = new Set(["PATH", "RE_PATH", "URL", "MATCH", "ROOT", "REQUESTMAPPING", "REDIRECT", "RESOURCES"]);
+
+const deriveVerb = (method: string): string => {
+  let up = method.toUpperCase();
+  if (up.endsWith("MAPPING")) up = up.slice(0, -"MAPPING".length); // Spring GetMapping → GET
+  return NON_VERB_METHODS.has(up) ? "ANY" : up;
+};
 
 export const DEFAULT_PACK: AnchorRule[] = [
   {
+    // `$P` as an arg NODE, not in-string: binds across double/single quotes,
+    // backticks and Python f-strings. Quote chars are stripped by unquote().
     id: "http-route-call",
     langs: ["TypeScript", "Tsx", "JavaScript", "Go"],
-    pattern: '$R.$M("$P", $$$H)',
+    pattern: "$R.$M($P, $$$H)",
     methods: "^(?i:get|post|put|delete|patch|head|options|all|use|any|handle|handlefunc|route|group)$",
     kind: "route",
   },
@@ -41,53 +82,120 @@ export const DEFAULT_PACK: AnchorRule[] = [
     // feature hubs when they reference a real path (validated below).
     id: "http-verb-single-arg",
     langs: ["TypeScript", "Tsx", "JavaScript"],
-    pattern: '$R.$M("$P")',
+    pattern: "$R.$M($P)",
     methods: "^(?i:get|post|put|delete|patch)$",
     kind: "route",
   },
   {
-    id: "http-route-call-singlequote",
-    langs: ["TypeScript", "Tsx", "JavaScript"],
-    pattern: "$R.$M('$P', $$$H)",
-    methods: "^(?i:get|post|put|delete|patch|all|use|handle|route)$",
+    id: "http-verb-single-arg-py",
+    langs: ["Python"],
+    pattern: "$R.$M($P)",
+    methods: "^(get|post|put|delete|patch|head|options)$",
     kind: "route",
   },
   {
-    // NestJS / decorator shape: @Get("/users/:id") on a controller method.
+    id: "python-route-call",
+    langs: ["Python"],
+    pattern: "$R.$M($P, $$$H)",
+    methods: "^(?:add_)?(?:get|post|put|delete|patch|head|options|route)$",
+    kind: "route",
+  },
+  {
+    // NestJS / Angular-style decorators; class prefix via @Controller.
     id: "ts-http-decorator",
     langs: ["TypeScript", "Tsx"],
-    pattern: '@$M("$P")',
+    pattern: "@$M($P)",
     methods: "^(?i:get|post|put|delete|patch|options|head)$",
     kind: "route",
-    prefixPattern: ['@Controller("$P")', "@Controller('$P')"],
-  },
-  {
-    // Single-quotes dominate real NestJS codebases (NOMAD, starters, docs).
-    id: "ts-http-decorator-singlequote",
-    langs: ["TypeScript", "Tsx"],
-    pattern: "@$M('$P')",
-    methods: "^(?i:get|post|put|delete|patch|options|head)$",
-    kind: "route",
-    prefixPattern: ['@Controller("$P")', "@Controller('$P')"],
+    prefixPattern: ["@Controller($P)"],
   },
   {
     id: "python-decorator-route",
     langs: ["Python"],
-    pattern: '@$R.$M("$P")',
+    pattern: "@$R.$M($P)",
     methods: "^(get|post|put|delete|patch|route|websocket)$",
     kind: "route",
   },
   {
-    id: "python-decorator-route-singlequote",
-    langs: ["Python"],
-    pattern: "@$R.$M('$P')",
-    methods: "^(get|post|put|delete|patch|route|websocket)$",
+    // chi r.Method("GET", "/x", h), aiohttp web.route(...)/router.add_route(...).
+    id: "verb-as-argument",
+    langs: ["Go", "Python", "TypeScript", "Tsx", "JavaScript"],
+    pattern: '$R.$M("$V", "$P", $$$H)',
+    methods: "^(?i:method|methodfunc|add_route|add_view|route)$",
     kind: "route",
+    verbFrom: "V",
+  },
+  {
+    // aiohttp module-level / receiver-free form: route("GET", "/x", h).
+    id: "verb-as-argument-norecv",
+    langs: ["Python"],
+    pattern: '$M("$V", "$P", $$$H)',
+    methods: "^route$",
+    kind: "route",
+    verbFrom: "V",
+  },
+  {
+    // Django urlconf; mounts for every verb, so they anchor as ANY /x.
+    id: "django-url",
+    langs: ["Python"],
+    pattern: '$M("$P", $$$H)',
+    methods: "^(path|re_path|url)$",
+    kind: "route",
+    mountRoot: true,
+  },
+  {
+    // Rails routes.rb macros. Bare word form, string content capture.
+    id: "rails-route-macro",
+    langs: ["Ruby"],
+    pattern: '$M "$P", $$$R',
+    methods: "^(get|post|put|delete|patch|match|redirect|mount|root|head|options)$",
+    kind: "route",
+  },
+  {
+    id: "rails-route-macro-sq",
+    langs: ["Ruby"],
+    pattern: "$M '$P', $$$R",
+    methods: "^(get|post|put|delete|patch|match|redirect|mount|root|head|options)$",
+    kind: "route",
+  },
+  {
+    // Phoenix router.ex macros. Scope prefixes are not composed (see README).
+    // resources expands to the REST verb set — anchor the mount as ANY,
+    // the hub still merges with controller code via literal joins.
+    id: "phoenix-route-macro",
+    langs: ["Elixir"],
+    pattern: '$M "$P", $$$R',
+    methods: "^(get|post|put|delete|patch|head|options|forward|resources)$",
+    kind: "route",
+  },
+  {
+    id: "phoenix-route-call",
+    langs: ["Elixir"],
+    pattern: '$M("$P", $$$R)',
+    methods: "^(get|post|put|delete|patch|head|options|forward|resources)$",
+    kind: "route",
+  },
+  {
+    // Ktor routing DSL: get("/health") { … }
+    id: "ktor-routing-dsl",
+    langs: ["Kotlin"],
+    pattern: '$M("$P") { $$$B }',
+    methods: "^(get|post|put|delete|patch|head|options|route)$",
+    kind: "route",
+  },
+  {
+    // Spring MVC / WebFlux: class @RequestMapping prefix x method @GetMapping.
+    id: "spring-mapping-annotation",
+    langs: ["Java", "Kotlin"],
+    pattern: '@$M("$P")',
+    methods: "^(Get|Post|Put|Delete|Patch)Mapping$",
+    kind: "route",
+    prefixPattern: ['@RequestMapping("$P")'],
   },
   {
     id: "flask-add-url-rule",
     langs: ["Python"],
-    pattern: '$R.add_url_rule("$P", $$$H)',
+    pattern: "$R.add_url_rule($P, $$$H)",
     methods: "^add_url_rule$",
     kind: "route",
   },
@@ -123,26 +231,39 @@ export const extractAnchors = (
     for (const lang of rule.langs) {
       const langFiles = byLang.get(lang);
       if (!langFiles?.length) continue;
-      const prefixes = new Map<string, string>(); // file -> @Controller prefix
+      const prefixes = new Map<string, string>(); // file -> class-level path prefix
       if (rule.prefixPattern?.length) {
         for (const pm of patternRunAll(rule.prefixPattern, lang, langFiles, cwd)) {
           const p = pm.single.P?.trim();
-          if (p !== undefined && !prefixes.has(pm.file)) prefixes.set(pm.file, p);
+          if (p !== undefined && !prefixes.has(pm.file)) prefixes.set(pm.file, unquote(p));
         }
       }
       for (const m of patternRun(rule.pattern, lang, langFiles, cwd)) {
         const method = m.single.M;
-        const path = m.single.P;
-        if (!method || !path || !methodRe.test(method)) continue;
+        const pathLike = m.single.P;
+        if (!method || !pathLike || !methodRe.test(method)) continue;
         const prefix = prefixes.get(m.file);
-        const raw = prefix !== undefined && prefix !== "" ? joinRoute(prefix, path.trim()) : path.trim();
+        let raw = prefix !== undefined && prefix !== "" ? joinRoute(prefix, unquote(pathLike)) : unquote(pathLike);
+        if (rule.mountRoot && !raw.startsWith("/")) raw = "/" + raw.replace(/^\/+/, "");
+        // Verb embedded in the path string (Go 1.22 mux, Starlette Route).
+        const vip = VERB_IN_PATH.exec(raw);
+        let verbOverride: string | undefined;
+        if (vip) {
+          verbOverride = vip[1]!.toUpperCase();
+          raw = vip[2]!;
+        }
         // $R.$M(...) also matches Map.get("key")-style data access; only real
-        // paths (or router-relative placeholders like ":id") may anchor.
+        // paths (or router-relative placeholders like ":id", "[id]") anchor.
         if (!PATH_TOKEN_RE.test(raw) && !PLACEHOLDER_ONLY.test(raw)) continue;
+        let httpMethod: string;
+        if (rule.verbFrom) {
+          const v = m.single[rule.verbFrom];
+          if (!v || !HTTP_VERB_RE.test(v)) continue;
+          httpMethod = v.toUpperCase();
+        } else {
+          httpMethod = verbOverride ?? deriveVerb(method);
+        }
         const norm = normalizeLiteral(raw, "path");
-        const httpMethod = method.toUpperCase() === "ROUTE" || method.toLowerCase() === "route" || method.toLowerCase() === "use" || method.toLowerCase() === "any"
-          ? method.toUpperCase()
-          : method.toUpperCase();
         const label = `${httpMethod} ${norm}`;
         const enclosing = resolveEnclosing(m.file, m.line);
         out.push({
@@ -166,26 +287,132 @@ export const extractAnchors = (
   });
 };
 
+// --- file-convention routes -------------------------------------------------
+
+// Frameworks where the route *is* the file path (no route string exists in
+// code at all): Next App Router, SvelteKit, Nuxt. Each rule is a regex with
+// capture group 1 = route stem, plus how verbs are known.
+export interface FileRouteRule {
+  id: string;
+  re: string;
+  verbs: "exports" | "suffix";
+  pathPrefix?: string; // prepended to the derived route (Nuxt /api)
+  kind?: string; // default "route"
+}
+
+export const DEFAULT_FILE_ROUTES: FileRouteRule[] = [
+  { id: "next-app-route", re: "(?:^|/)app/(.+)/route\\.(?:ts|tsx|js|jsx|mjs)$", verbs: "exports", kind: "route" },
+  { id: "next-app-page", re: "(?:^|/)app/(?:(.+)/)?page\\.(?:tsx|jsx|mdx)$", verbs: "suffix", kind: "page" },
+  { id: "next-pages-api", re: "(?:^|/)pages/api/(.+)\\.(?:ts|tsx|js|jsx)$", verbs: "suffix", pathPrefix: "/api", kind: "route" },
+  { id: "sveltekit-server", re: "(?:^|/)src/routes/(?:(.+)/)?\\+server\\.(?:ts|js)$", verbs: "exports", kind: "route" },
+  { id: "sveltekit-page", re: "(?:^|/)src/routes/(?:(.+)/)?\\+page\\.(?:svelte|md)$", verbs: "suffix", kind: "page" },
+  { id: "nuxt-server-api", re: "(?:^|/)server/api/(.+)\\.(?:ts|js|mjs)$", verbs: "suffix", pathPrefix: "/api", kind: "route" },
+  { id: "astro-endpoint", re: "(?:^|/)src/pages/(.+)\\.(?:ts|js|mjs)$", verbs: "exports", kind: "route" },
+];
+
+// `export async function GET`, `export const POST` — route handler verbs.
+const EXPORTED_VERB_RE = /\bexport\s+(?:(?:async\s+)?function\s+|const\s+)(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/g;
+const SUFFIX_VERB_RE = /\.(get|post|put|delete|patch|head|options)$/i;
+
+// Cards → concrete path. `(group)` segments vanish (Next), dynamic segments
+// become the canonical {*} placeholder, `index` is the path itself.
+const FILE_DYNAMIC_SEG = /^@?\[+(?:\.\.\.)?[^\]]+\]+$/; // [x], [...x], [[...x]] (optional catch-all), @[x]
+const toFileRoutePath = (stem: string): string => {
+  if (stem === "") return "/";
+  const segs = stem.split("/").flatMap((seg) => {
+    if (!seg || /^\(.+\)$/.test(seg)) return [];
+    if (FILE_DYNAMIC_SEG.test(seg)) return ["{*}"];
+    if (seg === "index") return [];
+    return [seg];
+  });
+  return "/" + segs.filter((s) => s !== "").join("/");
+};
+
+export const extractFileRoutes = (files: string[], root: string, rules: FileRouteRule[] = DEFAULT_FILE_ROUTES): AnchorDraft[] => {
+  const compiled = rules.map((r) => ({ rule: r, re: new RegExp(r.re) }));
+  const out: AnchorDraft[] = [];
+  for (const file of files) {
+    for (const { rule, re } of compiled) {
+      const match = re.exec(file);
+      if (!match) continue;
+      let stem = match[1] ?? ""; // optional dir group: route lives at the root
+      if (!stem && !rule.pathPrefix) { /* root page/endpoint: keep going, path is / */ }
+      const verbs = new Set<string>();
+      let suffixVerb: string | undefined;
+      const sv = SUFFIX_VERB_RE.exec(stem);
+      if (sv) {
+        suffixVerb = sv[1]!.toUpperCase();
+        stem = stem.slice(0, -sv[0].length);
+      }
+      if (rule.verbs === "suffix") {
+        if (suffixVerb) verbs.add(suffixVerb);
+      } else {
+        let content = "";
+        try {
+          content = readFileSync(joinPath(root, file), "utf8");
+        } catch {
+          // unreadable: fall through with no verbs
+        }
+        for (const vm of content.matchAll(EXPORTED_VERB_RE)) verbs.add(vm[1]!);
+      }
+      if (verbs.size === 0) verbs.add("ANY")
+      const rel = (rule.pathPrefix ?? "") + toFileRoutePath(stem);
+      const norm = normalizeLiteral(rel, "path");
+      for (const verb of verbs) {
+        const label = `${verb} ${norm}`;
+        out.push({
+          id: label,
+          kind: rule.kind ?? "route",
+          label,
+          nodeId: `file:${file}`,
+          file,
+          line: 0,
+        });
+      }
+    }
+  }
+  return dedupeAnchors(out);
+};
+
+const dedupeAnchors = (out: AnchorDraft[]): AnchorDraft[] => {
+  const seen = new Set<string>();
+  return out.filter((a) => {
+    const k = `${a.id}|${a.file}|${a.line}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+};
+
 // Re-export so callers can classify an anchor path like any literal.
 export const anchorClassify = classifyLiteral;
 
-// Repo-local overrides: .fovea/rules.json = { "rules": AnchorRule[] }.
-// Merged after the default pack; the content hash invalidates the fact cache
-// so changing rules rebuilds anchors only.
-export const loadRepoRules = (root: string): { pack: AnchorRule[]; sha: string } => {
+// Hash of the built-in packs: code changes to the default pack invalidate
+// cached anchor facts even when a repo ships no rules.json of its own.
+const DEFAULTS_SHA = createHash("sha1")
+  .update(JSON.stringify(DEFAULT_PACK))
+  .update(JSON.stringify(DEFAULT_FILE_ROUTES))
+  .digest("hex");
+
+// Repo-local overrides: .fovea/rules.json = { "rules": AnchorRule[], "fileRoutes": FileRouteRule[] }.
+export const loadRepoRules = (root: string): { pack: AnchorRule[]; fileRoutes: FileRouteRule[]; sha: string } => {
   let raw = "";
   try {
     raw = readFileSync(joinPath(root, ".fovea", "rules.json"), "utf8");
   } catch {
-    return { pack: DEFAULT_PACK, sha: "" };
+    return { pack: DEFAULT_PACK, fileRoutes: DEFAULT_FILE_ROUTES, sha: DEFAULTS_SHA };
   }
+  // Repo rules extend defaults; the defaults themselves ride in the hash,
+  // so upgrading pi-fovea invalidates anchors even with no repo rules file.
+  const sha = createHash("sha1").update(DEFAULTS_SHA + raw).digest("hex");
   try {
-    const parsed = JSON.parse(raw) as { rules?: AnchorRule[] };
+    const parsed = JSON.parse(raw) as { rules?: AnchorRule[]; fileRoutes?: FileRouteRule[] };
     const rules = (parsed.rules ?? []).filter(
       (r) => r && typeof r.pattern === "string" && typeof r.methods === "string" && Array.isArray(r.langs),
     );
-    return { pack: [...DEFAULT_PACK, ...rules], sha: createHash("sha1").update(raw).digest("hex") };
+    const fileRoutes = (parsed.fileRoutes ?? []).filter((r) => r && typeof r.re === "string" && typeof r.verbs === "string");
+    return { pack: [...DEFAULT_PACK, ...rules], fileRoutes: [...DEFAULT_FILE_ROUTES, ...fileRoutes], sha };
   } catch {
-    return { pack: DEFAULT_PACK, sha: createHash("sha1").update(raw).digest("hex") };
+    return { pack: DEFAULT_PACK, fileRoutes: DEFAULT_FILE_ROUTES, sha: createHash("sha1").update(raw).digest("hex") };
   }
 };

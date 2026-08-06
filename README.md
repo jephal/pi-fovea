@@ -120,7 +120,21 @@ Global `~/.pi/agent/fovea.json`; project override `<repo>/.pi/fovea.json` when t
 
 ## Repo rule packs
 
-Drop `.fovea/rules.json` in a repo to extend anchor detection beyond the built-ins (express/orval chains, NestJS decorators, Flask/FastAPI decorators, Go chi/mux, axum):
+The built-in pack catches route declarations by **port shape**, not framework name — five shapes cover almost the whole ecosystem:
+
+| Port shape | Examples |
+|---|---|
+| `recv.verb("path", handlers…)` | express, koa, fastify, hono, gin, echo, chi, net/http (any quotes, incl. TS template literals and Python f-strings) |
+| verb-annotation + optional class prefix | NestJS `@Controller + @Get`, Flask/FastAPI decorators, Spring `@RequestMapping + @GetMapping` |
+| verb embedded in the path | Go 1.22 `mux.HandleFunc("GET /x", h)` |
+| verb as first string argument | chi `r.Method("GET", path, h)`, aiohttp `router.add_route("GET", path, h)` |
+| receiver-less DSL macros | Rails `routes.rb`, Phoenix `router.ex`, Django `path()`, Ktor `routing { get("/x") {} }` |
+
+File-convention routers never write a route string at all — those anchors are derived from **file paths** (Next.js App Router `app/**/route.ts` + `page.tsx`, Pages Router `pages/api/**`, SvelteKit `+server.ts` / `+page.svelte`, Nuxt `server/api/**.get.ts`, Astro endpoints), with verbs pulled from exported handler names or file-name suffixes.
+
+**Known blind spots** (deliberate, logged in `src/core/anchors.ts`): Rust proc-macro attribute routers (actix `#[get("/x")]`, rocket) — ast-grep patterns can't parameterize attribute paths; frameworks with constructor-assigned prefixes (Flask Blueprint, FastAPI `APIRouter(prefix=…)`, chi `Mount`, Express `Router` mounts) — variable binding tracking is out of band; `scope`/`namespace` nesting in Phoenix/Rails/Django `include()` — prefixes across blocks aren't composed; tRPC/GraphQL/gRPC — no path token exists to anchor on.
+
+Drop `.fovea/rules.json` in a repo to extend anchor detection beyond the built-ins:
 
 ```json
 {
