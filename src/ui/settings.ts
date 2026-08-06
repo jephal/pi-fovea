@@ -36,7 +36,7 @@ import {
 
 const BOOLEANS = ["true", "false"] as const;
 const BUDGETS = [256, 512, 1024, 2048, 4096, 8192] as const;
-const THRESHOLDS = [1, 2, 3, 5, 8, 13] as const;
+const THRESHOLDS = [0.05, 0.1, 0.15, 0.25, 0.5, 1] as const;
 
 const SELECT_LAYOUT: SelectListLayoutOptions = {
   minPrimaryColumnWidth: 12,
@@ -249,10 +249,10 @@ const buildItems = (
       "Show a brief notification after changed-but-actionless turns. Default off; clean turns spend no model tokens.",
     values: BOOLEANS,
   }),
-  setting("sync.warmFileThreshold", "Steer threshold", String(config.sync.warmFileThreshold), {
+  setting("sync.steerThreshold", "Steer threshold", String(config.sync.steerThreshold), {
     description:
-      "How many newly relevant files justify steering the model. Higher means fewer continuations; route changes always steer.",
-    submenu: numericSubmenu(theme, THRESHOLDS, "Relevance threshold", "Newly relevant file count that steers the model."),
+      "Total surprise (channel-weighted heat above the session's sync memory) that justifies steering the model. Higher means fewer continuations; route changes always steer.",
+    submenu: numericSubmenu(theme, THRESHOLDS, "Steer threshold", "Surprise mass that steers the model."),
   }),
   setting("sync.pushFocus", "Push focus detail", config.sync.pushFocus ? "true" : "false", {
     description:

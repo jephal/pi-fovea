@@ -34,7 +34,7 @@ const sandbox = (src: string, name: string): string => {
 
 // Mirror of src/index.ts turn_end with clean acknowledgements shown for the demo.
 const simulateTurnEnd = async (root: string, touched: string[]): Promise<SyncOutcome> => {
-  const outcome = await sync(root, { files: touched, budget: 1024, warmFileThreshold: 2 });
+  const outcome = await sync(root, { files: touched, budget: 1024, steerThreshold: 0.15 });
   if (!outcome.structural) {
     console.log(`\x1b[32m(sync: unchanged — nothing emitted)\x1b[0m`);
   } else if (outcome.red && outcome.text) {

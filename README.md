@@ -153,7 +153,7 @@ Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override 
 | `sync.enabled` | `true` | pre-agent and post-turn continuous sync |
 | `sync.budget` | `1024` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
-| `sync.warmFileThreshold` | `2` | newly relevant files that justify proactive model steering |
+| `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |
 | `sync.pushFocus` | `true` | embed a budgeted focus preview of the top drift target in red syncs |
 | `tools.defaultBudget` | `2000` | fallback maxTokens for the fovea_* tools |
 | `tools.replaceGrep` | `true` | install hybrid native-text / bare-query graph grep |

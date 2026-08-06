@@ -23,8 +23,10 @@ interface SyncBaseline {
   shas: Map<string, string>;
   /** file -> extracted semantic facts, excluding the content hash. */
   semantics: Map<string, string>;
-  /** Previously reported undisclosed warmth, for delta delivery. */
-  warmed?: Set<string>;
+  /** file -> absorbed cascade mass (μ): the decayed union of all reported warmth. */
+  heat?: Map<string, number>;
+  /** Hysteresis latch: any red sync disarms warmth firing until total surprise drops back into the re-arm fraction. */
+  warmthArmed?: boolean;
   /** Drift targets already push-embedded in this baseline chain (embed-once). */
   pushed?: Set<string>;
 }
@@ -49,6 +51,28 @@ export const resetSyncBaselines = (): void => {
   warmCache.clear();
 };
 
+// Channel priors for the surprise gate. A cascade whose only evidence is a
+// weak-prior channel (shared literal, co-change) must move proportionally
+// more raw heat to steer. Reason labels mirror reasonFor() in ops.ts.
+const CHANNEL_WEIGHT: Record<string, number> = {
+  "call dependency": 1,
+  "import dependency": 1,
+  "test dependency": 1,
+  "inheritance": 1,
+  "shared route": 1,
+  "co-change history": 0.5,
+  "shared literal": 0.35,
+  "graph path": 0.5,
+};
+// Unlabeled multi-hop warmth.
+const CHANNEL_UNKNOWN = 0.5;
+// Heat memory decay per structural sync (μ ← 0.7μ): repeat warmth re-fires
+// only once it exceeds what the session was already told.
+const HEAT_DECAY = 0.7;
+// Hysteresis re-arm band, as a fraction of the steer threshold.
+const REARM_FRACTION = 0.5;
+const round4 = (x: number): number => Math.round(x * 1e4) / 1e4;
+
 // Background warm. The blocking `sync` call on the user-perceived send path
 // (before_agent_start / turn_end) recomputes extraction, graph assembly, the
 // baseline fingerprint, and the impact cascade whenever the repo drifted.
@@ -67,6 +91,7 @@ interface WarmCompute {
   snapshot: SyncBaseline;
   /** impact() outputs for the changed set. */
   warmedFiles: string[];
+  warmedMass: Record<string, number>;
   warmReasons: Record<string, string[]>;
 }
 
@@ -110,6 +135,7 @@ export const warmSync = async (root: string, params: WarmParams, state?: RepoSta
       filesKey: key,
       snapshot: next,
       warmedFiles: (result.details.warmedFiles as string[] | undefined) ?? [],
+      warmedMass: (result.details.warmedMass as Record<string, number> | undefined) ?? {},
       warmReasons: (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {},
     });
     while (warmCache.size > ROOT_CACHE_LIMIT) warmCache.delete(warmCache.keys().next().value!);
@@ -124,7 +150,10 @@ export interface SyncParams {
    * turn). Unioned into the warmth seeds; never the source of truth. */
   files?: string[];
   budget: number;
-  warmFileThreshold: number;
+  /** Total surprise (channel-adjusted cascade mass above the session heat
+   * memory) that justifies proactive steering on warmth alone. Route and
+   * deletion signals bypass it. */
+  steerThreshold: number;
   /** Push vs pull (default push): embed the top file target's focus context. */
   pushFocus?: boolean;
 }
@@ -231,7 +260,7 @@ export const sync = async (
   const files = [...new Set([...semanticChanged, ...hinted])];
 
   let warmNow: Set<string> = new Set();
-  let warmNew: string[] = [];
+  let warmMass: Record<string, number> = {};
   let warmReasons: Record<string, string[]> = {};
   let preparedBaseline: SyncBaseline | undefined;
   if (files.length) {
@@ -247,6 +276,7 @@ export const sync = async (
     if (preparedHit) {
       warmCache.delete(root);
       preparedBaseline = prepared.snapshot;
+      warmMass = prepared.warmedMass;
       warmReasons = prepared.warmReasons;
       warmNow = new Set(prepared.warmedFiles.filter(
         (file) => !disclosedFiles.has(file) && !files.includes(file),
@@ -254,32 +284,76 @@ export const sync = async (
     } else {
       const result = await impact(root, { files, includeUncommitted: false, budget: params.budget });
       const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
+      warmMass = (result.details.warmedMass as Record<string, number> | undefined) ?? {};
       warmReasons = (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {};
       warmNow = new Set(warmedFiles.filter((file) => !disclosedFiles.has(file) && !files.includes(file)));
     }
-    warmNew = prev.warmed === undefined
-      ? [...warmNow]
-      : [...warmNow].filter((file) => !prev.warmed!.has(file));
+  }
+
+  // Surprise gate. Warmth earns a steer only to the extent its channel-adjusted
+  // mass exceeds μ, the session's heat memory: the decayed union of every
+  // cascade already disclosed. Repeat warmth around ongoing work contributes
+  // nothing; genuinely hotter re-warming fires again. Novelty is continuous,
+  // not a one-sync set difference.
+  const channelMass = (file: string): number => {
+    let prior = 0;
+    for (const reason of warmReasons[file] ?? []) prior = Math.max(prior, CHANNEL_WEIGHT[reason] ?? CHANNEL_UNKNOWN);
+    return (warmMass[file] ?? 0) * (prior || CHANNEL_UNKNOWN);
+  };
+  const memory = new Map<string, number>();
+  for (const [file, mass] of prev.heat ?? []) {
+    const decayed = mass * HEAT_DECAY;
+    if (decayed > 1e-6) memory.set(file, decayed);
+  }
+  const surprise = new Map<string, number>();
+  let surpriseTotal = 0;
+  for (const file of warmNow) {
+    const delta = channelMass(file) - (memory.get(file) ?? 0);
+    if (delta > 1e-9) {
+      surprise.set(file, delta);
+      surpriseTotal += delta;
+    }
   }
 
   const pushed = new Set(prev.pushed ?? []);
-  setBaseline(root, { ...(preparedBaseline ?? (await snapshot(state))), warmed: warmNow, pushed });
-
   // Extraction failures leave fact gaps that look like anchor *removals* —
   // never escalate red on removals while degraded; the degraded note is
   // already loud in details.
   const degraded = state.extraction.failed.length > 0;
-  const red = (added.length - newlyImplicit.length) > 0 ||
+  const structuralRed = (added.length - newlyImplicit.length) > 0 ||
     (removed.length > 0 && !degraded) ||
-    deleted.some((file) => !isTestScope(file)) ||
-    warmNew.length >= Math.max(1, params.warmFileThreshold);
+    deleted.some((file) => !isTestScope(file));
+  const prevArmed = prev.warmthArmed !== false;
+  const warmthFire = prevArmed && surpriseTotal >= params.steerThreshold;
+  const red = structuralRed || warmthFire;
+  // Hysteresis: a red sync discloses its whole cascade, so the latch disarms
+  // until total surprise drops into the re-arm fraction of the threshold.
+  const warmthArmed = red ? false : prevArmed || surpriseTotal <= params.steerThreshold * REARM_FRACTION;
+  // Absorb on disclosure: every warmed file the message covers charges the
+  // memory at its current adjusted mass, displayed or not.
+  if (red) {
+    for (const file of warmNow) {
+      const adjusted = channelMass(file);
+      if (adjusted > (memory.get(file) ?? 0)) memory.set(file, adjusted);
+    }
+  }
+  const orderedWarm = [...surprise.entries()]
+    .sort((a, b) => b[1] - a[1] || Number(isTestScope(a[0])) - Number(isTestScope(b[0])) || a[0].localeCompare(b[0]))
+    .map(([file]) => file);
+  setBaseline(root, {
+    ...(preparedBaseline ?? (await snapshot(state))),
+    heat: memory.size ? memory : undefined,
+    warmthArmed,
+    pushed,
+  });
   if (!red) {
     return {
       structural: true, red: false, tokens: 0,
       details: {
         version: state.version,
         anchorsDelta: added.length - removed.length,
-        warmNew: warmNew.length,
+        warmNew: orderedWarm.length,
+        surprise: round4(surpriseTotal),
         changedFiles: changed,
         semanticChangedFiles: files,
         deletedFiles: deleted,
@@ -293,8 +367,6 @@ export const sync = async (
     : deleted.length
       ? `deleted ${deleted.slice(0, 4).join(", ")}${deleted.length > 4 ? ` (+${deleted.length - 4} more)` : ""}`
       : "route structure";
-  const orderedWarm = [...warmNew].sort((a, b) =>
-    Number(isTestScope(a)) - Number(isTestScope(b)) || a.localeCompare(b));
   const lines: string[] = [
     "Repository structure changed.",
     `Changed: ${changedSummary}`,
@@ -357,6 +429,7 @@ export const sync = async (
       changedFiles: changed,
       semanticChangedFiles: files,
       warmNew: orderedWarm,
+      surprise: round4(surpriseTotal),
       warmReasons,
       deletedFiles: deleted,
       ...(embedded ? { pushedFocus: focusTarget } : {}),

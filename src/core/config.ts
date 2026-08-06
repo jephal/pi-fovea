@@ -15,8 +15,10 @@ interface FoveaSyncConfig {
   budget: number;
   /** Also send a tiny model-visible ack on clean turns (default false: silent green). */
   ackClean: boolean;
-  /** Number of newly relevant files that justifies proactive steering on its own. */
-  warmFileThreshold: number;
+  /** Total surprise — channel-adjusted cascade mass above the session heat
+   * memory — that justifies proactive model steering on warmth alone.
+   * Route and deletion signals always steer regardless. */
+  steerThreshold: number;
   /** Push (default): red syncs embed a budgeted focus preview of the top drift
    * target. Pull: the update ends in a Next: advisory the model may follow. */
   pushFocus: boolean;
@@ -39,7 +41,12 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
     enabled: true,
     budget: 1024,
     ackClean: false,
-    warmFileThreshold: 2,
+    // Masses are heat units leaked outside the changed files (1 unit seeded
+    // per changed file), discounted by channel. Measured: a central fixture
+    // semantic edit (tests/fixtures/mini server/users.go) totals ≈0.077
+    // adjusted; a pair of weak shared-literal/co-change warm-ups ≈0.01–0.03;
+    // one strong call/import neighbor on a 350-node repo ≈0.19.
+    steerThreshold: 0.15,
     pushFocus: true,
   },
   tools: {
@@ -68,7 +75,7 @@ export const projectFoveaConfigPath = (cwd: string): string => path.join(cwd, CO
 const BOUNDS: Record<string, [number, number]> = {
   "sync.budget": [128, 8192],
   "tools.defaultBudget": [256, 16000],
-  "sync.warmFileThreshold": [1, 16],
+  "sync.steerThreshold": [0.02, 8],
 };
 
 const clamp = (id: string, value: number): number => {
@@ -82,6 +89,12 @@ const boolValue = (value: unknown, fallback: boolean): boolean =>
 const intValue = (id: string, value: unknown, fallback: number): number =>
   clamp(id, typeof value === "number" && Number.isFinite(value) ? value : fallback);
 
+const floatValue = (id: string, value: unknown, fallback: number): number => {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  const [lo, hi] = BOUNDS[id] ?? [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY];
+  return Math.min(hi, Math.max(lo, n));
+};
+
 const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
   if (typeof partial !== "object" || partial === null || Array.isArray(partial)) return base;
   const src = partial as Record<string, unknown>;
@@ -92,7 +105,7 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
       enabled: boolValue(sync.enabled, base.sync.enabled),
       budget: intValue("sync.budget", sync.budget, base.sync.budget),
       ackClean: boolValue(sync.ackClean, base.sync.ackClean),
-      warmFileThreshold: intValue("sync.warmFileThreshold", sync.warmFileThreshold, base.sync.warmFileThreshold),
+      steerThreshold: floatValue("sync.steerThreshold", sync.steerThreshold, base.sync.steerThreshold),
       pushFocus: boolValue(sync.pushFocus, base.sync.pushFocus),
     },
     tools: {

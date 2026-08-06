@@ -132,3 +132,32 @@ w = \frac{0.5}{\sqrt{S}}
 $$
 
 versus $1/\sqrt{S}$ for declared routes, where $S$ is the number of sites bound to the hub. Swap rates are symmetric constants that do not depend on the corpus. Turn sync reports churn on discovered hubs (a `△` in the anchors report) with no red escalation, and the moment any site matches a first-class rule the hub graduates.
+
+## Turn sync: surfacing only surprise
+
+The same impact cascade that answers `fovea_impact` also drives turn sync, which runs before agent start and after every assistant turn and decides whether repository drift justifies spending model tokens (`src/core/sync.ts`). The gate used to count newly warmed files; it now measures how much of a cascade is *news*.
+
+Each sync keeps a per-file heat memory $\mu$, the session's decayed union of every warmth payload already disclosed. For a warmed file $f$ with cascade mass $m_f$ (the per-file sums the impact renderer aggregates), the evidence channel enters as a prior $c_f$ on the strongest reason the graph recorded:
+
+| Channel | $c_f$ |
+|---|:--:|
+| call / import / test / inheritance / shared route | $1$ |
+| co-change history | $0.5$ |
+| multi-hop graph path | $0.5$ |
+| shared literal | $0.35$ |
+
+Surprise is the channel-adjusted mass above what the session was already told:
+
+$$
+s_f = \max\!(0,\; c_f \, m_f - \mu_f), \qquad S = \textstyle\sum_f s_f
+$$
+
+A sync goes red on structural events (route added or removed, production file deleted, all subject to the degraded-extraction distrust) or when warmth alone crosses the steer threshold, $S \ge \theta$ with $\theta = 0.15$ by default (`sync.steerThreshold`). Masses are dimensionless: seeding is one heat unit per changed file node, so $S$ reads as "units of evidence-weighted heat landing outside the change that were not already disclosed." Calibration on `tests/fixtures/mini`: a central semantic edit totals $\approx 0.077$ adjusted, one strong call/import neighbor on a 350-node repo $\approx 0.19$, a pair of weak literal/co-change warm-ups $\approx 0.01\!-\!0.03$.
+
+Three dynamics fall out of $\mu$:
+
+- **Absorb on disclosure.** Any red sync charges $\mu_f \leftarrow \max(\mu_f, c_f m_f)$ for every warmed file, displayed or not. The disclosed cascade cannot immediately re-fire.
+- **Decay.** $\mu \leftarrow 0.7\,\mu$ per structural sync. Repeat warmth re-fires only once genuine re-heating exceeds what the session was told: novelty is a margin, not a seen-set bit. Editing $A$, then its neighbor $B$, then $A$ again no longer ping-pongs a steer per turn.
+- **Hysteresis.** A fire disarms the warmth latch; it re-arms only once $S \le \theta/2$. Cascades hovering near the threshold cannot oscillate.
+
+The rendered list is sorted by $s_f$ descending, test scopes last within a tie, so the top of the message is always the least-expected warmth. Route and deletion signals bypass the warmth gate entirely. A clean structural turn costs one fingerprint diff; a quiet turn costs the same, because the gate only evaluates when the version fingerprint moved.

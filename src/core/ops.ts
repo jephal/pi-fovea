@@ -869,14 +869,21 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
   const exclude = new Set(seeds.map((i) => g.nodes[i]!.id));
   const seedFiles = new Set(seeds.map((i) => g.nodes[i]!.file));
 
-  // Aggregate warmed mass per file (excluding the seeds themselves).
+  // Aggregate warmed mass per file (excluding the seeds themselves). Heat
+  // retained by the seed files (seedMass) is the scale-free normalizer turn
+  // sync uses, since raw mass shrinks with graph size.
   const fileAgg = new Map<string, number>();
   const fileTop = new Map<string, Array<[number, number]>>();
   const anchorHits: GroupLine[] = [];
+  let seedMass = 0;
   g.nodes.forEach((n, i) => {
-    if (exclude.has(n.id) || seedFiles.has(n.file)) return;
+    if (exclude.has(n.id)) return;
     const v = field[i]!;
     if (v <= 1e-6) return;
+    if (seedFiles.has(n.file)) {
+      seedMass += v;
+      return;
+    }
     if (n.kind === "anchor") {
       anchorHits.push({ label: `⚑ ${n.name}`, mass: v, detail: `${n.file}:${n.line}` });
       return;
@@ -971,6 +978,15 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
       // and the strongest direct evidence channel without text re-parsing.
       warmedAnchors: anchorHits.map((h) => h.label.replace(/^⚑\s*/, "")),
       warmedFiles: fileEntries.map(([file]) => file),
+      // Heat retained by the seed files themselves — a graph-size-invariant
+      // normalizer for warmedMass (per-file warmth as a fraction of the heat
+      // the change site keeps).
+      seedMass: Number(seedMass.toFixed(6)),
+      // Per-file cascade mass (Σ node heat, seeds excluded). Turn-sync gates
+      // on these masses; the file list alone cannot rank a drizzle against a
+      // real cascade. Rounded so the warm-cache path and the inline path
+      // carry bit-identical payloads.
+      warmedMass: Object.fromEntries(fileEntries.map(([file, mass]) => [file, Number(mass.toFixed(6))])),
       warmedReasons: Object.fromEntries(fileEntries.map(([file]) => [
         file,
         [...(reasonByFile.get(file) ?? new Set(["graph path"]))],

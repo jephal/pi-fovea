@@ -46,7 +46,7 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     let yielded = false;
     setImmediate(() => { yielded = true; });
 
-    const outcome = await sync("/synthetic-baseline", { budget: 512, warmFileThreshold: 2 }, state);
+    const outcome = await sync("/synthetic-baseline", { budget: 512, steerThreshold: 0.01 }, state);
 
     expect(outcome.details.baseline).toBe("established");
     expect(yielded).toBe(true);
@@ -55,25 +55,25 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
   it("baseline establishes silently, then clean edits stay silent", async () => {
     resetSyncBaselines();
     resetSessions();
-    const first = await sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
+    const first = await sync(root, { files: ["server/main.go"], budget: 512, steerThreshold: 0.01 });
     expect(first.structural).toBe(true);
     expect(first.red).toBe(false);       // baseline: never red on first contact
     expect(first.text).toBeUndefined();
 
     // Same content again: version unchanged -> not structural.
-    const same = await sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
+    const same = await sync(root, { files: ["server/main.go"], budget: 512, steerThreshold: 0.01 });
     expect(same.structural).toBe(false);
 
     // A comment-only edit drifts the file but must stay green.
     const main = join(root, "server/main.go");
     writeFileSync(main, readFileSync(main, "utf8") + "\n// touched\n");
-    const drift = await sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
+    const drift = await sync(root, { files: ["server/main.go"], budget: 512, steerThreshold: 0.01 });
     expect(drift.structural).toBe(true);
     expect(drift.red).toBe(false);
     expect(drift.details.semanticChangedFiles).toEqual([]);
 
     writeFileSync(main, `\n${readFileSync(main, "utf8")}`);
-    const shifted = await sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+    const shifted = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     expect(shifted.red).toBe(false);
     expect(shifted.details.semanticChangedFiles).toEqual([]);
     execSync("git checkout -- server/main.go", { cwd: root });
@@ -83,11 +83,11 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
   it("steers on the first semantic cascade with causal context", async () => {
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     const users = join(root, "server/users.go");
     const src = readFileSync(users, "utf8");
     writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
-    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(outcome.red).toBe(true);
     expect(outcome.tokens).toBeLessThanOrEqual(512);
     expect(outcome.text).toContain("Repository structure changed.");
@@ -103,71 +103,124 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     expect(outcome.details.warmReasons).toBeTruthy();
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
+
+  it("gates on surprise mass, not warmed-file count, and reports it when silent", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, steerThreshold: 8 });
+    const users = join(root, "server/users.go");
+    const src = readFileSync(users, "utf8");
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    // Fixture calibration: this cascade totals ~0.077 channel-adjusted mass —
+    // far above any file-count threshold of 1, far below a mass threshold of 8.
+    const quiet = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 8 });
+    expect(quiet.structural).toBe(true);
+    expect(quiet.red).toBe(false);
+    expect(Number(quiet.details.surprise)).toBeGreaterThan(0.02);
+    // No fire -> nothing absorbed into the heat memory and the latch stays
+    // armed: a fresh semantic nudge re-examined under a low threshold fires.
+    writeFileSync(users, readFileSync(users, "utf8").replace("return SaveUser(id)", "return SaveUserByRef(id)"));
+    const loud = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
+    expect(loud.red).toBe(true);
+    expect(loud.text).toContain("Changed: server/users.go");
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
+
+  it("absorbed warmth and the hysteresis latch suppress the ping-pong repeat", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
+    const users = join(root, "server/users.go");
+    const src = readFileSync(users, "utf8");
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    // First contact: μ is empty, full surprise (~0.077) crosses 0.05.
+    const first = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.05 });
+    expect(first.red).toBe(true);
+    expect(Number(first.details.surprise)).toBeGreaterThan(0.05);
+    // Revert: the identical-shape cascade re-warms the same cluster, but the
+    // heat memory absorbed the first disclosure (μ = a, decayed to 0.7a), so
+    // surprise is only the ~30% regrowth margin and the latch is disarmed.
+    execSync("git checkout -- server/users.go", { cwd: root });
+    const reverted = await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
+    expect(reverted.red).toBe(false);
+    expect(Number(reverted.details.surprise)).toBeLessThan(0.05);
+    // Third flip of the same semantics: memory has decayed further (0.49a),
+    // surprise ~51% of the cascade — still under the threshold. The A→B→A
+    // steer loop dies by construction, not by rate limiting.
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    const third = await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
+    expect(third.red).toBe(false);
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
   });
 
   it("pull mode keeps the Next advisory instead of embedding focus", async () => {
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1, pushFocus: false });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01, pushFocus: false });
     const users = join(root, "server/users.go");
     const src = readFileSync(users, "utf8");
     writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
-    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1, pushFocus: false });
+    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01, pushFocus: false });
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain('Next: fovea_focus "server/users.go" to see what it now connects to.');
     expect(outcome.text).not.toContain('fovea focus "server/users.go"');
     expect(outcome.details.pushedFocus).toBeUndefined();
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1, pushFocus: false });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01, pushFocus: false });
   });
 
   it("embeds focus detail once per drift target", async () => {
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     const users = join(root, "server/users.go");
     const src = readFileSync(users, "utf8");
     writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
     rmSync(join(root, "web/types.ts"));
-    const first = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const first = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(first.red).toBe(true);
     expect(first.text).toContain('fovea focus "server/users.go"');
     expect(first.details.pushedFocus).toBe("server/users.go");
     execSync("git checkout -- web/types.ts", { cwd: root });
     writeFileSync(users, readFileSync(users, "utf8").replace("return SaveUser(id)", "return LoadUser(id)"));
     rmSync(join(root, "pages/api/health.ts"));
-    const second = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const second = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(second.red).toBe(true);
     expect(second.text).not.toContain('fovea focus "server/users.go"');
     expect(second.text).toContain('Next: fovea_focus "server/users.go"');
     expect(second.details.pushedFocus).toBeUndefined();
     execSync("git checkout -- server/users.go pages/api/health.ts", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
   });
 
   it("follows the worktree when a dirty file returns to porcelain-clean", async () => {
     resetSyncBaselines();
     resetSessions();
     const users = join(root, "server/users.go");
-    const base = await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    const base = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     const pristineVersion = String(base.details.version);
     writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
-    const dirty = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const dirty = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(dirty.red).toBe(true);
     expect(dirty.details.version).not.toBe(pristineVersion);
     execSync("git checkout -- server/users.go", { cwd: root });
-    const restored = await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    const restored = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     expect(restored.details.version).toBe(pristineVersion);
     writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
-    const again = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const again = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(again.structural).toBe(true);
     expect(again.details.semanticChangedFiles).toContain("server/users.go");
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
   });
 
   it("anchor shift escalates to red with the added route", async () => {
@@ -177,14 +230,14 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
       'r.POST("/api/users", server.CreateUserHandler)',
       'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/restore", server.GetUserHandler)',
     ));
-    const outcome = await sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
+    const outcome = await sync(root, { files: ["server/main.go"], budget: 512, steerThreshold: 0.01 });
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain("GET /api/users/{*}/restore");
     expect(outcome.details.added).toContain("GET /api/users/{*}/restore");
     expect(outcome.text).toContain('Next: fovea_focus "/api/users/{*}/restore"');
     execSync("git checkout -- server/main.go", { cwd: root });
     // Post-restore sync re-baselines; the restored repo is the new normal.
-    await sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
+    await sync(root, { files: ["server/main.go"], budget: 512, steerThreshold: 0.01 });
   });
 
   it("hintless drift is detected identically (fabric_exec / bash mutation path)", async () => {
@@ -198,34 +251,34 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
       'r.POST("/api/users", server.CreateUserHandler)',
       'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/audit", server.GetUserHandler)',
     ));
-    const outcome = await sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+    const outcome = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     expect(outcome.structural).toBe(true);
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain("GET /api/users/{*}/audit");
     execSync("git checkout -- server/main.go", { cwd: root });
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
   });
 
 
   it("precomputes ingredients so the blocking sync reuses them", async () => {
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     const users = join(root, "server/users.go");
     writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
     await warmSync(root, { files: ["server/users.go"], budget: 512 });
-    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain("Newly relevant files:");
     expect(outcome.text).toContain('fovea focus "server/users.go"');
     expect(outcome.details.warmReasons).toBeTruthy();
     // The warm did not advance the baseline; the verdict arrives at the
     // blocking sync. After it, the next sync is a no-op fast path.
-    const again = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const again = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
     expect(again.structural).toBe(false);
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
   });
 
   it("warm path equals the inline compute on the same drift", async () => {
@@ -237,31 +290,32 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
 
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     edit();
-    const inline = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const inline = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
 
     restore();
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
     edit();
     await warmSync(root, { files: ["server/users.go"], budget: 512 });
-    const warmed = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    const warmed = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
 
     expect(warmed.red).toBe(inline.red);
     expect(warmed.text).toBe(inline.text);
     expect(warmed.details.semanticChangedFiles).toEqual(inline.details.semanticChangedFiles);
-    expect(warmed.details.warmedFiles).toEqual(inline.details.warmedFiles);
+    expect(warmed.details.warmNew).toEqual(inline.details.warmNew);
+    expect(warmed.details.surprise).toEqual(inline.details.surprise);
     restore();
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
   });
 
   it("stale warm (more drift since) falls back to the inline compute", async () => {
     resetSyncBaselines();
     resetSessions();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 4 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 8 });
     const users = join(root, "server/users.go");
     const main = join(root, "server/main.go");
     writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
@@ -272,26 +326,26 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
       'r.POST("/api/users", server.CreateUserHandler)',
       'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/warmcheck", server.GetUserHandler)',
     ));
-    const outcome = await sync(root, { files: ["server/users.go", "server/main.go"], budget: 512, warmFileThreshold: 4 });
+    const outcome = await sync(root, { files: ["server/users.go", "server/main.go"], budget: 512, steerThreshold: 8 });
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain("GET /api/users/{*}/warmcheck");
     execSync("git checkout -- server/users.go server/main.go", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 4 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 8 });
   });
 
   it("steers when a production file disappears", async () => {
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 8 });
     rmSync(join(root, "web/types.ts"));
-    const outcome = await sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
+    const outcome = await sync(root, { files: [], budget: 512, steerThreshold: 8 });
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain("deleted web/types.ts");
     expect(outcome.text).not.toContain("Next:");
     expect(outcome.details.deletedFiles).toContain("web/types.ts");
     execSync("git checkout -- web/types.ts", { cwd: root });
     resetSyncBaselines();
-    await sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
+    await sync(root, { files: [], budget: 512, steerThreshold: 8 });
   });
 
   it("hintless drift in a non-git workspace still detects content change", async () => {
@@ -299,7 +353,7 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     cpSync(SRC, plain, { recursive: true }); // deliberately no git init
     try {
       await ensureState(plain); // plain workspace: pre-warm, same as hooks do at session start
-      const base = await sync(plain, { files: [], budget: 512, warmFileThreshold: 2 });
+      const base = await sync(plain, { files: [], budget: 512, steerThreshold: 0.01 });
       expect(base.structural).toBe(true);
       expect(base.red).toBe(false);
       const main = join(plain, "server/main.go");
@@ -308,7 +362,7 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
         'r.GET("/api/users/:id", server.GetUserHandler)',
         'r.GET("/api/users/:id", server.GetUserHandler)\n\tr.DELETE("/api/users/:id", server.GetUserHandler)',
       ));
-      const outcome = await sync(plain, { files: [], budget: 512, warmFileThreshold: 2 });
+      const outcome = await sync(plain, { files: [], budget: 512, steerThreshold: 0.01 });
       expect(outcome.structural).toBe(true);
       expect(outcome.red).toBe(true);
       expect(outcome.text).toContain("DELETE /api/users/{*}");
