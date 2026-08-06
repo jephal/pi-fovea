@@ -19,7 +19,7 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 pi-fovea hands the model a map of your repo on every prompt. The repo compiles once into a code graph across languages, where symbols, files, and route anchors join into one network. Each question becomes an interest vector that diffuses over the graph as heat. The renderer converts the field into a token-capped view: full signatures near your task, one-liners a hop away, a skeleton of the rest.
 
-After each assistant turn the map re-syncs incrementally. A clean turn stays silent. A turn that moves route anchors or warms files you have not looked at says so.
+After each assistant turn the map re-syncs incrementally. Detection reads content hashes instead of tool events, so edits made by pi's edit/write tools, a fabric_exec inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all land identically. A clean turn stays silent. A turn that moves route anchors or warms files you have not looked at says so.
 
 ## What the model gets
 

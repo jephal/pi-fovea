@@ -59,4 +59,45 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     // Post-restore sync re-baselines; the restored repo is the new normal.
     sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
   });
+
+  it("hintless drift is detected identically (fabric_exec / bash mutation path)", () => {
+    // Raw filesystem write with NO tool-event hints: the sha diff against the
+    // baseline's content hashes is the source of truth, so a fabric_exec inner
+    // pi.edit, a bash heredoc, or an out-of-band editor save all escalate the
+    // same way a pi edit/write tool call does.
+    const main = join(root, "server/main.go");
+    const src = readFileSync(main, "utf8");
+    writeFileSync(main, src.replace(
+      'r.POST("/api/users", server.CreateUserHandler)',
+      'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/audit", server.GetUserHandler)',
+    ));
+    const outcome = sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+    expect(outcome.structural).toBe(true);
+    expect(outcome.red).toBe(true);
+    expect(outcome.text).toContain("GET /api/users/{*}/audit");
+    execSync("git checkout -- server/main.go", { cwd: root });
+    sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+  });
+
+  it("hintless drift in a non-git workspace still detects content change", () => {
+    const plain = mkdtempSync(join(tmpdir(), "fovea-sync-nogit-"));
+    cpSync(SRC, plain, { recursive: true }); // deliberately no git init
+    try {
+      const base = sync(plain, { files: [], budget: 512, warmFileThreshold: 2 });
+      expect(base.structural).toBe(true);
+      expect(base.red).toBe(false);
+      const main = join(plain, "server/main.go");
+      const src = readFileSync(main, "utf8");
+      writeFileSync(main, src.replace(
+        'r.GET("/api/users/:id", server.GetUserHandler)',
+        'r.GET("/api/users/:id", server.GetUserHandler)\n\tr.DELETE("/api/users/:id", server.GetUserHandler)',
+      ));
+      const outcome = sync(plain, { files: [], budget: 512, warmFileThreshold: 2 });
+      expect(outcome.structural).toBe(true);
+      expect(outcome.red).toBe(true);
+      expect(outcome.text).toContain("DELETE /api/users/{*}");
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
+  });
 });

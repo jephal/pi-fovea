@@ -38,11 +38,11 @@ export default function fovea(pi: ExtensionAPI) {
     }
   });
 
-  // Turn-sync loop. Edits discovered via the files touched by tool calls in
-  // the turn's results; the graph drifts only when content actually changed,
-  // so pure conversation turns exit early at zero cost.
-  // Per-turn mutation accumulator. tool_execution_start carries typed args,
-  // so edit/write paths are tracked without parsing completed tool messages.
+  // Turn-sync loop. The tracker below is a hint accumulator only: pi's
+  // edit/write tool starts give the warmth pass a head start, but sync relies
+  // on content-hash drift, so identical detection covers fabric_exec inner
+  // pi.edit calls, bash mutations, subagents, and out-of-band editor saves.
+  // Pure conversation turns exit at zero cost through the version fast path.
   let turnFiles: string[] = [];
   pi.on("turn_start", () => {
     turnFiles = [];

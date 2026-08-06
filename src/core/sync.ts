@@ -1,8 +1,10 @@
 // Turn-sync: the default-on feedback loop the extension was built around.
 // After each assistant turn, if the repo's facts version drifted ANY edit
-// re-syncs, regardless of whether it came through pi's edit/write tools or
-// a shell heredoc — the verdict is green (UI-only) or red (model-visible,
-// budget-capped):
+// re-syncs, regardless of the mutation path — pi's edit/write tools, a
+// fabric_exec inner pi.edit, a bash heredoc, a subagent run, or an editor
+// save outside the session all land the same way, because drift is measured
+// by diffing the baseline's content hashes against the current facts instead
+// of trusting tool events or git.
 //
 //   red  = route anchors appeared/vanished   (structural feature churn)
 //       OR warm undisclosed files >= warmFileThreshold  (unseen blast radius)
@@ -11,13 +13,17 @@
 // The first sync of a session only establishes the baseline (never red).
 // Baselines reset on /new and /fork alongside fovea sessions.
 
-import { ensureState, impact, uncommittedFiles } from "./ops.js";
+import { ensureState, impact } from "./ops.js";
 import type { RepoState } from "./ops.js";
 import { getSession } from "./session.js";
 
 interface SyncBaseline {
   version: string;
   anchors: Set<string>;
+  /** file -> content sha1 at baseline. Diffing this against the current facts
+   * yields the exact changed-file set for any mutation path — no dependence
+   * on which tool executed the write, nor on git. */
+  shas: Map<string, string>;
   /** Steady-state warmth recorded on the most recent sync. undefined = "the
    * first drift after baseline calibrates the neighborhood instead of
    * escalating" — a file list appears after that calibration sync. */
@@ -29,7 +35,8 @@ const baselines = new Map<string, SyncBaseline>();
 export const resetSyncBaselines = (): void => baselines.clear();
 
 export interface SyncParams {
-  /** Files the turn is known to have touched. Empty + drift => git fallback. */
+  /** Optional drift hints (e.g. files touched by pi's edit/write tools this
+   * turn). Unioned into the warmth seeds; never the source of truth. */
   files?: string[];
   budget: number;
   warmFileThreshold: number;
@@ -48,6 +55,7 @@ export interface SyncOutcome {
 const snapshot = (state: RepoState): SyncBaseline => ({
   version: state.version,
   anchors: new Set(state.graph.anchors.map((a) => a.id)),
+  shas: new Map(Object.entries(state.facts).map(([f, x]) => [f, x.sha1])),
 });
 
 export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOutcome => {
@@ -80,8 +88,15 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
     if (at >= 0) disclosedFiles.add(id.slice(at + 1));
   }
 
-  let files = (params.files ?? []).filter((f) => state.graph.byFile.has(f));
-  if (!files.length) files = uncommittedFiles(root).filter((f) => state.graph.byFile.has(f));
+  // Exact change set: facts whose content hash moved since the baseline.
+  // Deleted files can't warm anything (absent from the graph) but ride along
+  // in details for observability.
+  const hinted = (params.files ?? []).filter((f) => state.graph.byFile.has(f));
+  const changed = Object.keys(state.facts).filter(
+    (f) => prev.shas.get(f) !== state.facts[f]!.sha1 && state.graph.byFile.has(f),
+  );
+  const deleted = [...prev.shas.keys()].filter((f) => !(f in state.facts));
+  const files = [...new Set([...hinted, ...changed])];
 
   let warmNow: Set<string> = new Set();
   let warmNew: string[] = [];
@@ -100,7 +115,7 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
   if (!red) {
     return {
       structural: true, red: false, tokens: 0,
-      details: { version: state.version, anchorsDelta: added.length - removed.length, warmNew: warmNew.length },
+      details: { version: state.version, anchorsDelta: added.length - removed.length, warmNew: warmNew.length, deletedFiles: deleted },
     };
   }
 
@@ -116,6 +131,6 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
   const text = lines.join("\n");
   return {
     structural: true, red: true, text, tokens: Math.ceil(text.length / 4),
-    details: { version: state.version, added, removed, warmNew },
+    details: { version: state.version, added, removed, warmNew, deletedFiles: deleted },
   };
 };
