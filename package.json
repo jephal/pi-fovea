@@ -6,6 +6,7 @@
   "license": "MIT",
   "engines": { "node": ">=20" },
   "author": "monotykamary",
+  "packageManager": "pnpm@11.20.0",
   "repository": { "type": "git", "url": "git+https://github.com/monotykamary/pi-fovea.git" },
   "homepage": "https://github.com/monotykamary/pi-fovea#readme",
   "bugs": "https://github.com/monotykamary/pi-fovea/issues",
