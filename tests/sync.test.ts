@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { ensureState } from "../src/core/ops.js";
 import type { RepoState } from "../src/core/ops.js";
-import { resetSyncBaselines, sync } from "../src/core/sync.js";
+import { resetSyncBaselines, sync, warmSync } from "../src/core/sync.js";
 import { resetSessions } from "../src/core/session.js";
 
 const SRC = new URL("./fixtures/mini", import.meta.url).pathname;
@@ -206,6 +206,79 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     await sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
   });
 
+
+  it("precomputes ingredients so the blocking sync reuses them", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    const users = join(root, "server/users.go");
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    await warmSync(root, { files: ["server/users.go"], budget: 512 });
+    const outcome = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(outcome.red).toBe(true);
+    expect(outcome.text).toContain("Newly relevant files:");
+    expect(outcome.text).toContain('fovea focus "server/users.go"');
+    expect(outcome.details.warmReasons).toBeTruthy();
+    // The warm did not advance the baseline; the verdict arrives at the
+    // blocking sync. After it, the next sync is a no-op fast path.
+    const again = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(again.structural).toBe(false);
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+  });
+
+  it("warm path equals the inline compute on the same drift", async () => {
+    const users = join(root, "server/users.go");
+    const edit = (): void => {
+      writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    };
+    const restore = (): void => { execSync("git checkout -- server/users.go", { cwd: root }); };
+
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    edit();
+    const inline = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+
+    restore();
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    edit();
+    await warmSync(root, { files: ["server/users.go"], budget: 512 });
+    const warmed = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+
+    expect(warmed.red).toBe(inline.red);
+    expect(warmed.text).toBe(inline.text);
+    expect(warmed.details.semanticChangedFiles).toEqual(inline.details.semanticChangedFiles);
+    expect(warmed.details.warmedFiles).toEqual(inline.details.warmedFiles);
+    restore();
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+  });
+
+  it("stale warm (more drift since) falls back to the inline compute", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 4 });
+    const users = join(root, "server/users.go");
+    const main = join(root, "server/main.go");
+    writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+    await warmSync(root, { files: ["server/users.go"], budget: 512 });
+    // A second edit lands after the warm: the cached fingerprint covers only
+    // the first drift, so sync must recompute against the newest state.
+    writeFileSync(main, readFileSync(main, "utf8").replace(
+      'r.POST("/api/users", server.CreateUserHandler)',
+      'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/warmcheck", server.GetUserHandler)',
+    ));
+    const outcome = await sync(root, { files: ["server/users.go", "server/main.go"], budget: 512, warmFileThreshold: 4 });
+    expect(outcome.red).toBe(true);
+    expect(outcome.text).toContain("GET /api/users/{*}/warmcheck");
+    execSync("git checkout -- server/users.go server/main.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, warmFileThreshold: 4 });
+  });
 
   it("steers when a production file disappears", async () => {
     resetSyncBaselines();

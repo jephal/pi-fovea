@@ -11,7 +11,7 @@ import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
 import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
-import { resetSyncBaselines, sync } from "./core/sync.js";
+import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
 import { openFoveaSettings } from "./ui/settings.js";
 import type { NodeKind } from "./core/types.js";
 
@@ -195,7 +195,28 @@ export default function fovea(pi: ExtensionAPI) {
   // conversation turns exit at zero cost through the version fast path.
   let turnFiles: string[] = [];
   let lastSyncError: string | undefined;
+  // Background warm pipeline: every edit schedules a debounced preparation of
+  // the next sync verdict, so the blocking sync on the send path (before_agent
+  // start / turn_end) reuses a precomputed fingerprint + impact cascade instead
+  // of re-extracting and re-diffusing while the UI waits.
+  const WARM_DEBOUNCE_MS = 250;
+  const warmTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const warmAfterEdit = (root: string, cfg: FoveaConfig): void => {
+    const rels = turnFiles
+      .map((p) => (p.startsWith(root + "/") ? p.slice(root.length + 1) : p))
+      .filter((p) => !p.startsWith("/"));
+    if (!rels.length || !cfg.sync.enabled) return;
+    const files = [...rels];
+    const existing = warmTimers.get(root);
+    if (existing) clearTimeout(existing);
+    warmTimers.set(root, setTimeout(() => {
+      warmTimers.delete(root);
+      void warmSync(root, { files, budget: cfg.sync.budget }).catch(() => {});
+    }, WARM_DEBOUNCE_MS));
+  };
   pi.on("session_shutdown", () => {
+    for (const timer of warmTimers.values()) clearTimeout(timer);
+    warmTimers.clear();
     lifecycleEpoch++;
     turnFiles = [];
     lastSyncError = undefined;
@@ -209,6 +230,12 @@ export default function fovea(pi: ExtensionAPI) {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const args = event.args as { path?: unknown };
     if (typeof args.path === "string") turnFiles.push(args.path);
+  });
+  // Warm once the file is actually on disk (tool_execution_start fires during
+  // preflight, before the write lands); the debounce also coalesces bursts.
+  pi.on("tool_execution_end", (event, ctx) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+    warmAfterEdit(ctx.cwd, configFor(ctx.cwd, ctx.isProjectTrusted()));
   });
   pi.on("before_agent_start", async (_event, ctx) => {
     try {

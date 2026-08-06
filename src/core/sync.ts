@@ -44,7 +44,80 @@ const setBaseline = (root: string, baseline: SyncBaseline): void => {
   while (baselines.size > ROOT_CACHE_LIMIT) baselines.delete(baselines.keys().next().value!);
 };
 
-export const resetSyncBaselines = (): void => baselines.clear();
+export const resetSyncBaselines = (): void => {
+  baselines.clear();
+  warmCache.clear();
+};
+
+// Background warm. The blocking `sync` call on the user-perceived send path
+// (before_agent_start / turn_end) recomputes extraction, graph assembly, the
+// baseline fingerprint, and the impact cascade whenever the repo drifted.
+// `warmSync` runs those heavyweight ingredients eagerly as soon as edits land
+// (tool_execution_end), keyed by state version + changed-file set, so the same
+// drift's sync call reuses them and stays verdict-only. Never advances the
+// baseline, never reports, never throws; a drift without a warm (external
+// edits between turns) falls back to the inline compute in `sync`.
+
+interface WarmCompute {
+  /** State version this computation fingerprints. */
+  version: string;
+  /** Canonical key of the changed-file set this warm covers. */
+  filesKey: string;
+  /** Full next-baseline snapshot, identical to snapshot(state). */
+  snapshot: SyncBaseline;
+  /** impact() outputs for the changed set. */
+  warmedFiles: string[];
+  warmReasons: Record<string, string[]>;
+}
+
+const warmCache = new Map<string, WarmCompute>();
+
+const filesKey = (files: readonly string[]): string => [...new Set(files)].sort().join("\n");
+
+/** Files whose extracted facts moved since a baseline, in canonical order. */
+const semanticDrift = (state: RepoState, prev: SyncBaseline): string[] => {
+  const changed = Object.keys(state.facts).filter(
+    (file) => prev.shas.get(file) !== state.facts[file]!.sha1,
+  );
+  return changed.filter(
+    (file) => prev.semantics.get(file) !== semanticFacts(state, file) && state.graph.byFile.has(file),
+  );
+};
+
+export interface WarmParams {
+  /** Optional drift hints, same role as sync hints; the probe stays the oracle. */
+  files?: string[];
+  /** Token budget for the impact cascade (mirrors sync.budget). */
+  budget: number;
+}
+
+export const warmSync = async (root: string, params: WarmParams, state?: RepoState): Promise<void> => {
+  try {
+    const cur = state ?? (await ensureState(root, { hints: params.files ?? [], force: false }));
+    const prev = getBaseline(root);
+    if (!prev || prev.version === cur.version) return;
+    const files = semanticDrift(cur, prev);
+    if (!files.length) return;
+    const key = filesKey(files);
+    const cached = warmCache.get(root);
+    if (cached && cached.version === cur.version && cached.filesKey === key) return;
+    const next = await snapshot(cur);
+    // The impact cascade runs against the same immutable state snapshot the
+    // fingerprint used, so the cached pair is consistent for cur.version.
+    const result = await impact(root, { files, includeUncommitted: false, budget: params.budget }, cur);
+    warmCache.set(root, {
+      version: cur.version,
+      filesKey: key,
+      snapshot: next,
+      warmedFiles: (result.details.warmedFiles as string[] | undefined) ?? [],
+      warmReasons: (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {},
+    });
+    while (warmCache.size > ROOT_CACHE_LIMIT) warmCache.delete(warmCache.keys().next().value!);
+  } catch {
+    // Best-effort: a failed warm just means the next blocking sync computes
+    // inline (with its own error reporting), exactly as before.
+  }
+};
 
 export interface SyncParams {
   /** Optional drift hints (e.g. files touched by pi's edit/write tools this
@@ -152,9 +225,7 @@ export const sync = async (
   const changed = Object.keys(state.facts).filter(
     (file) => prev.shas.get(file) !== state.facts[file]!.sha1,
   );
-  const semanticChanged = changed.filter(
-    (file) => prev.semantics.get(file) !== semanticFacts(state, file) && state.graph.byFile.has(file),
-  );
+  const semanticChanged = semanticDrift(state, prev);
   const hinted = (params.files ?? []).filter((file) => semanticChanged.includes(file));
   const deleted = [...prev.shas.keys()].filter((file) => !(file in state.facts));
   const files = [...new Set([...semanticChanged, ...hinted])];
@@ -162,18 +233,37 @@ export const sync = async (
   let warmNow: Set<string> = new Set();
   let warmNew: string[] = [];
   let warmReasons: Record<string, string[]> = {};
+  let preparedBaseline: SyncBaseline | undefined;
   if (files.length) {
-    const result = await impact(root, { files, includeUncommitted: false, budget: params.budget });
-    const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
-    warmReasons = (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {};
-    warmNow = new Set(warmedFiles.filter((file) => !disclosedFiles.has(file) && !files.includes(file)));
+    // Edit-time `warmSync` may have precomputed the heavyweight ingredients —
+    // the next baseline fingerprint and the impact cascade — so this blocking
+    // hook only renders the verdict. Keyed by state version + changed set, a
+    // stale warm (more drift landed since) falls through to the inline compute.
+    const prepared = warmCache.get(root);
+    const preparedHit =
+      prepared !== undefined &&
+      prepared.version === state.version &&
+      prepared.filesKey === filesKey(files);
+    if (preparedHit) {
+      warmCache.delete(root);
+      preparedBaseline = prepared.snapshot;
+      warmReasons = prepared.warmReasons;
+      warmNow = new Set(prepared.warmedFiles.filter(
+        (file) => !disclosedFiles.has(file) && !files.includes(file),
+      ));
+    } else {
+      const result = await impact(root, { files, includeUncommitted: false, budget: params.budget });
+      const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
+      warmReasons = (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {};
+      warmNow = new Set(warmedFiles.filter((file) => !disclosedFiles.has(file) && !files.includes(file)));
+    }
     warmNew = prev.warmed === undefined
       ? [...warmNow]
       : [...warmNow].filter((file) => !prev.warmed!.has(file));
   }
 
   const pushed = new Set(prev.pushed ?? []);
-  setBaseline(root, { ...(await snapshot(state)), warmed: warmNow, pushed });
+  setBaseline(root, { ...(preparedBaseline ?? (await snapshot(state))), warmed: warmNow, pushed });
 
   // Extraction failures leave fact gaps that look like anchor *removals* —
   // never escalate red on removals while degraded; the degraded note is

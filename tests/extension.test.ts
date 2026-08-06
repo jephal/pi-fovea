@@ -414,6 +414,49 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     }
   });
 
+  it("background-warms on edit tool end and still steers at turn_end", async () => {
+    // The send-path pause came from sync blocking on refresh + fingerprint +
+    // impact. With tool_execution_end wired to the debounced warm, an edit
+    // prepares the verdict in the background; turn_end reuses it. This guards
+    // the hook wiring end to end (event shapes, config gating, timer cleanup).
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-warm-"));
+    cpSync(FIXTURE, root, { recursive: true });
+    execSync("git init -qb main && git add -A", { cwd: root });
+    execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    resetSessions();
+    resetSyncBaselines();
+    const loaded = load();
+    const ctx = fakeCtx(root);
+    try {
+      await ensureState(root);
+      await loaded.emit("before_agent_start", { prompt: "add a route" }, ctx);
+      await loaded.emit("turn_start", {}, ctx);
+      const main = path.join(root, "server/main.go");
+      await loaded.emit(
+        "tool_execution_start",
+        { toolCallId: "t1", toolName: "edit", args: { path: main } },
+        ctx,
+      );
+      writeFileSync(
+        main,
+        readFileSync(main, "utf8").replace(
+          'r.POST("/api/users", server.CreateUserHandler)',
+          'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/warmed", server.GetUserHandler)',
+        ),
+      );
+      await loaded.emit("tool_execution_end", { toolCallId: "t1", toolName: "edit" }, ctx);
+      // Let the 250ms debounce warm land during the (simulated) model pause.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await loaded.emit("turn_end", {}, ctx);
+      expect(loaded.messages).toHaveLength(1);
+      expect(loaded.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+      expect(String(loaded.messages[0]!.message.content)).toContain("Steer: account for this update");
+      expect(String(loaded.messages[0]!.message.content)).toContain("GET /api/users/{*}/warmed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("fovea_impact executes and respects the what-if mode", async () => {
     resetSessions();
     const { tools } = load();

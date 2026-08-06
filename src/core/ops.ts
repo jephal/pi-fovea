@@ -840,8 +840,8 @@ export interface ImpactArgs {
   budget?: number;
 }
 
-export const impact = async (root: string, args: ImpactArgs): Promise<OpResult> => {
-  const state = await ensureState(root);
+export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState): Promise<OpResult> => {
+  const state = ensured ?? (await ensureState(root));
   const g = state.graph;
   const B = clampBudget(args.budget, 2000);
   const files = new Set<string>(args.files ?? []);
