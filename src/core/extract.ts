@@ -270,8 +270,12 @@ const IMPORT_PATTERNS: Record<string, string[]> = {
     "import $$$I from '$M'",
     'import "$M"',
     "import '$M'",
-    'export $$$I from "$M"',
-    "export $$$I from '$M'",
+    // ast-grep >= current rejects 'export $$$I from ...' parse-wide; the
+    // named and star forms are the valid decomposition of the same intent.
+    'export { $$$I } from "$M"',
+    "export { $$$I } from '$M'",
+    'export * from "$M"',
+    "export * from '$M'",
     'require("$M")',
   ],
   Go: ['import "$M"', 'import ( $$$S )'],
