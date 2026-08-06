@@ -85,6 +85,7 @@ describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
     expect(r.text).toContain("fovea impact");
     expect(r.text).toContain("web/api.ts");      // shares the /api/users literal
     expect(r.text).toContain("openapi.yaml");    // same route in the spec
+    expect(r.text).toContain("worker/search.rs"); // same route literal in Rust
     // the seed file's own symbols are not part of the review list
     expect(r.text.split("\n").filter((l) => l.startsWith("server/users.go"))).toHaveLength(0);
   });

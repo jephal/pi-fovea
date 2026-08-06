@@ -7,7 +7,7 @@ import { extractAnchors } from "../src/core/anchors.js";
 import type { SymbolRec } from "../src/core/types.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
-const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "worker/jobs.py"];
+const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "worker/jobs.py", "worker/search.rs"];
 const ALL = [...CODE, "openapi.yaml"];
 
 const enclosing = (syms: SymbolRec[]) => (file: string, line: number): string | undefined => {
@@ -28,6 +28,8 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(byId.get("Router.db@server/main.go")?.kind).toBe("field");
     expect(byId.get("Router.GET@server/main.go")?.kind).toBe("method");
     expect(byId.get("LoadUser@server/users.go")?.kind).toBe("function");
+    // Rust path: struct + impl methods land with Type.method names.
+    expect(syms.some((s) => s.file === "worker/search.rs" && /UserSearch/.test(s.name))).toBe(true);
     expect(byId.get("loadUser@web/api.ts")?.kind).toBe("function");
     expect(byId.get("User@web/api.ts")?.kind).toBe("interface");
     expect(byId.get("User.id@web/api.ts")?.kind).toBe("field");

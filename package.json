@@ -7,7 +7,8 @@
   "engines": { "node": ">=20" },
   "pi": { "extensions": ["./src/index.ts"] },
   "exports": { "./ops": "./src/core/ops.ts" },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": ["src", "cli.ts", "README.md", "LICENSE"],
+  "bin": { "fovea": "cli.ts" },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

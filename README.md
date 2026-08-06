@@ -56,7 +56,7 @@ Drop `.fovea/rules.json` in a repo to extend route/anchor detection beyond the b
 
 Changing the rules file invalidates only the anchor extraction cache.
 
-Supported today: TypeScript/JavaScript, Python, Go, Rust for symbols/calls; plus literal joins from YAML/JSON/TOML/HCL/env/Markdown config files (OpenAPI specs join routers and clients automatically).
+Supported today: TypeScript/JavaScript/Python/Go/Rust with full symbol+call extraction; Elixir, Ruby, C, C++, Java, Kotlin, Lua, PHP, Swift, Scala, Haskell, Bash via outline-based symbols with heuristic naming. Config files (YAML/JSON/TOML/env/Markdown/OpenAPI specs) join through literals.
 
 ## How the agent uses it
 
@@ -69,6 +69,10 @@ fovea_impact  { "base": "main" }                        # PR cascade (git diff m
 ```
 
 Cursor lines tell the model what remains (`… 37 lit below threshold — call fovea_dwell`), so progressive disclosure is tool-driven, not one-shot.
+
+## Feature hubs and basins
+
+Route declarations and every client call of the same normalized path collapse to ONE feature node — `POST /auth/login` in an express router and in axios clients are occurrences of the same thing, and the anchor hub is where they meet. Where no routes exist at all (CLIs, libraries, kernels), `sketch` infers **basins**: greedy conductance-cut regions around triangle-dense seeds — implicit features that hold together under diffusion.
 
 ## How the graph is joined
 
