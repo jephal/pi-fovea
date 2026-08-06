@@ -11,6 +11,8 @@
 // The first sync establishes the baseline. Baselines reset on /new, /fork,
 // and /fovea reset alongside focus sessions.
 
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { ROOT_CACHE_LIMIT, forEachChunked } from "./asyncutil.js";
 import { ensureState, ensureStateBackground, focus, getInflight, getState, impact, isTestScope } from "./ops.js";
 import type { RepoState } from "./ops.js";
@@ -256,7 +258,14 @@ export const sync = async (
   );
   const semanticChanged = semanticDrift(state, prev);
   const hinted = (params.files ?? []).filter((file) => semanticChanged.includes(file));
-  const deleted = [...prev.shas.keys()].filter((file) => !(file in state.facts));
+  // Absent-from-facts is usually a coverage gap (failed/unreadable/oversized
+  // bucket, or a transient sweep race), not a deletion — stat is the arbiter,
+  // same as the resurrection path in ensureState. Reporting an on-disk file
+  // as deleted misleads the model and self-perpetuates: the false red steer
+  // fires every sync while the gap persists (phantom-deletion loop).
+  const deleted = [...prev.shas.keys()].filter(
+    (file) => !(file in state.facts) && !existsSync(join(state.root, file)),
+  );
   const files = [...new Set([...semanticChanged, ...hinted])];
 
   let warmNow: Set<string> = new Set();

@@ -348,6 +348,32 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     await sync(root, { files: [], budget: 512, steerThreshold: 8 });
   });
 
+  it("never reports an on-disk file as deleted (coverage gaps are not deletions)", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    const rel = "web/big-new.ts";
+    const big = join(root, rel);
+    try {
+      writeFileSync(big, "export const PAD_BIG = 1;\n");
+      await sync(root, { files: [rel], budget: 512, steerThreshold: 0.01 }); // baseline: extracted, in facts + baseline shas
+
+      // Past FOVEA_MAX_FILE_BYTES: refresh moves it from facts to the oversized
+      // bucket while it stays on disk. Absent-from-facts is a coverage gap, so
+      // sync must not narrate it as a deletion — the phantom-deletion loop that
+      // used to steer red on every turn while such a gap persisted.
+      const pad = "// pad past the 1 MiB extraction cap\n";
+      writeFileSync(big, pad.repeat(Math.ceil((1024 * 1024 + 4096) / pad.length)));
+      const gapped = await sync(root, { files: [rel], budget: 512, steerThreshold: 0.01 });
+      expect(gapped.red).toBe(false);
+      expect(gapped.text).toBeUndefined();
+      expect((gapped.details.deletedFiles as string[] | undefined) ?? []).toEqual([]);
+    } finally {
+      rmSync(big, { force: true });
+      resetSyncBaselines();
+      await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    }
+  });
+
   it("hintless drift in a non-git workspace still detects content change", async () => {
     const plain = mkdtempSync(join(tmpdir(), "fovea-sync-nogit-"));
     cpSync(SRC, plain, { recursive: true }); // deliberately no git init
