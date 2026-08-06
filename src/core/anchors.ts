@@ -26,7 +26,8 @@ import type { Anchor } from "./types.js";
 export interface AnchorRule {
   id: string;
   langs: string[];
-  pattern: string;
+  /** Single ast-grep pattern; tier-3 synthesized rules use `patterns` instead. */
+  pattern?: string;
   methods: string; // regex tested against the captured method metavar
   kind: string;
   /**
@@ -39,6 +40,10 @@ export interface AnchorRule {
   verbFrom?: string;
   /** Idiom writes paths mount-relative (Django `path("users/")`): root them. */
   mountRoot?: boolean;
+  /** Synthesized tier-3 rules ship as variant lists (exact arity + trailing $$$H). */
+  patterns?: string[];
+  /** Discovered rules: half hub gravity until a real join upgrades them. */
+  implicit?: boolean;
 }
 
 const HTTP_VERB_RE = /^(?i:get|post|put|delete|patch|head|options)$/;
@@ -59,12 +64,19 @@ const PLACEHOLDER_ONLY = /^(:[A-Za-z_]\w*|\{[A-Za-z_]\w*\}|\[[A-Za-z_]\w*\])$/;
 // Method names that are mounts, not verbs: Django urls, Rails match/root,
 // Spring's umbrella RequestMapping. They anchor as ANY so the hub exists
 // without pretending a verb was declared.
-const NON_VERB_METHODS = new Set(["PATH", "RE_PATH", "URL", "MATCH", "ROOT", "REQUESTMAPPING", "REDIRECT", "RESOURCES"]);
+// Method names that mount a target rather than declare a verb. fetch(url)
+// and redirect targets both resolve to GET; Django urlconfs and Rails mounts
+// accept any verb.
+const METHOD_ALIASES: Record<string, string> = {
+  PATH: "ANY", RE_PATH: "ANY", URL: "ANY", MATCH: "ANY", ROOT: "ANY",
+  REQUESTMAPPING: "ANY", RESOURCES: "ANY", FORWARD: "ANY",
+  FETCH: "GET", REDIRECT: "GET", RESPONDREDIRECT: "GET", REDIRECT_TO: "GET",
+};
 
 const deriveVerb = (method: string): string => {
   let up = method.toUpperCase();
   if (up.endsWith("MAPPING")) up = up.slice(0, -"MAPPING".length); // Spring GetMapping → GET
-  return NON_VERB_METHODS.has(up) ? "ANY" : up;
+  return METHOD_ALIASES[up] ?? up;
 };
 
 export const DEFAULT_PACK: AnchorRule[] = [
@@ -200,6 +212,24 @@ export const DEFAULT_PACK: AnchorRule[] = [
     kind: "route",
   },
   {
+    // Client fetch with no receiver: fetch("/api/x"). Precision-audited by
+    // discovery (~93% path precision in the next.js clone corpus).
+    id: "fetch-bare",
+    langs: ["TypeScript", "Tsx", "JavaScript"],
+    pattern: "$M($P, $$$H)",  // trailing $$$H absorbs the options bag; zero-arg tail matches fetch("/x") too
+    methods: "^fetch$",
+    kind: "route",
+  },
+  {
+    // Response-side route linkage: ktor respondRedirect("/myfiles") references
+    // an existing route without declaring it. Discovery found it at p̂≈0.81.
+    id: "ktor-respond-redirect",
+    langs: ["Kotlin"],
+    pattern: "$R.$M($P, $$$H)",
+    methods: "^respondRedirect$",
+    kind: "route",
+  },
+  {
     id: "rust-router-chain",
     langs: ["Rust"],
     pattern: '$R.route("$P", $$$H)',
@@ -238,7 +268,8 @@ export const extractAnchors = (
           if (p !== undefined && !prefixes.has(pm.file)) prefixes.set(pm.file, unquote(p));
         }
       }
-      for (const m of patternRun(rule.pattern, lang, langFiles, cwd)) {
+      const matchSets = patternRunAll(rule.patterns ?? [rule.pattern!], lang, langFiles, cwd);
+      for (const m of matchSets) {
         const method = m.single.M;
         const pathLike = m.single.P;
         if (!method || !pathLike || !methodRe.test(method)) continue;
@@ -273,6 +304,7 @@ export const extractAnchors = (
           nodeId: enclosing ?? `file:${m.file}`,
           file: m.file,
           line: m.line,
+          ...(rule.implicit ? { implicit: true } : {}),
         });
       }
     }

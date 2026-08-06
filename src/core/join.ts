@@ -14,7 +14,7 @@ export interface LitOccurrence { node: number; line: number; file: string; }
 
 export interface JoinEdge { a: number; b: number; w: number; }
 
-const PLACEHOLDER_SEGMENT = /^(?::[^/]+|\{[^}/]*\}|\$\{[^}/]*\}|<[^/>]+>|\*+)$/;
+const PLACEHOLDER_SEGMENT = /^(?::[^/]+|\{[^}/]*\}|\$\{[^}/]*\}|\$[A-Za-z_]\w*|<[^/>]+>|\*+)$/; // $x = Kotlin template shorthand
 const WORD_RE = /^[A-Za-z][\w$.\-]{6,63}$/;
 const URLISH_RE = /^(?:https?|wss?):\/\/[^/]+/;
 

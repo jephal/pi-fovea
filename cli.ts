@@ -6,12 +6,16 @@
 //   fovea dwell [root] [factor] [budget]     (deepens the in-process focus)
 //   fovea impact [root] [--files a,b] [--symbols x,y] [--base ref] [--no-uncommitted] [budget]
 //   fovea anchors [root] [filter]             (every feature anchor, sorted)
+//   fovea rules [root]                        (tier-3 discovered shape hypotheses)
 //
 // The CLI is stateless across invocations (dwell needs a prior focus in the
 // same process — combine ops inside pi, where sessions persist); stdout is
 // the rendered field, nothing else, so it composes with head/grep/$().
 
+import { statSync } from "node:fs";
 import { ensureState, sketch, focus, dwell, impact } from "./src/core/ops.js";
+import { aggregateFiles, posterior, promote } from "./src/core/discover.js";
+import { DEFAULT_PACK } from "./src/core/anchors.js";
 
 const [, , cmd = "status", ...argv] = process.argv;
 
@@ -37,9 +41,15 @@ const numAt = (i: number): number | undefined => {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 };
 // Root is the first positional that names a path; everything else is arg data.
+// Existing directories count as paths even when bare ("next", "kernel").
 const rootAt = (i: number): string => {
   const p = pos[i];
-  return p !== undefined && (p.includes("/") || p === ".") ? p : ".";
+  if (p === undefined) return ".";
+  if (p.includes("/") || p === ".") return p;
+  try {
+    if (statSync(p).isDirectory()) return p;
+  } catch { /* not a path */ }
+  return ".";
 };
 
 try {
@@ -76,10 +86,49 @@ try {
     const root = rootAt(0);
     const filter = pos.find((p) => p !== root);
     const rows = ensureState(root).graph.anchors
-      .map((a) => `${a.kind}\t${a.id}\t${a.file}:${a.line}`)
-      .filter((r) => !filter || r.includes(filter))
+      .map((a) => `${a.implicit ? "△" : " "}\t${a.kind}\t${a.id}\t${a.file}:${a.line}`)
+      .filter((r) => (!filter || r.includes(filter)) && (!flags.has("discovered") || r.startsWith("△")))
       .sort();
     out = rows.join("\n");
+  } else if (cmd === "rules") {
+    const root = rootAt(0);
+    const st = ensureState(root);
+    const sigs = aggregateFiles(Object.fromEntries(Object.entries(st.facts).map(([k, v]) => [k, v.sigs])));
+    const promoted = promote(sigs, DEFAULT_PACK);
+    if (flags.has("adopt") && promoted.length) {
+      const { mkdirSync, writeFileSync, readFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      mkdirSync(join(root, ".fovea"), { recursive: true });
+      const rulesFile = join(root, ".fovea", "rules.json");
+      let existing = { rules: [] as unknown[] };
+      try { existing = JSON.parse(readFileSync(rulesFile, "utf8")); } catch { /* new */ }
+      const stamp = promoted.map((r) => ({
+        id: r.id.slice("implicit:".length),
+        langs: r.langs,
+        pattern: r.patterns[0],
+        methods: r.methods,
+        kind: r.kind,
+      }));
+      existing.rules = [...existing.rules, ...stamp];
+      writeFileSync(rulesFile, JSON.stringify(existing, null, 2) + "\n");
+      out = `wrote ${stamp.length} discovered rule(s) to .fovea/rules.json`;
+    } else if (flags.has("sigs")) {
+      out = sigs.filter((s) => s.pathN > 0)
+        .sort((a, b) => posterior(b.pathN, b.n) - posterior(a.pathN, a.n))
+        .map((s) => `${posterior(s.pathN, s.n).toFixed(2)}  ${s.pathN}/${s.n} across ${s.files} files  ${s.key}`)
+        .join("\n");
+    } else if (!promoted.length) {
+      out = "(no unknown shape passes the promotion floor — tier-1/2 coverage is doing fine)";
+    } else {
+      out = promoted.map((r) => JSON.stringify({
+        id: r.id.slice("implicit:".length),
+        langs: r.langs,
+        pattern: r.patterns[0],
+        methods: r.methods.replace(/\(\?i\)/, ""),
+        kind: r.kind,
+        _evidence: `p̂=${r.evidence.posterior.toFixed(2)} (${r.evidence.pathN}/${r.evidence.n} sites, ${r.evidence.files} files)`,
+      })).join("\n");
+    }
   } else {
     console.error(`unknown command: ${cmd}`);
     process.exit(2);

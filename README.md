@@ -134,6 +134,19 @@ File-convention routers never write a route string at all — those anchors are 
 
 **Known blind spots** (deliberate, logged in `src/core/anchors.ts`): Rust proc-macro attribute routers (actix `#[get("/x")]`, rocket) — ast-grep patterns can't parameterize attribute paths; frameworks with constructor-assigned prefixes (Flask Blueprint, FastAPI `APIRouter(prefix=…)`, chi `Mount`, Express `Router` mounts) — variable binding tracking is out of band; `scope`/`namespace` nesting in Phoenix/Rails/Django `include()` — prefixes across blocks aren't composed; tRPC/GraphQL/gRPC — no path token exists to anchor on.
 
+### Tier 3: discovery mode
+
+Unknown shapes self-heal. During the literal pass fovea harvests a per-repo histogram of *call-shape signatures* — `(lang · shape · callee · argIdx)` with a path-precision — and promotes statistically significant unknown ones into **implicit rules**: exact-arity ast-grep patterns, synthesized automatically, wired into the graph at **half hub gravity** with a `△` sigil in `fovea anchors` output. Sync reports discovered churn but never lets an unconfirmed hypothesis escalate to red; a hub upgrades to first-class the moment any site matches a non-implicit rule.
+
+Promotion needs: ≥4 path-carrying sites, spread over ≥2 files, and a Jeffreys-smoothed posterior `p̂ = (pathN + .5) / (n + 1) ≥ 0.55`. Measured against 8 cloned projects, junk bands land below p̂≈0.27 and real shapes above p̂≈0.75 — the line is not tuned to the corpus, it sits mid-cliff. Frameworks already known to the static pack are never re-promoted.
+
+```sh
+fovea anchors <root> --discovered   # only the △ hypothesis hubs
+fovea rules <root>                  # promoted rules + evidence, ready to paste into .fovea/rules.json
+fovea rules <root> --sigs           # every path-touching signature, by precision (audit the corpus)
+fovea rules <root> --adopt          # write them into the repo's rule pack explicitly
+```
+
 Drop `.fovea/rules.json` in a repo to extend anchor detection beyond the built-ins:
 
 ```json

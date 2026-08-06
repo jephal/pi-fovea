@@ -64,10 +64,14 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
     };
   }
 
-  // Version drifted: measure what moved.
-  const current = new Set(state.graph.anchors.map((a) => a.id));
-  const added = [...current].filter((id) => !prev.anchors.has(id));
-  const removed = [...prev.anchors].filter((id) => !current.has(id));
+  // Version drifted: measure what moved. Implicit (tier-3 discovered) hubs
+  // churn is reported but NEVER escalates alone — hypotheses with no first-class
+  // backing don't get to wake the model with a red verdict.
+  const current = new Map(state.graph.anchors.map((a) => [a.id, a.implicit === true]));
+  const currentIds = new Set(current.keys());
+  const added = [...currentIds].filter((id) => !prev.anchors.has(id));
+  const removed = [...prev.anchors].filter((id) => !currentIds.has(id));
+  const newlyImplicit = added.filter((id) => current.get(id));
 
   const session = getSession(root);
   const disclosedFiles = new Set<string>();
@@ -92,7 +96,7 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
 
   baselines.set(root, { ...snapshot(state), warmed: warmNow });
 
-  const red = added.length + removed.length > 0 || warmNew.length >= Math.max(1, params.warmFileThreshold);
+  const red = (added.length - newlyImplicit.length) + removed.length > 0 || warmNew.length >= Math.max(1, params.warmFileThreshold);
   if (!red) {
     return {
       structural: true, red: false, tokens: 0,
@@ -102,7 +106,8 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
 
   const lines: string[] = [];
   lines.push(`fovea sync · v ${state.version} · edit cascade did not stay local`);
-  for (const id of added.slice(0, 12)) lines.push(`  ⚑=new ${id}`);
+  for (const id of added.filter((a) => !newlyImplicit.includes(a)).slice(0, 12)) lines.push(`  ⚑=new ${id}`);
+  for (const id of newlyImplicit.slice(0, 6)) lines.push(`  △ newly discovered hub ${id}`);
   for (const id of removed.slice(0, 12)) lines.push(`  ⚑-removed ${id}`);
   if (warmNew.length) {
     lines.push(`  newly warm undisclosed files (revisit with fovea_focus):`);

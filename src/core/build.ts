@@ -8,10 +8,11 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { basename, dirname, join as joinPath, posix } from "node:path";
 import { spawnSync } from "node:child_process";
-import { LANG_BY_EXT, isBinaryExt, isConfigFile } from "./astgrep.js";
+import { LANG_BY_EXT, isBinaryExt, isConfigFile, langOf } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
 import { buildJoinIndex } from "./join.js";
 import { extractAnchors, extractFileRoutes, loadRepoRules } from "./anchors.js";
+import { aggregateFiles, harvestFile, promote, type FileSigs, type SynthesizedRule } from "./discover.js";
 import type { CallSite, Edge, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
 import { coChangePairs } from "./cochange.js";
@@ -23,9 +24,13 @@ export interface FileFacts {
   calls: CallSite[];
   literals: LiteralSite[];
   anchors: AnchorDraft[];
+  // Tier-3 discovery: per-file histogram of call-shape signatures
+  // (sig -> [totalSites, pathSites]); aggregated repo-wide at load to promote
+  // statistically significant unknown shapes into implicit half-weight rules.
+  sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 5; // bump when extractor semantics change
+const CACHE_VERSION = 6; // bump when extractor semantics change
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods"]);
 const MAX_FILES = 24000;
 // Generated dependency manifests are enormous and carry no first-class routes.
@@ -103,8 +108,12 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
   } catch {
     cached = undefined;
   }
-  const { pack: anchorPack, fileRoutes, sha: rulesSha } = loadRepoRules(root);
-  const rulesChanged = cached !== undefined && cached.rulesSha !== rulesSha;
+  const { pack: basePack, fileRoutes, sha: baseRulesSha } = loadRepoRules(root);
+  const anchorPack = [...basePack];
+  // Implicit rules promote AFTER the first fact pass: their evidence lives in
+  // freshly harvested sigs, so the pack can only be finalized once facts exist.
+  let implicitRules: SynthesizedRule[] = [];
+  let rulesSha = baseRulesSha;
   if (cached && (cached.version !== CACHE_VERSION || cached.root !== root)) cached = undefined;
   const facts: Record<string, FileFacts> = {};
   const dirty: string[] = [];
@@ -133,12 +142,31 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
     putByFile(extractImports(code, root), (f, v) => f.imports.push(v));
     putByFile(extractCalls(code, root), (f, v) => f.calls.push(v));
     putByFile(extractLiterals(dirty, root), (f, v) => f.literals.push(v));
+    // Tier-3 harvest: regex histogram of call-shape signatures per file. Cheap
+    // (line scan, no ast-grep) and cached alongside the other facts.
+    for (const f of code) {
+      const lang = langOf(f);
+      if (!lang) continue;
+      let text = "";
+      try { text = readFileSync(joinPath(root, f), "utf8"); } catch { continue; }
+      const sigs = harvestFile(lang, text);
+      if (Object.keys(sigs).length) facts[f]!.sigs = sigs;
+    }
   }
+  // Tier-3: promote harvested signatures into implicit rules BEFORE anchors
+  // run, and fold their ids into the rules hash so a promotion change rebuilds
+  // anchors exactly like a rules.json edit would.
+  implicitRules = promote(aggregateFiles(Object.fromEntries(Object.entries(facts).map(([k, v]) => [k, v.sigs]))), anchorPack);
+  if (implicitRules.length) {
+    anchorPack.push(...implicitRules);
+    rulesSha = createHash("sha1").update(baseRulesSha).update(JSON.stringify(implicitRules.map((r) => r.id).sort())).digest("hex");
+  }
+  const rulesChangedFinal = cached !== undefined && cached.rulesSha !== rulesSha;
   // Anchors need enclosing-symbol resolution. Symbols, imports, calls and
   // literals are rules-independent — when only the rule pack changed, re-run
   // anchor extraction over every code file against cached symbols and keep
   // every other fact (green-node reuse one level up).
-  const anchorTargets = rulesChanged
+  const anchorTargets = rulesChangedFinal
     ? files.filter((f) => !isConfigFile(f))
     : dirty.filter((f) => !isConfigFile(f));
   if (anchorTargets.length) {
@@ -151,7 +179,7 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
     const symsByFile = new Map<string, SymbolRec[]>();
     for (const rel of anchorTargets) {
       symsByFile.set(rel, facts[rel]?.symbols.length ? facts[rel]!.symbols : (cached?.facts[rel]?.symbols ?? []));
-      if (rulesChanged) facts[rel] && (facts[rel]!.anchors = []);
+      if (rulesChangedFinal) facts[rel] && (facts[rel]!.anchors = []);
     }
     const enclosingId = (file: string, line: number): string | undefined => {
       const syms = symsByFile.get(file) ?? [];
@@ -391,13 +419,18 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
   for (const [label, sites] of draftsByLabel) {
     const first = sites[0]!;
     const filesOf = [...new Set(sites.map((s) => s.file))];
-    anchors.push({ id: label, kind: first.kind, label: sites.length > 1 ? `${label} · ${sites.length} sites` : label, nodeId: first.nodeId, file: first.file, line: first.line });
+    // A hub is implicit only when EVERY site came from a discovered rule — a
+    // match by any real rule upgrades it back to first-class instantly.
+    const hubImplicit = sites.every((s) => s.implicit === true);
+    anchors.push({ id: label, kind: first.kind, label: sites.length > 1 ? `${label} · ${sites.length} sites` : label, nodeId: first.nodeId, file: first.file, line: first.line, ...(hubImplicit ? { implicit: true } : {}) });
     const idx = addNode(nodes, seen, {
       id: `anchor:${label}`, name: label, kind: "anchor", file: first.file, line: first.line,
-      sig: sites.length > 1 ? `${label} (${sites.length} sites)` : label, lang: "anchor",
+      sig: `${hubImplicit ? "(△ discovered) " : ""}${sites.length > 1 ? `${label} (${sites.length} sites)` : label}`, lang: "anchor",
     });
     (byFile.get(first.file) ?? byFile.set(first.file, []).get(first.file)!).push(idx);
-    const w = 1 / Math.sqrt(sites.length);
+    // Tier-3 hubs prove themselves at half conductance; a later literal join
+    // against a first-class hub can still warm them via the channel edges.
+    const w = (hubImplicit ? 0.5 : 1) / Math.sqrt(sites.length);
     for (const s of sites) {
       const handler = seen.get(s.nodeId) ?? fileIdx.get(s.file)!;
       pushEdge(idx, handler, "anchors", w);

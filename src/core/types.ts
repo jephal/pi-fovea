@@ -48,6 +48,7 @@ export interface Anchor {
   nodeId: string;    // handler symbol node id, or enclosing node
   file: string;
   line: number;
+  implicit?: boolean; // tier-3 discovered shape: half hub gravity, shown with △
 }
 
 export interface Graph {
