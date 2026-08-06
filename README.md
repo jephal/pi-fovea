@@ -21,6 +21,17 @@ pi-fovea hands the model a map of your repo on every prompt. The repo compiles o
 
 At agent start Fovea establishes or checks its semantic baseline, so out-of-band edits made while Pi was idle enter context before the first model call. After each assistant turn it re-syncs again. Detection does not trust tool events: edits made by Pi tools, fabric_exec, bash, subagents, or an editor land identically, while comment- and formatting-only drift stays silent. A meaningful post-turn change is delivered as a **steer**, and Fovea triggers the continuation itself if the agent would otherwise wait.
 
+## Where fovea fits in shipping a feature
+
+Feature work in a large codebase has two costs: the change itself, and
+everything around it — finding where the feature lives, mapping what the
+change touches, keeping pace with edits landing from other branches, and
+handing reviewers an honest blast radius. In long-lived enterprise repos the
+second cost usually dominates the first. Fovea is built for that second cost:
+orientation, impact assessment, and mid-task re-sync become cheap, repeatable
+calls. The rest of the pipeline — testing, review gates, CI, rollout — stays
+with the tools built for it.
+
 ## When not to reach for fovea
 
 A map costs more than the territory when the territory is small: on repos of a
