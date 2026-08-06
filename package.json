@@ -1,0 +1,26 @@
+{
+  "name": "pi-fovea",
+  "version": "0.1.0",
+  "description": "Token-budgeted repo mapping for agent sessions: foveated heat diffusion over a cross-language code graph, with progressive disclosure.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "pi": { "extensions": ["./src/index.ts"] },
+  "exports": { "./ops": "./src/core/ops.ts" },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "bench": "tsx scripts/bench.ts",
+    "check": "pnpm run typecheck && pnpm run test"
+  },
+  "dependencies": {
+    "typebox": "^1.0.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}

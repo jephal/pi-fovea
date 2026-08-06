@@ -1,0 +1,75 @@
+// Extraction against the cross-language minimonorepo fixture.
+
+import { describe, expect, it } from "vitest";
+import { hasAstGrep } from "../src/core/astgrep.js";
+import { extractCalls, extractImports, extractLiterals, extractSymbols } from "../src/core/extract.js";
+import { extractAnchors } from "../src/core/anchors.js";
+import type { SymbolRec } from "../src/core/types.js";
+
+const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
+const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "worker/jobs.py"];
+const ALL = [...CODE, "openapi.yaml"];
+
+const enclosing = (syms: SymbolRec[]) => (file: string, line: number): string | undefined => {
+  let best: SymbolRec | undefined;
+  for (const s of syms.filter((x) => x.file === file)) {
+    if (s.line <= line && (!best || s.line > best.line)) best = s;
+  }
+  return best ? `${best.name}@${best.file}` : `file:${file}`;
+};
+
+describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
+  it("extracts symbols across Go, TypeScript and Python via outline", () => {
+    const syms = extractSymbols(CODE, FIXTURE);
+    const byId = new Map(syms.map((s) => [`${s.name}@${s.file}`, s]));
+    expect(byId.get("GetUserHandler@server/users.go")?.kind).toBe("function");
+    expect(byId.get("GetUserHandler@server/users.go")?.sig).toContain("func GetUserHandler");
+    expect(byId.get("Router@server/main.go")?.kind).toBe("class");
+    expect(byId.get("Router.db@server/main.go")?.kind).toBe("field");
+    expect(byId.get("Router.GET@server/main.go")?.kind).toBe("method");
+    expect(byId.get("LoadUser@server/users.go")?.kind).toBe("function");
+    expect(byId.get("loadUser@web/api.ts")?.kind).toBe("function");
+    expect(byId.get("User@web/api.ts")?.kind).toBe("interface");
+    expect(byId.get("User.id@web/api.ts")?.kind).toBe("field");
+    expect(byId.get("UserName@web/types.ts")?.kind).toBe("type");
+    expect(byId.get("sync_users@worker/jobs.py")?.kind).toBe("function");
+    expect(byId.get("fetch_all@worker/jobs.py")).toBeTruthy();
+  });
+
+  it("extracts imports across languages", () => {
+    const imps = extractImports(CODE, FIXTURE);
+    const has = (file: string, spec: string) => imps.some((i) => i.file === file && i.spec === spec);
+    expect(has("web/api.ts", "./types")).toBe(true);
+    expect(has("web/api.test.ts", "./api")).toBe(true);
+    expect(has("server/main.go", "github.com/acme/app/server")).toBe(true);
+    expect(has("worker/jobs.py", "os")).toBe(true);
+  });
+
+  it("extracts call sites with callee names", () => {
+    const calls = extractCalls(CODE, FIXTURE);
+    const has = (file: string, callee: string) => calls.some((c) => c.file === file && c.callee === callee);
+    expect(has("server/users.go", "LoadUser")).toBe(true);
+    expect(has("server/users.go", "SaveUser")).toBe(true);
+    expect(has("web/api.ts", "fetch")).toBe(true);
+  });
+
+  it("extracts literals from code and config files", () => {
+    const lits = extractLiterals(ALL, FIXTURE);
+    const texts = lits.map((l) => `${l.text}@${l.file}`);
+    expect(texts).toContain("/api/users/${id}@web/api.ts");
+    expect(texts).toContain("/api/users/:id@server/main.go");
+    expect(texts).toContain("/api/users/{id}@openapi.yaml");
+    expect(texts).toContain("DATABASE_URL@server/config.go");
+    expect(texts).toContain("DATABASE_URL@worker/jobs.py");
+  });
+
+  it("discovers route anchors from the default pack and binds handlers", () => {
+    const syms = extractSymbols(CODE, FIXTURE);
+    const anchors = extractAnchors(CODE, FIXTURE, enclosing(syms));
+    const labels = anchors.map((a) => `${a.id} -> ${a.nodeId}`);
+    expect(labels.some((l) => l.startsWith("GET /api/users/{*}"))).toBe(true);
+    expect(labels.some((l) => l.startsWith("POST /api/users"))).toBe(true);
+    const get = anchors.find((a) => a.id.startsWith("GET "))!;
+    expect(get.file).toBe("server/main.go");
+  });
+});
