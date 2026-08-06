@@ -135,6 +135,21 @@ const outlineKind = (symbol: OutlineSymbol, lang: string): NodeKind => {
 const identifierRe = (name: string): RegExp =>
   new RegExp(`(^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9_$]|$)`);
 
+// ast-grep --view=expanded inlines aggregate-initializer bodies into a
+// variable item's name — BoringSSL's curve25519 tables land 260 KB there.
+// That string is not an identifier: escaped into a RegExp it hits V8's
+// "Regular expression too large" compile limit, and as a graph node it is
+// noise. Reduce malformed names to their leading identifier; items with no
+// identifier head carry no symbol meaning and are skipped.
+const MAX_OUTLINE_NAME = 256;
+const OUTLINE_NAME_MALFORMED = /[\s{}]/;
+const OUTLINE_NAME_HEAD = /^[A-Za-z_$][A-Za-z0-9_$]*/;
+
+const outlineName = (name: string): string | undefined => {
+  if (name.length <= MAX_OUTLINE_NAME && !OUTLINE_NAME_MALFORMED.test(name)) return name;
+  return OUTLINE_NAME_HEAD.exec(name)?.[0];
+};
+
 const topLocation = (
   item: OutlineSymbol,
   sourceLines: readonly string[],
@@ -164,15 +179,20 @@ const parseStructuredOutline = async (
   // decorated file duplicated a whole batch's source beside outline JSON.
   for (const record of files) {
     const file = record.path.replace(/^\.\//, "");
-    const needsCorrection = record.items.some((item) => {
+    const items: OutlineSymbol[] = [];
+    for (const item of record.items) {
+      const name = outlineName(item.name);
+      if (name !== undefined) items.push(name === item.name ? item : { ...item, name });
+    }
+    const needsCorrection = items.some((item) => {
       const sig = cleanSig(item.signature || item.name);
       return !!item.name && (!identifierRe(item.name).test(sig) || /^@/.test(sig));
     });
     const sourceLines = needsCorrection ? (await source.read(file))?.split("\n") ?? [] : [];
     const concreteParents = new Set(
-      record.items.filter((item) => item.symbolType !== "object").map((item) => item.name),
+      items.filter((item) => item.symbolType !== "object").map((item) => item.name),
     );
-    for (const item of record.items) {
+    for (const item of items) {
       const kind = outlineKind(item, record.language);
       let name = item.name;
       if (kind === "method") {
@@ -186,13 +206,15 @@ const parseStructuredOutline = async (
         out.push({ name, kind, file, line: location.line, sig: location.sig, lang: record.language });
       }
       for (const member of item.members ?? []) {
+        const memberName = outlineName(member.name);
+        if (memberName === undefined) continue;
         const memberKind = outlineKind(member, record.language);
         out.push({
-          name: `${item.name}.${member.name}`,
+          name: `${item.name}.${memberName}`,
           kind: memberKind,
           file,
           line: member.range.start.line + 1,
-          sig: cleanSig(member.signature || `${memberKind} ${item.name}.${member.name}`),
+          sig: cleanSig(member.signature || `${memberKind} ${item.name}.${memberName}`),
           lang: record.language,
         });
       }

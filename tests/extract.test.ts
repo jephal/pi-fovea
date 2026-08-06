@@ -1,5 +1,8 @@
 // Extraction against the cross-language minimonorepo fixture.
 
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols } from "../src/core/extract.js";
@@ -140,5 +143,33 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(byId.get("GET /channels/{*}")?.kind).toBe("route");
     expect(byId.get("GET /api/session")?.file).toBe("server/api/session.get.ts");
     expect(byId.has("ANY /api/health")).toBe(true);
+  });
+
+  it("normalizes variable items whose name inlined a huge C initializer", async () => {
+    // aws-lc-sys 0.41-0.43 curve25519_tables.h: ast-grep outline --view=expanded
+    // inlines the whole 260,027-char k25519Precomp initializer into the item
+    // name. identifierRe() escaped it into a RegExp and V8 aborted the build
+    // with SyntaxError "Regular expression too large".
+    const root = mkdtempSync(join(tmpdir(), "fovea-biginit-"));
+    try {
+      const pad = "    0x10, 0x2024, 0x30ff, 0x40a5,\n".repeat(Math.ceil(320_000 / 32));
+      writeFileSync(
+        join(root, "tables.h"),
+        "static const int tiny_ok[3] = { 1, 2, 3 };\n\n" +
+          "static const long big_table[] = {\n" + pad + "};\n\n" +
+          "static long use_tables(void) { return big_table[0] + tiny_ok[1]; }\n",
+      );
+      const syms = await extractSymbols(["tables.h"], root);
+      const byId = new Map(syms.map((s) => [`${s.name}@${s.file}`, s]));
+      expect(byId.get("big_table@tables.h")?.kind).toBe("decl");
+      expect(byId.get("tiny_ok@tables.h")?.kind).toBe("decl");
+      expect(byId.get("use_tables@tables.h")?.kind).toBe("function");
+      for (const s of syms) {
+        expect(s.name.length).toBeLessThanOrEqual(256);
+        expect(s.name).not.toMatch(/[\s{}]/);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

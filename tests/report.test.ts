@@ -60,6 +60,25 @@ describe("bounded discovery", () => {
     }
   });
 
+  it("skips Cargo package caches during umbrella walks", async () => {
+    // ~/.cargo/registry/src and ~/.cargo/git/checkouts hold vendored crate
+    // copies (e.g. aws-lc-sys' generated BoringSSL tables), the same class of
+    // dependency payload as node_modules or vendor.
+    const root = mkdtempSync(join(tmpdir(), "fovea-cargo-"));
+    try {
+      writeFileSync(join(root, "top.ts"), "export const top = 1;\n");
+      const registry = join(root, ".cargo", "registry", "src", "index.crates.io-deadbeef", "aws-lc-sys-0.42.0");
+      mkdirSync(registry, { recursive: true });
+      writeFileSync(join(registry, "lib.rs"), "pub fn cached() {}\n");
+      const checkout = join(root, ".cargo", "git", "checkouts", "some-abc123", "deadbeef");
+      mkdirSync(checkout, { recursive: true });
+      writeFileSync(join(checkout, "main.rs"), "fn main() {}\n");
+      expect(await listFiles(root)).toEqual(["top.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("reports and omits individual source files over the memory safety cap", async () => {
     const root = mkdtempSync(join(tmpdir(), "fovea-oversized-"));
     try {
