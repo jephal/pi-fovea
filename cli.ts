@@ -56,7 +56,9 @@ try {
   let out = "";
   if (cmd === "status") {
     const s = sketch(rootAt(0), 256);
-    out = `${s.details.files} files, ${s.details.nodes} nodes, ${s.details.anchors} anchors`;
+    const testAnchors = Number(s.details.testAnchors ?? 0);
+    out = `${s.details.files} files, ${s.details.nodes} symbols, ${s.details.productionAnchors ?? s.details.anchors} production anchors` +
+      (testAnchors ? `, ${testAnchors} test/fixture anchors collapsed` : "");
   } else if (cmd === "sketch") {
     const root = rootAt(0);
     const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 1400;

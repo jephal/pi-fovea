@@ -76,6 +76,41 @@ describe("revealFoveated", () => {
     expect(fit.text).toContain("← caller  caller");
   });
 
+
+  it("keeps a structured focus nucleus while suppressing seen periphery", () => {
+    const nodes: NodeRec[] = [
+      { id: "focus@src/a.ts", name: "focus", kind: "function", file: "src/a.ts", line: 1, sig: "focus()", lang: "TypeScript" },
+      { id: "caller@src/b.ts", name: "caller", kind: "function", file: "src/b.ts", line: 2, sig: "caller()", lang: "TypeScript" },
+      { id: "warm@src/c.ts", name: "warm", kind: "function", file: "src/c.ts", line: 3, sig: "warm()", lang: "TypeScript" },
+    ];
+    const g: Graph = {
+      nodes,
+      edges: [{ a: 1, b: 0, kind: "invokes", w: 0.7 }],
+      byName: new Map(),
+      byFile: new Map(),
+      anchors: [],
+      files: [],
+    };
+    const field = new Float64Array([1, 0.1, 0.1]);
+    const first = revealFoveated(g, field, { header: "t", budget: 1000, seeds: [0], repeatNucleus: true });
+    const second = revealFoveated(g, field, {
+      header: "t",
+      budget: 1000,
+      seeds: [0],
+      repeatNucleus: true,
+      disclosed: new Set(first.revealedIds),
+    });
+    expect(second.revealedIds).toContain("focus@src/a.ts");
+    expect(second.revealedIds).toContain("caller@src/b.ts");
+    expect(second.revealedIds).not.toContain("warm@src/c.ts");
+    expect(second.revealed.find((node) => node.id === "caller@src/b.ts")).toMatchObject({
+      role: "direct",
+      relation: "← caller",
+      seedId: "focus@src/a.ts",
+    });
+    expect(second.suppressed).toBe(1);
+  });
+
   it("collapses anonymous warm siblings instead of flooding one file", () => {
     const nodes: NodeRec[] = [
       { id: "focus@src/large.ts", name: "focus", kind: "method", file: "src/large.ts", line: 10, sig: "focus()", lang: "TypeScript" },
@@ -129,7 +164,7 @@ describe("revealFoveated", () => {
     s[0] = 1;
     const fit = revealFoveated(g, heatAt(csr, s, 3), { header: "fovea focus x", budget: 256 });
     expect(fit.tokens).toBeLessThanOrEqual(256);
-    expect(fit.text).toContain("low-acuity nodes remain collapsed"); // periphery was truncated, budget intact
+    expect(fit.text).toContain("more results collapsed"); // periphery was truncated, budget intact
     expect(fit.truncated).toBe(true);
   });
 });

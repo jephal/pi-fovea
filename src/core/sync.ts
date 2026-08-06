@@ -1,32 +1,28 @@
-// Turn-sync: the default-on feedback loop the extension was built around.
-// After each assistant turn, if the repo's facts version drifted ANY edit
-// re-syncs, regardless of the mutation path — pi's edit/write tools, a
-// fabric_exec inner pi.edit, a bash heredoc, a subagent run, or an editor
-// save outside the session all land the same way, because drift is measured
-// by diffing the baseline's content hashes against the current facts instead
-// of trusting tool events or git.
+// Turn-sync is continuous repository intelligence for the active agent loop.
+// Before agent start and after each assistant turn it compares extracted facts
+// against its baseline, regardless of whether edits came from Pi tools,
+// fabric_exec, bash, a subagent, or an external editor. Content hashes provide
+// the cheap unchanged path; semantic fingerprints ignore coordinate-only drift.
 //
-//   red  = route anchors appeared/vanished   (structural feature churn)
-//       OR warm undisclosed files >= warmFileThreshold  (unseen blast radius)
-//   green = structure stable; zero model tokens unless ackClean is on
+// A route change or enough newly relevant files emits compact causal context.
+// Pre-agent drift is injected directly; post-turn drift is sent as a steer and
+// triggers a continuation if the agent would otherwise become idle.
 //
-// The first sync of a session only establishes the baseline (never red).
-// Baselines reset on /new and /fork alongside fovea sessions.
+// The first sync establishes the baseline. Baselines reset on /new, /fork,
+// and /fovea reset alongside focus sessions.
 
-import { ensureState, impact } from "./ops.js";
+import { ensureState, impact, isTestScope } from "./ops.js";
 import type { RepoState } from "./ops.js";
 import { getSession } from "./session.js";
 
 interface SyncBaseline {
   version: string;
   anchors: Set<string>;
-  /** file -> content sha1 at baseline. Diffing this against the current facts
-   * yields the exact changed-file set for any mutation path — no dependence
-   * on which tool executed the write, nor on git. */
+  /** file -> content sha1 at baseline; used only for fast drift detection. */
   shas: Map<string, string>;
-  /** Steady-state warmth recorded on the most recent sync. undefined = "the
-   * first drift after baseline calibrates the neighborhood instead of
-   * escalating" — a file list appears after that calibration sync. */
+  /** file -> extracted semantic facts, excluding the content hash. */
+  semantics: Map<string, string>;
+  /** Previously reported undisclosed warmth, for delta delivery. */
   warmed?: Set<string>;
 }
 
@@ -52,10 +48,26 @@ export interface SyncOutcome {
   details: Record<string, unknown>;
 }
 
+const semanticFacts = (state: RepoState, file: string): string => {
+  const facts = state.facts[file];
+  if (!facts) return "";
+  const sorted = (rows: unknown[][]): unknown[][] => rows.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const compactSig = (sig: string): string => sig.replace(/\s+/g, " ").trim();
+  return JSON.stringify({
+    symbols: sorted(facts.symbols.map((symbol) => [symbol.name, symbol.kind, compactSig(symbol.sig), symbol.lang])),
+    imports: sorted(facts.imports.map((site) => [site.spec])),
+    calls: sorted(facts.calls.map((site) => [site.callee])),
+    literals: sorted(facts.literals.map((site) => [site.text])),
+    anchors: sorted(facts.anchors.map((anchor) => [anchor.id, anchor.kind, anchor.nodeId, anchor.implicit === true])),
+    sigs: Object.entries(facts.sigs ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+  });
+};
+
 const snapshot = (state: RepoState): SyncBaseline => ({
   version: state.version,
-  anchors: new Set(state.graph.anchors.map((a) => a.id)),
-  shas: new Map(Object.entries(state.facts).map(([f, x]) => [f, x.sha1])),
+  anchors: new Set(state.graph.anchors.map((anchor) => anchor.id)),
+  shas: new Map(Object.entries(state.facts).map(([file, facts]) => [file, facts.sha1])),
+  semantics: new Map(Object.keys(state.facts).map((file) => [file, semanticFacts(state, file)])),
 });
 
 export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOutcome => {
@@ -91,46 +103,85 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
   // Exact change set: facts whose content hash moved since the baseline.
   // Deleted files can't warm anything (absent from the graph) but ride along
   // in details for observability.
-  const hinted = (params.files ?? []).filter((f) => state.graph.byFile.has(f));
   const changed = Object.keys(state.facts).filter(
-    (f) => prev.shas.get(f) !== state.facts[f]!.sha1 && state.graph.byFile.has(f),
+    (file) => prev.shas.get(file) !== state.facts[file]!.sha1,
   );
-  const deleted = [...prev.shas.keys()].filter((f) => !(f in state.facts));
-  const files = [...new Set([...hinted, ...changed])];
+  const semanticChanged = changed.filter(
+    (file) => prev.semantics.get(file) !== semanticFacts(state, file) && state.graph.byFile.has(file),
+  );
+  const hinted = (params.files ?? []).filter((file) => semanticChanged.includes(file));
+  const deleted = [...prev.shas.keys()].filter((file) => !(file in state.facts));
+  const files = [...new Set([...semanticChanged, ...hinted])];
 
   let warmNow: Set<string> = new Set();
   let warmNew: string[] = [];
+  let warmReasons: Record<string, string[]> = {};
   if (files.length) {
-    const r = impact(root, { files, budget: params.budget });
-    const warmedFiles = (r.details.warmedFiles as string[] | undefined) ?? [];
-    warmNow = new Set(warmedFiles.filter((f) => !disclosedFiles.has(f) && !files.includes(f)));
+    const result = impact(root, { files, includeUncommitted: false, budget: params.budget });
+    const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
+    warmReasons = (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {};
+    warmNow = new Set(warmedFiles.filter((file) => !disclosedFiles.has(file) && !files.includes(file)));
     warmNew = prev.warmed === undefined
-      ? []                                  // first drift after baseline: calibrate, don't escalate
-      : [...warmNow].filter((f) => !prev.warmed!.has(f));
+      ? [...warmNow]
+      : [...warmNow].filter((file) => !prev.warmed!.has(file));
   }
 
   baselines.set(root, { ...snapshot(state), warmed: warmNow });
 
-  const red = (added.length - newlyImplicit.length) + removed.length > 0 || warmNew.length >= Math.max(1, params.warmFileThreshold);
+  const red = (added.length - newlyImplicit.length) + removed.length > 0 ||
+    deleted.some((file) => !isTestScope(file)) ||
+    warmNew.length >= Math.max(1, params.warmFileThreshold);
   if (!red) {
     return {
       structural: true, red: false, tokens: 0,
-      details: { version: state.version, anchorsDelta: added.length - removed.length, warmNew: warmNew.length, deletedFiles: deleted },
+      details: {
+        version: state.version,
+        anchorsDelta: added.length - removed.length,
+        warmNew: warmNew.length,
+        changedFiles: changed,
+        semanticChangedFiles: files,
+        deletedFiles: deleted,
+      },
     };
   }
 
-  const lines: string[] = [];
-  lines.push(`fovea sync · v ${state.version} · edit cascade did not stay local`);
-  for (const id of added.filter((a) => !newlyImplicit.includes(a)).slice(0, 12)) lines.push(`  ⚑=new ${id}`);
-  for (const id of newlyImplicit.slice(0, 6)) lines.push(`  △ newly discovered hub ${id}`);
-  for (const id of removed.slice(0, 12)) lines.push(`  ⚑-removed ${id}`);
-  if (warmNew.length) {
-    lines.push(`  newly warm undisclosed files (revisit with fovea_focus):`);
-    for (const f of warmNew.slice(0, 20)) lines.push(`    ${f}`);
+  const changedSummary = files.length
+    ? `${files.slice(0, 4).join(", ")}${files.length > 4 ? ` (+${files.length - 4} more)` : ""}`
+    : deleted.length
+      ? `${deleted.length} deleted file${deleted.length === 1 ? "" : "s"}`
+      : "route structure";
+  const orderedWarm = [...warmNew].sort((a, b) =>
+    Number(isTestScope(a)) - Number(isTestScope(b)) || a.localeCompare(b));
+  const lines: string[] = [
+    "Fovea continuous update — repository structure changed.",
+    `Changed: ${changedSummary}`,
+  ];
+  for (const id of added.filter((anchor) => !newlyImplicit.includes(anchor)).slice(0, 6)) {
+    lines.push(`Route added: ${id}`);
+  }
+  for (const id of removed.slice(0, 6)) lines.push(`Route removed: ${id}`);
+  if (orderedWarm.length) {
+    lines.push("Newly relevant files:");
+    for (const file of orderedWarm.slice(0, 8)) {
+      lines.push(`  ${file} — ${(warmReasons[file] ?? ["graph path"]).join(", ")}`);
+    }
+  }
+  lines.push("Steer: account for this update before continuing; inspect only the files relevant to the current task.");
+  while (lines.length > 3 && Math.ceil(lines.join("\n").length / 4) > params.budget) {
+    lines.splice(lines.length - 2, 1);
   }
   const text = lines.join("\n");
   return {
     structural: true, red: true, text, tokens: Math.ceil(text.length / 4),
-    details: { version: state.version, added, removed, warmNew, deletedFiles: deleted },
+    details: {
+      version: state.version,
+      added,
+      removed,
+      changedFiles: changed,
+      semanticChangedFiles: files,
+      warmNew: orderedWarm,
+      warmReasons,
+      deletedFiles: deleted,
+    },
   };
 };

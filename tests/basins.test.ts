@@ -52,4 +52,18 @@ describe("detectBasins", () => {
     expect(basins).toHaveLength(1);
     expect(Math.max(...basins[0]!.members)).toBeLessThan(4);
   });
+
+  it("keeps excluded nodes out of scoped region membership", () => {
+    const edges: Array<[number, number, number]> = [];
+    for (let i = 0; i < 4; i++) {
+      for (let j = i + 1; j < 4; j++) edges.push([i, j, 1]);
+      for (let j = 4; j < 8; j++) edges.push([i, j, 0.05]);
+    }
+    const { adjacency, cond } = build(edges, 8);
+    const production = (i: number): boolean => i < 4;
+    const basins = detectBasins(adjacency, cond, 8, production, production);
+    expect(basins).toHaveLength(1);
+    expect(basins[0]!.members).toHaveLength(4);
+    expect(basins[0]!.members.every(production)).toBe(true);
+  });
 });

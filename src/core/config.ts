@@ -11,18 +11,18 @@ import path from "node:path";
 interface FoveaSyncConfig {
   /** turn_end feedback loop on/off (the default-on, opt-out knob). */
   enabled: boolean;
-  /** Token budget for the red (issues) message. */
+  /** Token budget for proactive model steering context. */
   budget: number;
   /** Also send a tiny model-visible ack on clean turns (default false: silent green). */
   ackClean: boolean;
-  /** Number of newly-warm undisclosed files that justifies a red message on its own. */
+  /** Number of newly relevant files that justifies proactive steering on its own. */
   warmFileThreshold: number;
 }
 
 interface FoveaToolsConfig {
   /** Budget applied when a fovea_* tool call omits maxTokens. */
   defaultBudget: number;
-  /** Replace Pi's grep slot with a graph-backed fovea_focus adapter. */
+  /** Install hybrid grep: native text semantics plus bare-query Fovea navigation. */
   replaceGrep: boolean;
 }
 

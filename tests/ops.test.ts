@@ -36,6 +36,15 @@ describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
     expect(r.text).toMatch(/web\//);
   });
 
+  it("keeps test and fixture architecture collapsed in a real project sketch", () => {
+    const project = new URL("../", import.meta.url).pathname;
+    const r = sketch(project, 1200);
+    expect(Number(r.details.testAnchors)).toBeGreaterThan(0);
+    expect(r.text).toContain("test/fixture anchors collapsed");
+    expect(r.text).toContain("src/core/");
+    expect(r.text).not.toContain("⚑ GET /elixir-health");
+  });
+
   it("focus on a route resolves across languages within budget", () => {
     resetSessions();
     const r = focus(FIXTURE, "/api/users/{id}", 1600);
@@ -88,15 +97,55 @@ describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
     expect(r.text).toContain("GetUserHandler");
   });
 
-  it("second identical focus returns a delta, not a repeat", () => {
+  it("repeats the active nucleus while suppressing previously seen periphery", () => {
     resetSessions();
-    const a = focus(FIXTURE, "loadUser", 2000);
-    const b = focus(FIXTURE, "loadUser", 2000);
-    expect(Number(b.details.suppressed)).toBeGreaterThan(0);
-    expect(b.text).toContain("seen");
-    // delta shares no hot signature line with the first answer
-    const hotA = a.text.split("\n").filter((l) => l.startsWith("▲"));
-    for (const line of hotA) expect(b.text).not.toContain(line);
+    const first = focus(FIXTURE, "loadUser", 2000);
+    const second = focus(FIXTURE, "loadUser", 2000);
+    expect(Number(second.details.suppressed)).toBeGreaterThan(0);
+    expect(second.text).toContain("prior results omitted");
+    for (const line of first.text.split("\n").filter((entry) => entry.includes("[focus]"))) {
+      expect(second.text).toContain(line);
+    }
+  });
+
+  it("starts unrelated focuses sharp and never hides their target", () => {
+    resetSessions();
+    focus(FIXTURE, "loadUser", 2000);
+    const user = focus(FIXTURE, "User", 1200);
+    expect(user.text).toContain("web/api.ts:3");
+    expect(user.text).toContain("[focus]");
+    expect(user.details.t).toBe(2);
+
+    dwell(FIXTURE, 8, 800);
+    const search = focus(FIXTURE, "AirportsController.search", 800);
+    expect(search.details.t).toBe(2);
+    expect(search.text).toContain("web/airports.controller.ts:7");
+  });
+
+  it("supports reproducible fresh focus and source scoping", () => {
+    resetSessions();
+    focus(FIXTURE, "loadUser", 1200);
+    const delta = focus(FIXTURE, "loadUser", 1200);
+    expect(Number(delta.details.suppressed)).toBeGreaterThan(0);
+    const fresh = focus(FIXTURE, "loadUser", 1200, {
+      fresh: true,
+      path: "web",
+      language: "TypeScript",
+      kind: "function",
+    });
+    expect(fresh.details.suppressed).toBe(0);
+    expect(fresh.text).toContain("web/api.ts:8");
+    expect(fresh.text).not.toContain("server/users.go:13");
+    expect(Array.isArray(fresh.details.nodes)).toBe(true);
+    expect(Array.isArray(fresh.details.suggestedReads)).toBe(true);
+    const reads = fresh.details.suggestedReads as Array<{ path: string; offset: number; limit: number }>;
+    expect(reads.filter((read) => read.path === "web/api.ts")).toHaveLength(1);
+
+    focus(FIXTURE, "loadUser", 256, { fresh: true, path: "web", language: "TypeScript" });
+    const wider = dwell(FIXTURE, 8, 1200);
+    const widenedNodes = wider.details.nodes as Array<{ file: string; language: string }>;
+    expect(widenedNodes.length).toBeGreaterThan(0);
+    expect(widenedNodes.every((node) => node.file.startsWith("web/") && node.language === "TypeScript")).toBe(true);
   });
 
   it("dwell deepens the field and reports the t transition", () => {
@@ -105,7 +154,7 @@ describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
     const d = dwell(FIXTURE, 2, 1600);
     expect(d.tokens).toBeLessThanOrEqual(1600);
     expect(d.text).toContain("dwell");
-    expect(d.text).toMatch(/t 2(\.\d+)?→4/);
+    expect(d.text).toContain("context widened 2×");
     expect(Number(d.details.to)).toBe(4);
   });
 
@@ -117,6 +166,10 @@ describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
     expect(r.text).toContain("web/api.ts");      // shares the /api/users literal
     expect(r.text).toContain("openapi.yaml");    // same route in the spec
     expect(r.text).toContain("worker/search.rs"); // same route literal in Rust
+    expect(r.details.warmedReasons).toBeTruthy();
+    const reasons = r.details.warmedReasons as Record<string, string[]>;
+    expect(reasons["web/api.ts"]).toContain("shared literal");
+    expect(reasons["worker/search.rs"]).not.toContain("graph path");
     // the seed file's own symbols are not part of the review list
     expect(r.text.split("\n").filter((l) => l.startsWith("server/users.go"))).toHaveLength(0);
   });

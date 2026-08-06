@@ -15,11 +15,14 @@ const MIN_BASIN_SIZE = 4;
 
 // eligible marks nodes that may seed a basin (symbols, not files/anchors: a
 // file's contains-star has ~zero triangle density and yields useless seeds).
+// include optionally constrains every member, for operation-specific views
+// such as production-first sketching without changing the underlying graph.
 export const detectBasins = (
   adjacency: Map<number, Array<{ to: number; kind: string; w: number }>>,
   conductance: Float64Array,
   n: number,
   eligible?: (i: number) => boolean,
+  include?: (i: number) => boolean,
 ): Basin[] => {
   // Triangle density: fraction of a node's neighbors that are co-neighbors.
   // Cheap O(deg^2) sampling with degree cap — hubs are star points anyway.
@@ -60,12 +63,14 @@ export const detectBasins = (
     const order: number[] = [seed];
     let internal = 0;
     const boundary = new Map<number, number>();
-    for (const e of adjacency.get(seed) ?? []) boundary.set(e.to, (boundary.get(e.to) ?? 0) + e.w);
+    for (const e of adjacency.get(seed) ?? []) {
+      if (!include || include(e.to)) boundary.set(e.to, (boundary.get(e.to) ?? 0) + e.w);
+    }
     while (order.length < MAX_BASIN_SIZE && boundary.size) {
       let best = -1;
       let bestRatio = -1;
       for (const [j, inW] of boundary) {
-        if (claimed.has(j) || members.has(j)) continue;
+        if (claimed.has(j) || members.has(j) || (include && !include(j))) continue;
         const total = [...(adjacency.get(j) ?? [])].reduce((s, e) => s + e.w, 0);
         const ratio = total > 0 ? inW / total : 0;
         if (ratio > bestRatio) { bestRatio = ratio; best = j; }
@@ -79,7 +84,7 @@ export const detectBasins = (
       internal += boundary.get(best) ?? 0;
       boundary.delete(best);
       for (const e of adjacency.get(best) ?? []) {
-        if (members.has(e.to)) continue;
+        if (members.has(e.to) || (include && !include(e.to))) continue;
         boundary.set(e.to, (boundary.get(e.to) ?? 0) + e.w);
       }
       const cut = [...boundary.values()].reduce((a, b2) => a + b2, 0);

@@ -11,11 +11,12 @@ import { hasAstGrep } from "./astgrep.js";
 import { assembleGraph, listFiles, loadFacts, type FileFacts } from "./build.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
-import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "./render.js";
-import { getSession, TK_ORDER } from "./session.js";
+import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine, type RevealedNode } from "./render.js";
+import { FOCUS_T0, getSession, TK_ORDER } from "./session.js";
 import { detectBasins } from "./basins.js";
 import { classifyLiteral, normalizeLiteral, buildJoinIndex, type JoinIndex } from "./join.js";
-import type { Graph, NodeRec } from "./types.js";
+import { isTestFile } from "./extract.js";
+import type { Graph, NodeKind, NodeRec } from "./types.js";
 
 export interface OpResult {
   text: string;
@@ -79,7 +80,7 @@ export const ensureState = (root: string): RepoState => {
   return state;
 };
 
-// --- seed resolution ------------------------------------------------------------
+// Seed resolution.
 
 export interface SeedSuggestion {
   index: number;
@@ -94,6 +95,13 @@ export interface SeedResolution {
   seeds: number[];
   note: string;
   suggestions: SeedSuggestion[];
+}
+
+export interface FocusOptions {
+  fresh?: boolean;
+  path?: string;
+  language?: string;
+  kind?: NodeKind;
 }
 
 const QUERY_STOP_WORDS = new Set([
@@ -163,10 +171,20 @@ const sameIdentifierTerms = (query: string, name: string): boolean => {
   return queryTerms.every((term) => candidateSet.has(term));
 };
 
-export const resolveSeeds = (state: RepoState, query: string): SeedResolution => {
+const matchesFocusScope = (node: NodeRec, options: FocusOptions): boolean => {
+  const pathScope = options.path?.replace(/^@/, "").replace(/^\.\//, "").replace(/\/$/, "");
+  if (pathScope && node.file !== pathScope && !node.file.startsWith(`${pathScope}/`)) return false;
+  if (options.language && node.lang.toLowerCase() !== options.language.toLowerCase()) return false;
+  if (options.kind && node.kind !== options.kind) return false;
+  return true;
+};
+
+export const resolveSeeds = (state: RepoState, query: string, options: FocusOptions = {}): SeedResolution => {
   const g = state.graph;
+  const allows = (idx: number): boolean => matchesFocusScope(g.nodes[idx]!, options);
   const scored = new Map<number, number>();
   const bump = (idx: number, s: number): void => {
+    if (!allows(idx)) return;
     scored.set(idx, Math.max(scored.get(idx) ?? 0, s));
   };
   const q = query.trim();
@@ -233,13 +251,15 @@ export const resolveSeeds = (state: RepoState, query: string): SeedResolution =>
     .sort((a, b) => b[1] - a[1] || g.nodes[a[0]]!.file.localeCompare(g.nodes[b[0]]!.file))
     .slice(0, 16);
   const seeds = ranked.map(([i]) => i);
-  const names = ranked.slice(0, 4).map(([i, s]) => `${g.nodes[i]!.name}${s < 1 ? "~" : ""}`);
-  const note = seeds.length ? `${seeds.length} seeds (${names.join(", ")}${seeds.length > 4 ? ", …" : ""})` : "no seeds matched";
+  const names = ranked.slice(0, 4).map(([i, score]) => `${g.nodes[i]!.name}${score < 1 ? " (approximate)" : ""}`);
+  const note = seeds.length
+    ? `${seeds.length} match${seeds.length === 1 ? "" : "es"}: ${names.join(", ")}${seeds.length > 4 ? ", …" : ""}`
+    : "no graph match";
   const suggestions = seeds.length
     ? []
     : g.nodes
       .map((node, index) => ({ node, index, score: symbolSimilarity(q, node) }))
-      .filter(({ node, score }) => node.kind !== "file" && node.kind !== "anchor" && score >= 0.34)
+      .filter(({ node, index, score }) => allows(index) && node.kind !== "file" && node.kind !== "anchor" && score >= 0.34)
       .sort((a, b) => b.score - a.score || a.node.name.localeCompare(b.node.name) || a.node.file.localeCompare(b.node.file))
       .slice(0, 5)
       .map(({ node, index, score }) => ({
@@ -253,6 +273,32 @@ export const resolveSeeds = (state: RepoState, query: string): SeedResolution =>
   return { seeds, note, suggestions };
 };
 
+const suggestedReads = (nodes: RevealedNode[]): Array<{ path: string; offset: number; limit: number; reason: string }> => {
+  const out: Array<{ path: string; offset: number; limit: number; reason: string }> = [];
+  for (const node of nodes) {
+    if (node.line <= 0 || node.lineApproximate) continue;
+    const offset = Math.max(1, node.line - 5);
+    const end = offset + 24;
+    const existing = out.find((read) =>
+      read.path === node.file && offset <= read.offset + read.limit && end + 1 >= read.offset);
+    if (existing) {
+      const mergedEnd = Math.max(existing.offset + existing.limit - 1, end);
+      existing.offset = Math.min(existing.offset, offset);
+      existing.limit = mergedEnd - existing.offset + 1;
+      if (node.role === "focus") existing.reason = "matched focus";
+      continue;
+    }
+    out.push({
+      path: node.file,
+      offset,
+      limit: 25,
+      reason: node.role === "focus" ? "matched focus" : node.relation ?? `${node.role} neighbor`,
+    });
+    if (out.length === 5) break;
+  }
+  return out;
+};
+
 const seedVector = (n: number, seeds: number[]): Float64Array => {
   const s = new Float64Array(n);
   for (const i of seeds) s[i] = 1;
@@ -262,21 +308,31 @@ const seedVector = (n: number, seeds: number[]): Float64Array => {
 const clampBudget = (b: number | undefined, dflt: number): number =>
   Math.max(256, Math.min(16000, b ?? dflt));
 
-// --- ops ------------------------------------------------------------------------
+export const isTestScope = (file: string): boolean =>
+  isTestFile(file) || /(^|\/)(tests?|__tests__|fixtures?)(\/|$)/i.test(file);
+
 
 export const sketch = (root: string, budget?: number): OpResult => {
   const state = ensureState(root);
   const g = state.graph;
   const B = clampBudget(budget, 1400);
 
-  // Seeds: anchors (features) + high-conductance hub nodes.
+  // Production anchors and hubs define the opening silhouette. Tests remain
+  // in the graph for focus/impact, but do not crowd out the code being shipped.
   const conductance = state.csr.deg;
-  const hubIdx = g.nodes
+  const closureFor = (i: number): number[] => [i, ...(state.adjacency.get(i) ?? []).map((edge) => edge.to)];
+  const anchorIdx = g.nodes.map((node, i) => (node.kind === "anchor" ? i : -1)).filter((i) => i >= 0);
+  const productionAnchorIdx = anchorIdx.filter((i) => closureFor(i).some((j) => !isTestScope(g.nodes[j]!.file)));
+  const testAnchorIdx = anchorIdx.filter((i) => !productionAnchorIdx.includes(i));
+  const productionHubIdx = g.nodes
     .map((_, i) => i)
+    .filter((i) => !isTestScope(g.nodes[i]!.file))
     .sort((a, b) => conductance[b]! - conductance[a]!)
     .slice(0, 24);
-  const anchorIdx = g.nodes.map((n, i) => (n.kind === "anchor" ? i : -1)).filter((i) => i >= 0);
-  const seeds = [...new Set([...anchorIdx, ...hubIdx])].slice(0, 64);
+  const fallbackHubIdx = productionHubIdx.length
+    ? productionHubIdx
+    : g.nodes.map((_, i) => i).sort((a, b) => conductance[b]! - conductance[a]!).slice(0, 24);
+  const seeds = [...new Set([...productionAnchorIdx, ...fallbackHubIdx])].slice(0, 64);
   const s = seedVector(g.nodes.length, seeds);
   const t = 16;
   const field = heatField(chebyshevVectors(state.csr, s, Math.max(TK_ORDER, chooseOrder(t))), t, g.nodes.length);
@@ -291,12 +347,13 @@ export const sketch = (root: string, budget?: number): OpResult => {
   // (implicit features on non-web repos: CLIs, libraries, kernels).
   const claimed = new Set<number>();
   const groups: GroupLine[] = [];
-  const basins = g.anchors.length < 6 && g.nodes.length >= 48
+  const basins = productionAnchorIdx.length < 6 && g.nodes.length >= 48
     ? detectBasins(
         state.adjacency,
         conductance,
         g.nodes.length,
-        (i) => g.nodes[i]!.kind !== "file" && g.nodes[i]!.kind !== "anchor",
+        (i) => g.nodes[i]!.kind !== "file" && g.nodes[i]!.kind !== "anchor" && !isTestScope(g.nodes[i]!.file),
+        (i) => !isTestScope(g.nodes[i]!.file),
       )
     : [];
   for (const b of basins) {
@@ -311,15 +368,15 @@ export const sketch = (root: string, budget?: number): OpResult => {
       .filter(([, j]) => g.nodes[j]!.kind !== "file")
       .sort((a, b2) => b2[0] - a[0])[0];
     groups.push({
-      label: `◈ basin ${topName ? g.nodes[topName[1]]!.name : g.nodes[b.seed]!.name}`,
+      label: `◈ region ${topName ? g.nodes[topName[1]]!.name : g.nodes[b.seed]!.name}`,
       mass,
       detail: `${b.members.length} nodes · ${bfiles.size} files · seed ${g.nodes[b.seed]!.file}`,
     });
     for (const j of b.members) claimed.add(j);
   }
 
-  for (const i of anchorIdx) {
-    const closure = [i, ...(state.adjacency.get(i) ?? []).map((e) => e.to)];
+  for (const i of productionAnchorIdx) {
+    const closure = closureFor(i);
     let mass = 0;
     const filesIn = new Set<string>();
     for (const j of closure) {
@@ -332,6 +389,21 @@ export const sketch = (root: string, budget?: number): OpResult => {
       label: `⚑ ${g.nodes[i]!.name}`,
       mass,
       detail: `${closure.length} nodes · ${filesIn.size} file${filesIn.size === 1 ? "" : "s"} · ${handler.file}:${handler.line}`,
+    });
+  }
+
+  let testAnchorMass = 0;
+  for (const i of testAnchorIdx) {
+    for (const j of closureFor(i)) {
+      testAnchorMass += field[j] ?? 0;
+      claimed.add(j);
+    }
+  }
+  if (testAnchorIdx.length) {
+    groups.push({
+      label: "tests/fixtures",
+      mass: testAnchorMass * 0.05,
+      detail: `${testAnchorIdx.length} feature anchors collapsed`,
     });
   }
 
@@ -350,19 +422,41 @@ export const sketch = (root: string, budget?: number): OpResult => {
   for (const [dir, agg] of dirAgg) {
     agg.top.sort((a, b) => b[0] - a[0]);
     const names = agg.top.slice(0, 3).map(([, i]) => g.nodes[i]!.name).join(", ");
-    groups.push({ label: dir, mass: agg.mass, detail: `${agg.files.size} files${names ? ` · top: ${names}` : ""}` });
+    const testScope = [...agg.files].every(isTestScope);
+    groups.push({
+      label: dir,
+      mass: agg.mass * (testScope ? 0.1 : 1),
+      detail: `${testScope ? "test scope · " : ""}${agg.files.size} files${names ? ` · top: ${names}` : ""}`,
+    });
   }
 
-  const fit = revealGroups(groups, { header: `fovea sketch · t=${t} · ${g.files.length} files · ${g.nodes.length} nodes · ${anchorIdx.length} anchors`, budget: B });
-  return { text: fit.text, tokens: fit.tokens, details: { files: g.files.length, nodes: g.nodes.length, anchors: anchorIdx.length, truncated: fit.truncated } };
+  const anchorSummary = testAnchorIdx.length
+    ? `${productionAnchorIdx.length} production anchors · ${testAnchorIdx.length} test/fixture anchors collapsed`
+    : `${productionAnchorIdx.length} anchors`;
+  const fit = revealGroups(groups, {
+    header: `fovea sketch · ${g.files.length} files · ${g.nodes.length} symbols · ${anchorSummary}`,
+    budget: B,
+  });
+  return {
+    text: fit.text,
+    tokens: fit.tokens,
+    details: {
+      files: g.files.length,
+      nodes: g.nodes.length,
+      anchors: anchorIdx.length,
+      productionAnchors: productionAnchorIdx.length,
+      testAnchors: testAnchorIdx.length,
+      truncated: fit.truncated,
+    },
+  };
 };
 
-export const focus = (root: string, query: string, budget?: number): OpResult => {
+export const focus = (root: string, query: string, budget?: number, options: FocusOptions = {}): OpResult => {
   const state = ensureState(root);
   const g = state.graph;
   const session = getSession(root);
   const B = clampBudget(budget, 2000);
-  const { seeds, note, suggestions } = resolveSeeds(state, query);
+  const { seeds, note, suggestions } = resolveSeeds(state, query, options);
   if (!seeds.length) {
     const renderMiss = (count: number): string => {
       const nearby = suggestions.slice(0, count).map((suggestion) => {
@@ -393,10 +487,18 @@ export const focus = (root: string, query: string, budget?: number): OpResult =>
           lineApproximate,
           score: Number(score.toFixed(3)),
         })),
+        scope: { path: options.path, language: options.language, kind: options.kind },
       },
     };
   }
-  const key = `${state.version}:${[...seeds].sort((a, b) => a - b).join(",")}`;
+  const scopeKey = [options.path ?? "", options.language?.toLowerCase() ?? "", options.kind ?? ""].join("|");
+  const key = `${state.version}:${[...seeds].sort((a, b) => a - b).join(",")}:${scopeKey}`;
+  if (options.fresh || session.focusKey !== key) {
+    session.t = FOCUS_T0;
+    session.disclosed.clear();
+    session.focusKey = key;
+    session.scope = { path: options.path, language: options.language, kind: options.kind };
+  }
   if (session.tkKey !== key) {
     session.tk = chebyshevVectors(state.csr, seedVector(g.nodes.length, seeds), TK_ORDER);
     session.tkKey = key;
@@ -405,17 +507,31 @@ export const focus = (root: string, query: string, budget?: number): OpResult =>
   session.seedNote = note;
   const t = session.t;
   const field = heatField(session.tk, t, g.nodes.length);
+  const scopedIds = options.path || options.language || options.kind
+    ? new Set(g.nodes.filter((node) => matchesFocusScope(node, options)).map((node) => node.id))
+    : undefined;
   const fit = revealFoveated(g, field, {
-    header: `fovea focus "${query}" · ${note} · t=${t}`,
+    header: `fovea focus "${query}" · ${note}`,
+    include: scopedIds,
     disclosed: session.disclosed,
     seeds,
+    repeatNucleus: true,
     budget: B,
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);
   return {
     text: fit.text,
     tokens: fit.tokens,
-    details: { seeds: seeds.length, lit: fit.litTotal, shown: fit.shown, suppressed: fit.suppressed, t },
+    details: {
+      seeds: seeds.length,
+      lit: fit.litTotal,
+      shown: fit.shown,
+      suppressed: fit.suppressed,
+      t,
+      scope: { path: options.path, language: options.language, kind: options.kind },
+      nodes: fit.revealed,
+      suggestedReads: suggestedReads(fit.revealed),
+    },
   };
 };
 
@@ -441,8 +557,13 @@ export const dwell = (root: string, factor?: number, budget?: number): OpResult 
     session.tkKey += "+ext";
   }
   const field = heatField(session.tk, to, g.nodes.length);
+  const scope = session.scope ?? {};
+  const scopedIds = scope.path || scope.language || scope.kind
+    ? new Set(g.nodes.filter((node) => matchesFocusScope(node, scope)).map((node) => node.id))
+    : undefined;
   const fit = revealFoveated(g, field, {
-    header: `fovea dwell · t ${from}→${to} · delta`,
+    header: `fovea dwell · context widened ${Number((to / from).toFixed(1))}× · new results`,
+    include: scopedIds,
     disclosed: session.disclosed,
     seeds: session.seeds,
     budget: B,
@@ -451,7 +572,16 @@ export const dwell = (root: string, factor?: number, budget?: number): OpResult 
   return {
     text: fit.text,
     tokens: fit.tokens,
-    details: { from, to, lit: fit.litTotal, shown: fit.shown, suppressed: fit.suppressed },
+    details: {
+      from,
+      to,
+      lit: fit.litTotal,
+      shown: fit.shown,
+      suppressed: fit.suppressed,
+      scope,
+      nodes: fit.revealed,
+      suggestedReads: suggestedReads(fit.revealed),
+    },
   };
 };
 
@@ -530,14 +660,78 @@ export const impact = (root: string, args: ImpactArgs): OpResult => {
     fileTop.set(n.file, top);
     top.push([v, i]);
   });
-  const groups: GroupLine[] = [...anchorHits];
-  for (const [f, mass] of fileAgg) {
-    const top = (fileTop.get(f) ?? []).sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, i]) => g.nodes[i]!.name).join(", ");
-    groups.push({ label: f, mass, detail: top ? `top: ${top}` : "" });
+  const reasonByFile = new Map<string, Set<string>>();
+  const reasonFor = (kind: Graph["edges"][number]["kind"]): string | undefined => {
+    switch (kind) {
+      case "invokes": return "call dependency";
+      case "imports": return "import dependency";
+      case "tests": return "test dependency";
+      case "inherits": return "inheritance";
+      case "join": return "shared literal";
+      case "anchors": return "shared route";
+      case "cochange": return "co-change history";
+      case "contains": return undefined;
+    }
+  };
+  for (const edge of g.edges) {
+    const aFile = g.nodes[edge.a]!.file;
+    const bFile = g.nodes[edge.b]!.file;
+    if (aFile === bFile) continue;
+    const target = seedFiles.has(aFile) && !seedFiles.has(bFile)
+      ? bFile
+      : seedFiles.has(bFile) && !seedFiles.has(aFile)
+        ? aFile
+        : undefined;
+    const reason = reasonFor(edge.kind);
+    if (!target || !reason || !fileAgg.has(target)) continue;
+    const reasons = reasonByFile.get(target) ?? new Set<string>();
+    reasons.add(reason);
+    reasonByFile.set(target, reasons);
   }
+
+  // Files beyond one hop still need an explanation. Walk the unweighted
+  // shortest paths once from all seeds, preserving semantic edge kinds while
+  // omitting same-file containment hops from the user-facing reason.
+  const visited = new Set(seeds);
+  const queue = seeds.map((node) => ({ node, reasons: [] as string[] }));
+  for (let head = 0; head < queue.length; head++) {
+    const current = queue[head]!;
+    const edges = [...(state.adjacency.get(current.node) ?? [])]
+      .sort((a, b) => Number(a.kind === "contains") - Number(b.kind === "contains") || b.w - a.w || a.to - b.to);
+    for (const edge of edges) {
+      if (visited.has(edge.to)) continue;
+      visited.add(edge.to);
+      const reason = reasonFor(edge.kind as Graph["edges"][number]["kind"]);
+      const reasons = reason && !current.reasons.includes(reason)
+        ? [...current.reasons, reason]
+        : current.reasons;
+      queue.push({ node: edge.to, reasons });
+      const file = g.nodes[edge.to]!.file;
+      if (fileAgg.has(file) && !seedFiles.has(file) && !reasonByFile.has(file) && reasons.length) {
+        reasonByFile.set(file, new Set(reasons.slice(0, 3)));
+      }
+    }
+  }
+
+  const fileEntries = [...fileAgg.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const fileGroups: GroupLine[] = [];
+  for (const [file, mass] of fileEntries) {
+    const top = (fileTop.get(file) ?? [])
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, 3)
+      .map(([, i]) => g.nodes[i]!.name)
+      .join(", ");
+    const reasons = [...(reasonByFile.get(file) ?? new Set(["graph path"]))];
+    fileGroups.push({
+      label: file,
+      mass,
+      detail: `via ${reasons.join(", ")}${top ? ` · top: ${top}` : ""}`,
+    });
+  }
+  const groups: GroupLine[] = [...anchorHits, ...fileGroups];
   const seedNames = seeds.slice(0, 5).map((i) => g.nodes[i]!.file).join(", ");
   const fit = revealGroups(groups, {
-    header: `fovea impact · ${seeds.length} seed${seeds.length === 1 ? "" : "s"} (${seedNames}${seeds.length > 5 ? ", …" : ""}) · t=${t} · review order by warmth`,
+    header: `fovea impact · changed: ${seedNames}${seeds.length > 5 ? ", …" : ""} · likely review order`,
     budget: B,
   });
   return {
@@ -547,10 +741,14 @@ export const impact = (root: string, args: ImpactArgs): OpResult => {
       seeds: seeds.length,
       warmed: groups.length,
       truncated: fit.truncated,
-      // Structured form for consumers (turn-sync): warmed anchor ids + files,
-      // no text re-parsing.
+      // Structured form for consumers (turn-sync): warmed anchors, files,
+      // and the strongest direct evidence channel without text re-parsing.
       warmedAnchors: anchorHits.map((h) => h.label.replace(/^⚑\s*/, "")),
-      warmedFiles: groups.filter((grp) => !grp.label.startsWith("⚑")).map((grp) => grp.label),
+      warmedFiles: fileEntries.map(([file]) => file),
+      warmedReasons: Object.fromEntries(fileEntries.map(([file]) => [
+        file,
+        [...(reasonByFile.get(file) ?? new Set(["graph path"]))],
+      ])),
     },
   };
 };

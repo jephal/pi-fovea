@@ -175,28 +175,28 @@ const buildItems = (
 ): SettingItem[] => {
   const persist = (id: string, newValue: string): void => apply(id, coerceValue(id, newValue, config));
   return [
-    setting("sync.enabled", "Turn sync", config.sync.enabled ? "true" : "false", {
+    setting("sync.enabled", "Continuous sync", config.sync.enabled ? "true" : "false", {
       description:
-        "After every turn, re-sync the graph and report anchor shifts or an unexpectedly warm blast radius. Default on; disable for quiet sessions. FOVEA_TURN_SYNC=off overrides.",
+        "Check semantic drift before agent start and after every turn; inject or steer before the model continues. FOVEA_TURN_SYNC=off overrides.",
       values: BOOLEANS,
     }),
     setting("sync.budget", "Sync budget", String(config.sync.budget), {
-      description: "Max tokens for the model-visible red message anchor-shift / warmed-file report.",
-      submenu: numericSubmenu(theme, BUDGETS, "Sync budget", "Max tokens for the model-visible red sync report."),
+      description: "Max tokens for proactive repository steering sent to the model.",
+      submenu: numericSubmenu(theme, BUDGETS, "Sync budget", "Max tokens for proactive repository steering."),
     }),
     setting("sync.ackClean", "Ack clean turns", config.sync.ackClean ? "true" : "false", {
       description:
-        "When true, a one-line ✓ message is shown after stable turns (still zero model tokens — display-only entry). Default off: green is silent.",
+        "Show a brief notification after changed-but-actionless turns. Default off; clean turns spend no model tokens.",
       values: BOOLEANS,
     }),
-    setting("sync.warmFileThreshold", "Warm file threshold", String(config.sync.warmFileThreshold), {
+    setting("sync.warmFileThreshold", "Steer threshold", String(config.sync.warmFileThreshold), {
       description:
-        "How many undisclosed files must warm up during sync to justify a red message. Higher = fewer interruptions; route anchor shifts always escalate.",
-      submenu: numericSubmenu(theme, THRESHOLDS, "Warm file threshold", "Disclosed-file warming count that escalates sync to red."),
+        "How many newly relevant files justify steering the model. Higher means fewer continuations; route changes always steer.",
+      submenu: numericSubmenu(theme, THRESHOLDS, "Relevance threshold", "Newly relevant file count that steers the model."),
     }),
-    setting("tools.replaceGrep", "Replace grep", config.tools.replaceGrep ? "true" : "false", {
+    setting("tools.replaceGrep", "Hybrid grep", config.tools.replaceGrep ? "true" : "false", {
       description:
-        "Register a grep-compatible tool backed by fovea_focus instead of literal text search. Default on; changing it reloads extensions so Pi and Fabric see the new tool slot.",
+        "Preserve native grep for scoped/regex/text searches and use Fovea only for bare symbol queries. Default on; changing it reloads extensions.",
       values: BOOLEANS,
     }),
     setting("tools.defaultBudget", "Default tool budget", String(config.tools.defaultBudget), {

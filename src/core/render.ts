@@ -24,6 +24,7 @@ interface DirectRelation {
   label: string;
   priority: number;
   weight: number;
+  seed: number;
 }
 
 const RELATION_PRIORITY: Record<EdgeKind, number> = {
@@ -62,6 +63,7 @@ const directRelations = (g: Graph, seeds: ReadonlySet<number>): Map<number, Dire
       label: relationLabel(edge, aSeed, g.nodes[node]!),
       priority: RELATION_PRIORITY[edge.kind],
       weight: edge.w,
+      seed: aSeed ? edge.a : edge.b,
     };
     const current = out.get(node);
     if (!current || relation.priority > current.priority ||
@@ -71,6 +73,20 @@ const directRelations = (g: Graph, seeds: ReadonlySet<number>): Map<number, Dire
   }
   return out;
 };
+
+export interface RevealedNode {
+  id: string;
+  name: string;
+  kind: NodeRec["kind"];
+  language: string;
+  file: string;
+  line: number;
+  lineApproximate?: boolean;
+  signature: string;
+  role: "focus" | "direct" | "hot" | "warm";
+  relation?: string;
+  seedId?: string;
+}
 
 export interface FitResult {
   text: string;
@@ -93,7 +109,9 @@ export interface RevealOptions {
   header?: string;
   disclosed?: ReadonlySet<string>;
   exclude?: ReadonlySet<string>; // hard exclusion (e.g. seeds for impact)
+  include?: ReadonlySet<string>; // optional focus scope
   seeds?: readonly number[];
+  repeatNucleus?: boolean;
   budget: number;
   maxCandidates?: number;
 }
@@ -102,11 +120,11 @@ export const revealFoveated = (
   g: Graph,
   field: Float64Array,
   opts: RevealOptions,
-): FitResult & { revealedIds: string[] } => {
+): FitResult & { revealedIds: string[]; revealed: RevealedNode[] } => {
   let vmax = 0;
   for (let i = 0; i < field.length; i++) if (field[i]! > vmax) vmax = field[i]!;
   if (vmax <= 0) {
-    return { text: `${opts.header ?? "fovea"}\n(nothing lit — field is zero)`, tokens: 0, shown: 0, suppressed: 0, litTotal: 0, truncated: false, revealedIds: [] };
+    return { text: `${opts.header ?? "fovea"}\n(nothing matched the current graph)`, tokens: 0, shown: 0, suppressed: 0, litTotal: 0, truncated: false, revealedIds: [], revealed: [] };
   }
   const seedSet = new Set(opts.seeds ?? []);
   const relations = directRelations(g, seedSet);
@@ -117,8 +135,10 @@ export const revealFoveated = (
     const direct = relations.get(i);
     if ((!direct || direct.kind === "contains") && (h < WARM_TIER * 0.1 || field[i]! < HEAT_EPS)) continue;
     const id = g.nodes[i]!.id;
+    if (opts.include && !opts.include.has(id)) continue;
     if (opts.exclude?.has(id)) continue;
-    if (opts.disclosed?.has(id)) { suppressed++; continue; }
+    const inNucleus = seedSet.has(i) || (direct !== undefined && direct.kind !== "contains");
+    if (opts.disclosed?.has(id) && !(opts.repeatNucleus && inNucleus)) { suppressed++; continue; }
     candidates.push(i);
   }
   const byHeat = cmpNodes(g, field);
@@ -139,12 +159,34 @@ export const revealFoveated = (
   const warmPerFile = new Map<string, number>();
   const lines: string[] = [];
   const ids: string[] = [];
+  const revealed: RevealedNode[] = [];
   for (const i of capped) {
     const node = g.nodes[i]!;
     const h = field[i]! / vmax;
     const relation = relations.get(i);
     const semanticRelation = relation && relation.kind !== "contains" ? relation : undefined;
-    const context = seedSet.has(i) ? "  [focus]" : relation ? `  [${relation.label}]` : "";
+    const displayRelation = relation
+      ? seedSet.size > 1
+        ? `${relation.label} of ${g.nodes[relation.seed]!.name}`
+        : relation.label
+      : undefined;
+    const context = seedSet.has(i) ? "  [focus]" : displayRelation ? `  [${displayRelation}]` : "";
+    const remember = (role: RevealedNode["role"]): void => {
+      ids.push(node.id);
+      revealed.push({
+        id: node.id,
+        name: node.name,
+        kind: node.kind,
+        language: node.lang,
+        file: node.file,
+        line: node.line,
+        lineApproximate: node.lineApproximate,
+        signature: node.sig,
+        role,
+        relation: displayRelation,
+        seedId: relation ? g.nodes[relation.seed]!.id : undefined,
+      });
+    };
     if (h >= HOT_TIER || seedSet.has(i)) {
       lines.push(
         node.kind === "file"
@@ -153,7 +195,7 @@ export const revealFoveated = (
             ? `⚑ ${node.sig}${context}`
             : `▲ ${formatNodeLocation(node)}  ${node.sig}${context}`,
       );
-      ids.push(node.id);
+      remember(seedSet.has(i) ? "focus" : semanticRelation ? "direct" : "hot");
     } else if (h >= WARM_TIER || semanticRelation) {
       const warmCount = warmPerFile.get(node.file) ?? 0;
       if (!semanticRelation && node.kind !== "file" && warmCount >= MAX_UNRELATED_WARM_PER_FILE) {
@@ -163,10 +205,10 @@ export const revealFoveated = (
       if (!semanticRelation && node.kind !== "file") warmPerFile.set(node.file, warmCount + 1);
       lines.push(
         semanticRelation
-          ? `  ${semanticRelation.label}  ${node.name} (${node.kind}) ${formatNodeLocation(node)}`
+          ? `  ${displayRelation}  ${node.name} (${node.kind}) ${formatNodeLocation(node)}`
           : `  · ${node.name} (${node.kind}) ${formatNodeLocation(node)}`,
       );
-      ids.push(node.id);
+      remember(semanticRelation ? "direct" : "warm");
     } else {
       glowCounts.set(node.file, (glowCounts.get(node.file) ?? 0) + 1);
     }
@@ -177,13 +219,13 @@ export const revealFoveated = (
   const items = [...lines, ...glowLines];
   const individual = lines.length;
 
-  const header = `${opts.header ?? "fovea"} · lit ${litTotal}${suppressed ? `, ${suppressed} seen` : ""}`;
+  const header = `${opts.header ?? "fovea"}${suppressed ? ` · ${suppressed} prior results omitted` : ""}`;
   const collapsed = litTotal - individual;
   const renderK = (k: number): string => {
     const shownIndiv = Math.min(k, individual);
     const remaining = collapsed + individual - shownIndiv;
     const footer = remaining > 0
-      ? `\n… ${remaining} low-acuity nodes remain collapsed or outside budget — fovea_dwell returns newly warmed neighbors`
+      ? `\n… ${remaining} more results collapsed or outside budget — use fovea_dwell for wider context`
       : "";
     return header + "\n" + items.slice(0, k).join("\n") + footer;
   };
@@ -211,10 +253,11 @@ export const revealFoveated = (
     litTotal,
     truncated: shown < individual || (k >= 0 && k < items.length),
     revealedIds: ids.slice(0, shown),
+    revealed: revealed.slice(0, shown),
   };
 };
 
-// --- grouped reveal (sketch / impact): one line per group ----------------------
+// Grouped reveal for sketch and impact, one line per group.
 
 export interface GroupLine { label: string; mass: number; detail: string; }
 
@@ -226,7 +269,7 @@ export const revealGroups = (
   const renderK = (k: number): string => {
     const body = ordered.slice(0, k).map((gl) => `${gl.label.padEnd(2)} ${gl.detail}`);
     const rest = ordered.length - k;
-    const footer = rest > 0 ? [`\n… ${rest} groups below threshold — fovea_focus one for detail`] : [];
+    const footer = rest > 0 ? [`\n… ${rest} more groups omitted — use fovea_focus for detail`] : [];
     return [opts.header, ...body, ...footer].join("\n");
   };
   let hi = ordered.length;

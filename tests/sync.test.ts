@@ -40,11 +40,40 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     const drift = sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });
     expect(drift.structural).toBe(true);
     expect(drift.red).toBe(false);
+    expect(drift.details.semanticChangedFiles).toEqual([]);
+
+    writeFileSync(main, `\n${readFileSync(main, "utf8")}`);
+    const shifted = sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+    expect(shifted.red).toBe(false);
+    expect(shifted.details.semanticChangedFiles).toEqual([]);
     execSync("git checkout -- server/main.go", { cwd: root });
   });
 
+
+  it("steers on the first semantic cascade with causal context", () => {
+    resetSyncBaselines();
+    resetSessions();
+    sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+    const users = join(root, "server/users.go");
+    const src = readFileSync(users, "utf8");
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    const outcome = sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
+    expect(outcome.red).toBe(true);
+    expect(outcome.tokens).toBeLessThanOrEqual(512);
+    expect(outcome.text).toContain("Fovea continuous update");
+    expect(outcome.text).toContain("Changed: server/users.go");
+    expect(outcome.text).toContain("Newly relevant files:");
+    expect(outcome.text).toContain("Steer: account for this update");
+    expect(outcome.text).not.toContain("undisclosed");
+    expect(outcome.text).not.toMatch(/ · v [a-f0-9]+/);
+    expect(outcome.details.semanticChangedFiles).toContain("server/users.go");
+    expect(outcome.details.warmReasons).toBeTruthy();
+    execSync("git checkout -- server/users.go", { cwd: root });
+    resetSyncBaselines();
+    sync(root, { files: [], budget: 512, warmFileThreshold: 1 });
+  });
+
   it("anchor shift escalates to red with the added route", () => {
-    // Calibration: this suite's earlier drift syncs recorded the warm set.
     const main = join(root, "server/main.go");
     const src = readFileSync(main, "utf8");
     writeFileSync(main, src.replace(
@@ -77,6 +106,20 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     expect(outcome.text).toContain("GET /api/users/{*}/audit");
     execSync("git checkout -- server/main.go", { cwd: root });
     sync(root, { files: [], budget: 512, warmFileThreshold: 2 });
+  });
+
+
+  it("steers when a production file disappears", () => {
+    resetSyncBaselines();
+    sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
+    rmSync(join(root, "web/types.ts"));
+    const outcome = sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
+    expect(outcome.red).toBe(true);
+    expect(outcome.text).toContain("1 deleted file");
+    expect(outcome.details.deletedFiles).toContain("web/types.ts");
+    execSync("git checkout -- web/types.ts", { cwd: root });
+    resetSyncBaselines();
+    sync(root, { files: [], budget: 512, warmFileThreshold: 16 });
   });
 
   it("hintless drift in a non-git workspace still detects content change", () => {

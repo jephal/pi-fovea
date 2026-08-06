@@ -60,14 +60,14 @@ All four tools call the same kernel at different timescales with different seeds
 
 | Tool | Seeds | $t$ |
 |---|---|:--:|
-| sketch | anchors ∪ basins (cap 64) | $16$ |
+| sketch | production anchors ∪ production regions (cap 64) | $16$ |
 | focus | resolved symbols / literal sites | $2$ |
 | dwell | same source re-seeded | $\times 2$ each call |
 | impact | changed files | $4$ |
 
-The renderer then reads the field $v(t)$ and normalizes by the peak $v_{\max}$. A node above $0.3 v_{\max}$ prints its full signature; a node above $0.02 v_{\max}$ prints as a one-liner; the remainder collapses to per-file glow counts. Typed one-hop neighbors of the focus are presented before anonymous thermal periphery, and unrelated warm nodes are capped per file so a large class cannot consume the view. A binary search over the resulting fixed candidate order still produces a monotonic prefix that never passes the $budget$ in tokens.
+The renderer reads $v(t)$ and normalizes by $v_{\max}$. A node above $0.3 v_{\max}$ prints its signature; a node above $0.02 v_{\max}$ prints as a one-liner; the remainder collapses to per-file counts. Typed one-hop neighbors lead anonymous thermal periphery, unrelated warm nodes are capped per file, and sketch applies a presentation-only demotion to test/fixture scopes. The graph and heat field remain unchanged. A binary search over the fixed candidate order still produces a monotonic prefix that never exceeds the token budget.
 
-`dwell` carries a `disclosed` set across the session, so repeat calls return the delta alone.
+Disclosure is scoped to the current seed set. Repeated focus keeps the seed/direct nucleus visible and suppresses seen periphery; dwell returns newly relevant neighbors. Changing focus resets to $t=2$ and clears that disclosure scope. `fresh` does the same explicitly for reproducibility.
 
 ## Literal bridges
 
@@ -95,7 +95,7 @@ The denominator stops a popular literal from turning into an uncapped hub. Repet
 
 File-to-file conductance from recent git history adds a channel the parser never sees. Files $a$ and $b$ that commute together earn an edge weight from a Jaccard-tilted coincidence count, capped per file and cached by HEAD until the working tree drifts.
 
-## Basins
+## Inferred regions (basins)
 
 Where a repo has no anchors, the silhouette uses inferred features instead. Seeds are nodes with conductance and local triangle density $\tau$ above thresholds; a seed's score is
 
@@ -109,7 +109,7 @@ $$
 \frac{\sum_{j \text{ in basin}} W_{ij}}{\sum_{j \in V} W_{ij}}
 $$
 
-of its incident weight, with a cut-domination stop rule. The result is a handful of cohesive clusters, capped at $12$ basins of up to $64$ nodes. Anchors outrank basins when both exist: anchors declare intent, basins infer it.
+of its incident weight, with a cut-domination stop rule. The result is a handful of cohesive clusters, capped at $12$ regions of up to $64$ nodes. Production anchors outrank inferred regions when both exist; test and fixture anchors stay in the graph but collapse in the opening sketch.
 
 ## Discovery mode
 

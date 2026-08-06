@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { openFoveaSettings } from "../src/ui/settings.js";
 
 describe("Fovea settings", () => {
-  it("renders and persists the Replace grep toggle", async () => {
+  it("renders and persists the Hybrid grep toggle", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-settings-"));
     const configPath = path.join(root, ".pi", "fovea.json");
     mkdirSync(path.dirname(configPath), { recursive: true });
@@ -29,7 +29,7 @@ describe("Fovea settings", () => {
             {},
             () => resolve(),
           );
-          expect(component.render(100).join("\n")).toContain("Replace grep");
+          expect(component.render(100).join("\n")).toContain("Hybrid grep");
           for (let index = 0; index < 4; index++) component.handleInput("\u001b[B");
           component.handleInput("\r");
           component.handleInput("\u001b");

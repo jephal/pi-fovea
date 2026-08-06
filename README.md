@@ -19,21 +19,21 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 pi-fovea hands the model a map of your repo on every prompt. The repo compiles once into a code graph across languages, where symbols, files, and route anchors join into one network. Each question becomes an interest vector that diffuses over the graph as heat. The renderer converts the field into a token-capped view: exact source locations and full signatures near your task, typed one-hop relationships next, and a skeleton of the rest.
 
-After each assistant turn the map re-syncs incrementally. Detection reads content hashes instead of tool events, so edits made by pi's edit/write tools, a fabric_exec inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all land identically. A clean turn stays silent. A turn that moves route anchors or warms files you have not looked at says so.
+At agent start Fovea establishes or checks its semantic baseline, so out-of-band edits made while Pi was idle enter context before the first model call. After each assistant turn it re-syncs again. Detection does not trust tool events: edits made by Pi tools, fabric_exec, bash, subagents, or an editor land identically, while comment- and formatting-only drift stays silent. A meaningful post-turn change is delivered as a **steer**, and Fovea triggers the continuation itself if the agent would otherwise wait.
 
 ## What the model gets
 
 | Command | Ask | Answer |
 |---|---|---|
-| `fovea_sketch` | where is everything? | the repo as a silhouette, with feature anchors and inferred regions ranked by mass |
-| `fovea_focus` | what is this? | centered on a symbol, route path, or env key: exact hot signatures, typed direct relationships, then warm one-liners |
-| `fovea_dwell` | what else? | diffuses the field one step further and returns the delta |
+| `fovea_sketch` | where is everything? | production-first silhouette; test and fixture architecture stays collapsed |
+| `fovea_focus` | what is this? | exact matches, typed relationships, suggested reads, optional source scopes, and deterministic `fresh` views |
+| `fovea_dwell` | what else? | widens the current focus and returns newly relevant neighbors |
 | `fovea_impact` | what does this touch? | warms everything a file, symbol, or PR base reaches across languages |
-| `grep` *(default override)* | where does this concept lead? | the same graph-backed focus through grep's familiar `pattern/path/glob/...` signature |
+| `grep` *(default hybrid)* | graph or text? | bare identifiers, qualified symbols, repo paths, and routes use Fovea; search options and obvious regex retain native grep |
 
 Focus normalizes camelCase and common inflections, so an approximate name such as `switchServer` can resolve `switchingServers`. If a query is still uncertain, Fovea returns nearby symbols with locations instead of a dead miss. Direct graph edges are labeled (caller, callee, route, shared literal, co-change), while unrelated same-file siblings remain collapsed.
 
-The **Replace grep** toggle makes Fovea own Pi's `grep` tool slot. It is on by default. Familiar calls such as `grep({ pattern: "CreateUser", path: "src" })` navigate the code graph first; use `bash` with `rg` only when you need exact matching lines. Disable the toggle to restore the previous grep implementation. Changing the toggle reloads extensions so pi-fabric captures the same override and `pi.grep(...)` follows it inside `fabric_exec`.
+The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`, `grep({ pattern: "Controller.create" })`, and route paths can navigate the graph. Calls with text-search options and obvious regexes delegate to Pi's native grep unchanged; a graph miss also falls back to native text. Disable the toggle for a purely native slot. Changing it reloads extensions so Pi and pi-fabric capture the same behavior.
 
 ### pi-fabric
 
@@ -54,10 +54,12 @@ return tools.call({ ref: action.ref, args: { query: "CreateUserHandler" } });
 
 The stable explicit ref is `extensions.fovea_focus`, not bare `fovea_focus` or `fovea.fovea_focus`.
 
-Two slash commands on top:
+Runtime slash controls:
 
-- `/fovea status` for graph stats and sync state
-- `/fovea settings` for an overlay in your TUI, styled after pi-fabric's `/fabric settings`
+- `/fovea status` for loaded versions, graph coverage, and active modes
+- `/fovea settings` for a TUI configuration overlay
+- `/fovea reset` for a fresh focus and sync baseline
+- `/fovea reload` to activate updated extension source
 
 ## Install
 
@@ -99,14 +101,18 @@ fovea status /path/to/repo
 
 ## Turn sync
 
-Turn sync is on by default. After every assistant turn the graph is re-synced against your edits: unchanged files cost nothing because every parsed fact sits behind its content hash. The verdict is **green** or **red**:
+Continuous sync is on by default. Before an agent starts, Fovea establishes its baseline or injects any out-of-band drift before the first model call. After every assistant turn it compares extracted symbols, calls, imports, literals, and anchors again. Content hashes keep the unchanged fast path cheap, while comment- and formatting-only edits do not wake the model.
 
-- **green**: silence in the model's context. A clean-toast shows only if you enable `sync.ackClean`.
-- **red**: a capped custom message naming route anchors that appeared or disappeared, plus files warmed by the edit cascade that the model has not focused on yet.
+A meaningful change found before agent start is injected directly into that run. A post-turn route or dependency change is sent with `deliverAs: "steer"`; if the agent would otherwise settle, `triggerTurn` starts the continuation automatically. The compact update names directly changed files, route deltas, newly relevant files, and causal channels such as calls, imports, shared literals, tests, or co-change history. Clean turns remain silent unless `sync.ackClean` is enabled.
 
-The first sync seeds the baseline. The first drift after it calibrates the warm neighborhood, so a steady feature cone stays quiet. Sub sequent drift turns red.
+Runtime controls:
 
-Turn it off per repo or globally: `/fovea settings` → Turn sync, or
+- `/fovea status` — loaded package/ast-grep versions, indexed coverage, anchor scopes, sync and grep modes.
+- `/fovea reset` — clear focus disclosure/depth and establish a fresh sync baseline.
+- `/fovea reload` — hot-reload extensions and activate newly installed source.
+- `/fovea settings` — configure sync, budgets, and hybrid grep.
+
+Turn sync off per repo or globally through settings, or with:
 
 ```sh
 FOVEA_TURN_SYNC=off pi
@@ -118,12 +124,12 @@ Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override 
 
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
-| `sync.enabled` | `true` | the turn-sync loop |
-| `sync.budget` | `1024` | token cap for the red report seen by the model |
+| `sync.enabled` | `true` | pre-agent and post-turn continuous sync |
+| `sync.budget` | `1024` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
-| `sync.warmFileThreshold` | `2` | warmed files unseen by the model that justify turning red |
+| `sync.warmFileThreshold` | `2` | newly relevant files that justify proactive model steering |
 | `tools.defaultBudget` | `2000` | fallback maxTokens for the fovea_* tools |
-| `tools.replaceGrep` | `true` | replace Pi's grep slot with graph-backed Fovea navigation |
+| `tools.replaceGrep` | `true` | install hybrid native-text / bare-query graph grep |
 
 ## How routes are found
 
@@ -172,7 +178,7 @@ $$
 v(t) = e^{-tL} \cdot s \quad \text{with} \quad L = I - D^{-1/2} W D^{-1/2}
 $$
 
-The four tools are the same operator at four timescales: sketch at $t=16$ with hub and anchor seeds, focus at $t=4$ with your query as seed, dwell doubling $t$ per call with a disclosed-set delta, and impact using the changed files as seed.
+The four tools are the same operator at four timescales: sketch at $t=16$ with production hub and anchor seeds, focus at $t=2$ with your query as seed, dwell doubling $t$ within that focus, and impact using changed files as seeds. Changing focus resets to the sharp timescale and its own disclosure scope.
 
 The kernel is evaluated with a Chebyshev expansion. Rescale $M = L - I$ so the spectrum sits in $[-1,1]$; then with $T_k$ the Chebyshev polynomials and $I_k$ the modified Bessel functions:
 
@@ -190,7 +196,7 @@ $$
 
 Measured against eight cloned projects, corpus junk sits below $\hat{p} \approx 0.27$ and real route shapes above $\hat{p} \approx 0.75$. The cutoff stays mid-cliff regardless of repo size.
 
-Lineage: spectral-graph wavelets evaluated by shared Chebyshev recurrence, progressive image coding where the budget is a bitrate over significance-ordered coefficients, and foveated rendering. Aider's PageRank repo map is the fixed-timescale special case of this field. The full walkthrough of conductance tiers, specificity bridges, hub gravity, and basins lives in [docs/heat-diffusion.md](docs/heat-diffusion.md).
+Lineage: spectral-graph wavelets evaluated by shared Chebyshev recurrence, progressive image coding where the budget is a bitrate over significance-ordered coefficients, and foveated rendering. Aider's PageRank repo map is the fixed-timescale special case of this field. The full walkthrough of conductance tiers, specificity bridges, hub gravity, and inferred regions lives in [docs/heat-diffusion.md](docs/heat-diffusion.md).
 
 ## Languages
 

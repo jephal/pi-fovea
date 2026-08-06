@@ -9,22 +9,22 @@ pi-fovea maintains a cross-language code graph of the working repository — rou
 
 ## The loop
 
-1. **`fovea_sketch`** — silhouettes only. Route/anchor inventory plus directory blobs ranked by heat. Start here in an unfamiliar repo. ~256–1024 tokens.
-2. **`fovea_focus` `<query>`** — point at a symbol name (close spellings work), route path (`/api/users/{id}`), env key, or file path. Hot nodes carry exact source locations and signatures; direct callers/callees and other typed edges are labeled; the periphery stays collapsed. A true miss suggests nearby symbols. Already-shown nodes are suppressed, so repeated focus calls stay cheap.
-3. **`fovea_dwell`** — optional second look. If a focus footer reports a remaining low-acuity periphery, dwell (diffusion time ×2) returns newly warmed neighbors.
-4. **`fovea_impact`** — blast radius. Seed with explicit repo-relative `files`, symbol names for what-if analysis, or uncommitted changes (`base` works PR-style against a ref). Output is the predicted co-change cascade ordered by warmth.
+1. **`fovea_sketch`** — production-first silhouette. Shipped routes and source regions lead; test and fixture architecture is collapsed. Start here in an unfamiliar repo. ~256–1024 tokens.
+2. **`fovea_focus` `<query>`** — point at a symbol name (close spellings work), route, env key, or file. The active seed and direct relationships always remain visible; previously seen periphery is suppressed only within that focus. A different focus resets to sharp context. Use `path`, `language`, or `kind` to scope output and `fresh: true` for a reproducible full view. Structured details include nodes and suggested read windows.
+3. **`fovea_dwell`** — optional second look. If focus says more results remain, dwell widens only the current focus and returns newly relevant neighbors.
+4. **`fovea_impact`** — blast radius. Seed with repo-relative `files`, symbols, uncommitted changes, or a PR `base`. Output is likely review order with causal channels (calls, imports, literals, routes, tests, inheritance, co-change).
 
 All four accept `maxTokens` (256–16000). Budget is roughly 4 chars per token.
 
 ## Working rules
 
-- **Never bulk-read to find things.** Read what focus surfaced; let the graph answer "where is X" and "what uses X" instead of spawning searches.
+- **Do not bulk-read to discover structure.** Focus first, then read its suggested ranges. Native grep semantics remain available whenever grep receives path/glob/literal/context/limit options or an obvious regex; unresolved graph queries fall back to native text.
 - **Impact before destructive edits.** One `fovea_impact` call is cheaper than rediscovering dependents by breaking them.
 - **Sketch is the safe opening bid.** If unsure, pay for a sketch; it almost never exceeds a few hundred tokens.
 
 ## Turn sync
 
-After each assistant turn, pi-fovea diffs content hashes against its baseline. If edits moved route anchors or warmed files outside the session's disclosed set, a `[fovea turn sync]` message arrives in the next turn with the delta; otherwise everything stays silent. Treat that message as ground truth about mid-session state changes.
+Before an agent starts, pi-fovea establishes its baseline or injects out-of-band semantic drift into that run. After each assistant turn it compares again; meaningful route/dependency drift is delivered as a **steer**, and Fovea triggers a continuation if the agent would otherwise stop. Treat its changed files, route deltas, and causal channels as continuous task context. Comment- and formatting-only edits stay silent.
 
 Sync is **mutation-path agnostic**: pi's edit/write tools, a pi-fabric `fabric_exec` program's inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all register identically. Content hashes are the source of truth; tool events are not consulted for detection. In repos with no `.git` directory this is also the only drift signal — do not fall back to `git status` assumptions.
 
@@ -36,7 +36,7 @@ When writing or editing code **inside a `fabric_exec` program**, the fovea tools
 - For dynamic discovery, use `const hits = await tools.search({ query: "fovea_focus" })`, then call the returned namespaced ref with `tools.call({ ref: hits[0].ref, args: { query: "CreateUserHandler", maxTokens: 6000 } })`. The stable explicit ref is `extensions.fovea_focus`; bare `fovea_focus` and `fovea.fovea_focus` are invalid.
 - Prefer a single `extensions.fovea_impact(...)` call over hand-rolled grep fan-outs when computing what an edit touches — the graph already resolved imports/calls across Go, TypeScript, Python, and Java.
 - Any file mutation performed by the program (including `pi.edit`/`pi.write` calls inside the sandbox) is picked up by turn sync automatically, so post-edit verification does not need a re-sketch.
-- The sketch `details` field carries counts (`files`, `nodes`, `anchors`); the hot-node list is the graph's highest-value entry points. On an unfamiliar repo, fetch it once and reuse instead of rediscovering entry points per call.
+- Sketch `details` carries coverage counts; its compact text names the highest-value entry points. On an unfamiliar repo, fetch it once and reuse it instead of rediscovering entry points per call.
 
 ## CLI
 
@@ -44,4 +44,4 @@ The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON
 
 ## Settings
 
-`/fovea settings` in the TUI, or `fovea.json` under `~/.pi/agent/` or a trusted repo's `.pi/` directory. Relevant knobs: `sync.enabled`, `sync.budget`, `sync.warmFileThreshold` (files that must escape before a red sync fires), `tools.defaultBudget`, and `tools.replaceGrep` (default on; installs a grep-compatible Fovea override and reloads extensions).
+Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`. `tools.replaceGrep` installs hybrid grep: native text semantics plus bare-query graph navigation.

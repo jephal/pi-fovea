@@ -3,13 +3,24 @@
 // per-conversation); the on-disk content-hash cache makes graph rebuilds
 // incremental across sessions.
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { createGrepTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { defaultAgentDir, loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { dwell, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
 import { resetSyncBaselines, sync } from "./core/sync.js";
 import { openFoveaSettings } from "./ui/settings.js";
+import type { NodeKind } from "./core/types.js";
+
+const PACKAGE_VERSION = (() => {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: string };
+    return manifest.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 const BudgetParam = Type.Optional(
   Type.Number({ description: "Max tokens for the response (256..16000). Estimate: 4 chars/token.", minimum: 256, maximum: 16000 }),
@@ -18,16 +29,42 @@ const RootParam = Type.Optional(
   Type.String({ description: "Repo root to map. Defaults to the session working directory." }),
 );
 const GrepParams = Type.Object({
-  pattern: Type.String({ description: "Symbol, route, environment key, or file query for the Fovea code graph." }),
-  path: Type.Optional(Type.String({ description: "Compatibility path hint. Used as a fallback graph seed when pattern finds no node." })),
-  glob: Type.Optional(Type.String({ description: "Accepted for grep-call compatibility; Fovea navigation is graph-based rather than glob-filtered." })),
-  ignoreCase: Type.Optional(Type.Boolean({ description: "Accepted for grep-call compatibility; Fovea symbol matching is already case-insensitive." })),
-  literal: Type.Optional(Type.Boolean({ description: "Accepted for grep-call compatibility; the pattern is interpreted as a graph query." })),
-  context: Type.Optional(Type.Number({ description: "Accepted for grep-call compatibility; graph neighbors replace line context." })),
-  limit: Type.Optional(Type.Number({ description: "Accepted for grep-call compatibility; output is controlled by tools.defaultBudget." })),
+  pattern: Type.String({ description: "Graph query for a bare identifier/path; exact text or regex pattern when search options are present." }),
+  path: Type.Optional(Type.String({ description: "Directory or file scope. Supplying it selects native text grep." })),
+  glob: Type.Optional(Type.String({ description: "File glob for native text grep." })),
+  ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive native text grep." })),
+  literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal text and use native grep." })),
+  context: Type.Optional(Type.Number({ description: "Context lines for native text grep." })),
+  limit: Type.Optional(Type.Number({ description: "Maximum native text matches." })),
 });
 
+const REGEX_META = /[\\^$.*+?()[\]{}|]/;
+const QUALIFIED_SYMBOL = /^[A-Za-z_$][\w$]*(?:[.#:][A-Za-z_$][\w$]*)+$/;
+const REPO_PATH = /^(?:\.\/)?[\w@.-]+(?:\/[\w@.{}:$-]+)+$/;
+const ROUTE_PATH = /^\/[\w@.{}:$/-]+$/;
+const requestsNativeGrep = (params: {
+  pattern: string;
+  path?: string;
+  glob?: string;
+  ignoreCase?: boolean;
+  literal?: boolean;
+  context?: number;
+  limit?: number;
+}): boolean =>
+  params.path !== undefined || params.glob !== undefined || params.ignoreCase !== undefined ||
+  params.literal !== undefined || params.context !== undefined || params.limit !== undefined ||
+  (REGEX_META.test(params.pattern) &&
+    !QUALIFIED_SYMBOL.test(params.pattern.trim()) &&
+    !REPO_PATH.test(params.pattern.trim()) &&
+    !ROUTE_PATH.test(params.pattern.trim()));
+
 const text = (s: string) => ({ type: "text" as const, text: s });
+
+const NODE_KINDS = new Set<NodeKind>([
+  "function", "method", "class", "interface", "type", "field", "decl", "file", "anchor",
+]);
+const focusKind = (value: string | undefined): NodeKind | undefined =>
+  value && NODE_KINDS.has(value as NodeKind) ? value as NodeKind : undefined;
 
 export default function fovea(pi: ExtensionAPI) {
   // Per-root config cache; invalidated by settings saves (/fovea settings).
@@ -48,35 +85,32 @@ export default function fovea(pi: ExtensionAPI) {
       name: "grep",
       label: "grep (Fovea)",
       description:
-        "Navigate the pi-fovea code graph through grep's familiar argument shape. Finds symbols, routes, environment keys, files, and their warm dependencies; it does not perform literal line matching. Use bash with rg only when exact text or regex matches are required.",
-      promptSnippet: "Navigate the Fovea code graph with a grep-compatible query",
+        "Hybrid repository search. A bare identifier, qualified symbol, repo path, or route navigates the Fovea graph; obvious regexes and calls with path/glob/literal/context/limit preserve native grep and return exact matching lines.",
+      promptSnippet: "Search exact text normally; bare symbol queries can expand through the Fovea graph",
       promptGuidelines: [
-        "Use grep for graph-backed repository navigation before exact text search; when the Fovea override is active, grep centers the code graph on pattern and returns warm dependencies rather than matching lines.",
-        "Use bash with rg only when an exact literal or regular-expression text match is required after the Fovea-backed grep result.",
+        "Use grep normally: search options and obvious regex patterns retain native text semantics; bare symbols, repo paths, and routes use Fovea with native fallback on a miss.",
       ],
       parameters: GrepParams,
-      async execute(_id, params, _signal, _onUpdate, ctx) {
+      async execute(id, params, signal, onUpdate, ctx) {
         const root = ctx.cwd;
+        if (requestsNativeGrep(params)) {
+          const native = createGrepTool(root);
+          return native.execute(id, params, signal, onUpdate);
+        }
         const budget = configFor(root, ctx.isProjectTrusted()).tools.defaultBudget;
-        const pattern = params.pattern.trim();
-        const pathHint = params.path?.replace(/^@/, "").trim();
-        let query = pattern || pathHint || params.pattern;
+        const query = params.pattern.trim() || params.pattern;
         try {
-          let result = focus(root, query, budget);
-          if (Number(result.details.seeds ?? 0) === 0 && pathHint && pathHint !== "." && pathHint !== query) {
-            query = pathHint;
-            result = focus(root, query, budget);
+          const result = focus(root, query, budget, { fresh: true });
+          if (Number(result.details.seeds ?? 0) === 0) {
+            const native = createGrepTool(root);
+            return native.execute(id, params, signal, onUpdate);
           }
           return {
             content: [text(result.text.replace(/^fovea focus/, "fovea grep"))],
             details: { ...result.details, backend: "fovea", query },
           };
         } catch (error) {
-          return {
-            content: [text(String(error instanceof Error ? error.message : error))],
-            details: { backend: "fovea", query },
-            isError: true,
-          };
+          throw error instanceof Error ? error : new Error(String(error));
         }
       },
     });
@@ -90,12 +124,12 @@ export default function fovea(pi: ExtensionAPI) {
     if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.replaceGrep) registerGrepOverride();
   });
 
-  // Turn-sync loop. The tracker below is a hint accumulator only: pi's
-  // edit/write tool starts give the warmth pass a head start, but sync relies
-  // on content-hash drift, so identical detection covers fabric_exec inner
-  // pi.edit calls, bash mutations, subagents, and out-of-band editor saves.
-  // Pure conversation turns exit at zero cost through the version fast path.
+  // Turn-sync loop. Tool events provide optional file hints, but content and
+  // extracted-fact drift remain the source of truth. The same path therefore
+  // covers fabric_exec, bash, subagents, and out-of-band editor saves. Pure
+  // conversation turns exit at zero cost through the version fast path.
   let turnFiles: string[] = [];
+  let lastSyncError: string | undefined;
   pi.on("turn_start", () => {
     turnFiles = [];
   });
@@ -103,6 +137,35 @@ export default function fovea(pi: ExtensionAPI) {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const args = event.args as { path?: unknown };
     if (typeof args.path === "string") turnFiles.push(args.path);
+  });
+  pi.on("before_agent_start", async (_event, ctx) => {
+    try {
+      const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
+      if (!cfg.sync.enabled) return;
+      const outcome = sync(ctx.cwd, {
+        files: [],
+        budget: cfg.sync.budget,
+        warmFileThreshold: cfg.sync.warmFileThreshold,
+      });
+      lastSyncError = undefined;
+      if (outcome.red && outcome.text) {
+        return {
+          message: {
+            customType: "pi-fovea-sync",
+            content: outcome.text,
+            display: true,
+            details: outcome.details,
+          },
+        };
+      }
+      if (outcome.structural && !outcome.details.baseline && cfg.sync.ackClean && ctx.hasUI) {
+        ctx.ui.notify("Fovea checked repository changes; no new action is needed.", "info");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (ctx.hasUI && message !== lastSyncError) ctx.ui.notify(`Fovea sync paused: ${message}`, "warning");
+      lastSyncError = message;
+    }
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -118,20 +181,26 @@ export default function fovea(pi: ExtensionAPI) {
         budget: cfg.sync.budget,
         warmFileThreshold: cfg.sync.warmFileThreshold,
       });
+      lastSyncError = undefined;
       if (!outcome.structural) return;
       if (outcome.red && outcome.text) {
-        // Lands in session context; the model sees it on the next LLM call.
-        // No triggerTurn: a red flag never spends a turn on its own.
+        // Continuous intelligence joins the active agent loop: steer reaches
+        // the model before its next call, and triggerTurn continues an idle run.
         pi.sendMessage({
           customType: "pi-fovea-sync",
           content: outcome.text,
           display: true,
-        }, { deliverAs: "nextTurn" });
-      } else if (cfg.sync.ackClean && ctx.hasUI) {
-        ctx.ui.notify(`fovea sync clean · v ${String(outcome.details.version ?? "?")}`, "info");
+          details: outcome.details,
+        }, { deliverAs: "steer", triggerTurn: true });
+      } else if (!outcome.details.baseline && cfg.sync.ackClean && ctx.hasUI) {
+        ctx.ui.notify("Fovea checked repository changes; no new action is needed.", "info");
       }
-    } catch {
-      // Turn-sync must never break the agent loop: log and move on.
+    } catch (error) {
+      // Turn-sync stays nonfatal, but a persistent index failure must not look
+      // like a clean repository. Notify once until a successful sync clears it.
+      const message = error instanceof Error ? error.message : String(error);
+      if (ctx.hasUI && message !== lastSyncError) ctx.ui.notify(`Fovea sync paused: ${message}`, "warning");
+      lastSyncError = message;
     }
   });
 
@@ -139,15 +208,19 @@ export default function fovea(pi: ExtensionAPI) {
     name: "fovea_sketch",
     label: "Fovea Sketch",
     description:
-      "Survey a repository as a low-acuity silhouette: feature anchors (routes etc.) and directory regions ranked by heat-diffusion mass. Cheap start of the progressive-disclosure loop; follow with fovea_focus on anything interesting. Token-budgeted.",
+      "Survey a repository as a production-first silhouette: shipped feature anchors and directory regions first, with tests and fixtures collapsed. Cheap start of the progressive-disclosure loop.",
+    promptSnippet: "Survey an unfamiliar repository with production architecture first",
+    promptGuidelines: ["Use fovea_sketch once at the start of work in an unfamiliar repository, then focus a surfaced symbol or path."],
     parameters: Type.Object({ root: RootParam, maxTokens: BudgetParam }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
+        if (signal?.aborted) throw new Error("Fovea sketch cancelled");
+        onUpdate?.({ content: [text("Surveying production architecture…")], details: { phase: "sketch" } });
         const r = sketch(root, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
-      } catch (e) {
-        return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
+      } catch (error) {
+        throw error instanceof Error ? error : new Error(String(error));
       }
     },
   });
@@ -156,19 +229,40 @@ export default function fovea(pi: ExtensionAPI) {
     name: "fovea_focus",
     label: "Fovea Focus",
     description:
-      "Center the fovea on a query (symbol name or close spelling, route path like /api/users/{id}, env key, or file). Returns exact hot signatures, typed direct relationships, warm one-liners, and a collapsed periphery. Misses include nearby symbols. Sets the session focus that fovea_dwell deepens; already-shown nodes are suppressed.",
+      "Center the graph on a symbol, close spelling, route, env key, or file. Returns exact signatures, typed direct relationships, scoped filters, suggested reads, and nearby symbols on a miss.",
+    promptSnippet: "Locate a symbol or route and explain its direct graph relationships",
+    promptGuidelines: ["Use fovea_focus for graph navigation and dependency context; use fresh=true when a reproducible full view is required."],
     parameters: Type.Object({
       query: Type.String({ description: "Symbol name or close spelling, route path, env key, or repo-relative file path." }),
+      path: Type.Optional(Type.String({ description: "Optional repo-relative file or directory scope." })),
+      language: Type.Optional(Type.String({ description: "Optional ast-grep language scope, such as TypeScript or Go." })),
+      kind: Type.Optional(Type.Union(
+        ["function", "method", "class", "interface", "type", "field", "decl", "file", "anchor"].map((kind) => Type.Literal(kind)),
+        { description: "Optional node-kind scope." },
+      )),
+      fresh: Type.Optional(Type.Boolean({ description: "Reset disclosure and return a reproducible full focus view." })),
       root: RootParam,
       maxTokens: BudgetParam,
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
-        const r = focus(root, params.query, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
+        if (signal?.aborted) throw new Error("Fovea focus cancelled");
+        onUpdate?.({ content: [text("Resolving focused repository context…")], details: { phase: "focus" } });
+        const r = focus(
+          root,
+          params.query,
+          params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget,
+          {
+            path: params.path,
+            language: params.language,
+            kind: focusKind(params.kind),
+            fresh: params.fresh,
+          },
+        );
         return { content: [text(r.text)], details: r.details };
-      } catch (e) {
-        return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
+      } catch (error) {
+        throw error instanceof Error ? error : new Error(String(error));
       }
     },
   });
@@ -177,19 +271,23 @@ export default function fovea(pi: ExtensionAPI) {
     name: "fovea_dwell",
     label: "Fovea Dwell",
     description:
-      "Let the current focus diffuse longer (heat time t grows, default x2) and return only newly warmed neighbors. Use after fovea_focus when its footer reports a remaining low-acuity periphery.",
+      "Widen the current focus and return newly relevant neighbors that were previously collapsed. Use only when fovea_focus says more context remains.",
+    promptSnippet: "Widen the current Fovea focus for additional neighbors",
+    promptGuidelines: ["Use fovea_dwell only after fovea_focus when wider subsystem context is useful."],
     parameters: Type.Object({
       factor: Type.Optional(Type.Number({ description: "Multiply diffusion time by this (default 2).", minimum: 1.1, maximum: 16 })),
       root: RootParam,
       maxTokens: BudgetParam,
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
+        if (signal?.aborted) throw new Error("Fovea dwell cancelled");
+        onUpdate?.({ content: [text("Widening the current graph context…")], details: { phase: "diffuse" } });
         const r = dwell(root, params.factor, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
-      } catch (e) {
-        return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
+      } catch (error) {
+        throw error instanceof Error ? error : new Error(String(error));
       }
     },
   });
@@ -198,7 +296,9 @@ export default function fovea(pi: ExtensionAPI) {
     name: "fovea_impact",
     label: "Fovea Impact",
     description:
-      "Seed diffusion from changed files (uncommitted changes by default, or explicit files/symbols) and rank what warms up — the predicted review/co-change cascade across languages, ordered by warmth. Run before or after edits to see what a change touches.",
+      "Predict review order from changed files, symbols, or a PR base. Returns warmed files with causal channels such as calls, imports, shared literals, routes, tests, and co-change history.",
+    promptSnippet: "Predict the likely review surface of a change",
+    promptGuidelines: ["Use fovea_impact before broad or risky edits and when checking the blast radius of completed changes."],
     parameters: Type.Object({
       files: Type.Optional(Type.Array(Type.String(), { description: "Repo-relative changed files." })),
       symbols: Type.Optional(Type.Array(Type.String(), { description: "Changed symbol names (what-if mode)." })),
@@ -207,9 +307,11 @@ export default function fovea(pi: ExtensionAPI) {
       root: RootParam,
       maxTokens: BudgetParam,
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
+        if (signal?.aborted) throw new Error("Fovea impact cancelled");
+        onUpdate?.({ content: [text("Tracing likely change impact…")], details: { phase: "impact" } });
         const r = impact(root, {
           files: params.files,
           symbols: params.symbols,
@@ -218,18 +320,33 @@ export default function fovea(pi: ExtensionAPI) {
           budget: params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget,
         });
         return { content: [text(r.text)], details: r.details };
-      } catch (e) {
-        return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
+      } catch (error) {
+        throw error instanceof Error ? error : new Error(String(error));
       }
     },
   });
 
   pi.registerCommand("fovea", {
-    description: "pi-fovea status and settings",
+    description: "pi-fovea status, settings, reset, and reload",
     getArgumentCompletions: (prefix) =>
-      ["status", "settings"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
+      ["status", "settings", "reset", "reload"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
     handler: async (args, ctx) => {
-      const sub = args.trim().split(/\s+/)[0] ?? "status";
+      const sub = args.trim().split(/\s+/)[0] || "status";
+      if (!["status", "settings", "reset", "reload"].includes(sub)) {
+        ctx.ui.notify("Usage: /fovea status | settings | reset | reload", "warning");
+        return;
+      }
+      if (sub === "reload") {
+        ctx.ui.notify("Reloading pi-fovea source…", "info");
+        await ctx.reload();
+        return;
+      }
+      if (sub === "reset") {
+        resetSessions();
+        resetSyncBaselines();
+        ctx.ui.notify("Fovea focus history and sync baseline reset.", "info");
+        return;
+      }
       if (sub === "settings") {
         const result = await openFoveaSettings(ctx, { onConfigApplied: () => configs.clear() });
         if (result.grepRegistrationChanged) {
@@ -239,14 +356,29 @@ export default function fovea(pi: ExtensionAPI) {
         return;
       }
       try {
-        const s = sketch(ctx.cwd, 256);
+        const [state, tracked, astGrep] = await Promise.all([
+          Promise.resolve(sketch(ctx.cwd, 256)),
+          pi.exec("git", ["-C", ctx.cwd, "ls-files"], { timeout: 15_000 })
+            .catch(() => ({ code: -1, stdout: "" })),
+          pi.exec(process.env.FOVEA_AST_GREP ?? "ast-grep", ["--version"], { timeout: 15_000 })
+            .catch(() => ({ code: -1, stdout: "" })),
+        ]);
+        const indexed = Number(state.details.files ?? 0);
+        const trackedCount = tracked.code === 0
+          ? tracked.stdout.split("\n").filter(Boolean).length
+          : undefined;
+        const coverage = trackedCount === undefined ? `${indexed} indexed files` : `${indexed}/${trackedCount} tracked files indexed`;
         const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
         ctx.ui.notify(
-          `pi-fovea: ${s.details.files ?? 0} files, ${s.details.nodes ?? 0} nodes, ${s.details.anchors ?? 0} anchors · sync ${cfg.sync.enabled ? "on" : "off"} · grep ${cfg.tools.replaceGrep ? "fovea" : "native"}`,
+          `pi-fovea ${PACKAGE_VERSION} · ${coverage} · ${state.details.nodes ?? 0} symbols · ` +
+          `${state.details.productionAnchors ?? state.details.anchors ?? 0} production anchors` +
+          `${Number(state.details.testAnchors ?? 0) ? ` (${state.details.testAnchors} test/fixture collapsed)` : ""} · ` +
+          `sync ${cfg.sync.enabled ? "continuous" : "off"} · grep ${cfg.tools.replaceGrep ? "hybrid" : "native"} · ` +
+          `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",
         );
-      } catch (e) {
-        ctx.ui.notify(`pi-fovea: ${e instanceof Error ? e.message : e}`, "error");
+      } catch (error) {
+        ctx.ui.notify(`pi-fovea: ${error instanceof Error ? error.message : error}`, "error");
       }
     },
   });

@@ -1,7 +1,7 @@
 // Replay of the exact pi turn wiring (src/index.ts turn_end -> sync()) against
 // SANDBOX copies of sibling repos — originals are never touched. For each
 // scenario the script prints the user-visible trace: tool outputs and the
-// per-turn model-visible (or silent) sync verdicts.
+// per-turn proactive steering context (or semantic silence).
 import { execFileSync } from "node:child_process";
 import { cpSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -32,15 +32,15 @@ const sandbox = (src: string, name: string): string => {
   return dest;
 };
 
-// Mirror of src/index.ts turn_end (ackClean on so green verdicts are visible).
+// Mirror of src/index.ts turn_end with clean acknowledgements shown for the demo.
 const simulateTurnEnd = (root: string, touched: string[]): SyncOutcome => {
   const outcome = sync(root, { files: touched, budget: 1024, warmFileThreshold: 2 });
   if (!outcome.structural) {
-    console.log(`\x1b[32m(sync: no structural drift — nothing emitted)\x1b[0m`);
+    console.log(`\x1b[32m(sync: unchanged — nothing emitted)\x1b[0m`);
   } else if (outcome.red && outcome.text) {
-    msg(`sendMessage customType=pi-fovea-sync ~${outcome.tokens} tok -> MODEL CONTEXT`, outcome.text);
+    msg(`sendMessage steer+triggerTurn ~${outcome.tokens} tok -> MODEL CONTEXT`, outcome.text);
   } else {
-    console.log(`\x1b[32m(sync: green — silent to model · toast "fovea sync clean · v ${String(outcome.details.version)}")\x1b[0m`);
+    console.log(`\x1b[32m(sync: changed but actionless — silent to model; optional clean notification)\x1b[0m`);
   }
   return outcome;
 };
@@ -106,7 +106,7 @@ const scenarioQuickbeam = () => {
 
 const scenarioNOMAD = () => {
   const root = sandbox(join(SATELLITE, "NOMAD"), "NOMAD");
-  banner("SCENARIO 4 · NOMAD (NestJS routes) — adding a route flips anchors: RED");
+  banner("SCENARIO 4 · NOMAD (NestJS routes) — adding a route triggers a steer");
   newSessionAt(root);
 
   toolOut(focus(root, "/api/airports", 800), 2000);
