@@ -67,18 +67,18 @@ try {
       (oversized ? `, !${oversized} files over size cap` : "");
   } else if (cmd === "sketch") {
     const root = rootAt(0);
-    const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 1400;
+    const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 512;
     out = (await sketch(root, B)).text;
   } else if (cmd === "focus") {
     const root = rootAt(0);
     const q = pos[0] !== root ? pos[0] : pos[1];
     if (!q) { console.error("fovea focus <query>"); process.exit(2); }
     const bi = pos.indexOf(q) + 1;
-    out = (await focus(root, q, numAt(bi) ?? 2000)).text;
+    out = (await focus(root, q, numAt(bi) ?? 512)).text;
   } else if (cmd === "dwell") {
     const root = rootAt(0);
     const factor = numAt(pos[0] === root ? 1 : 0) ?? 2;
-    const B = numAt(pos[0] === root ? 2 : 1) ?? 2000;
+    const B = numAt(pos[0] === root ? 2 : 1) ?? 512;
     out = (await dwell(root, factor, B)).text;
   } else if (cmd === "impact") {
     const root = rootAt(0);
@@ -88,7 +88,7 @@ try {
       symbols: str("symbols")?.split(",").filter(Boolean),
       base: str("base"),
       includeUncommitted: !flags.has("no-uncommitted"),
-      budget: B ?? 2000,
+      budget: B ?? 512,
     })).text;
   } else if (cmd === "anchors") {
     const root = rootAt(0);

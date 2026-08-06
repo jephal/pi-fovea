@@ -554,7 +554,7 @@ export const isTestScope = (file: string): boolean =>
 export const sketch = async (root: string, budget?: number): Promise<OpResult> => {
   const state = await ensureState(root);
   const g = state.graph;
-  const B = clampBudget(budget, 1400);
+  const B = clampBudget(budget, 512);
 
   // Production anchors and hubs define the opening silhouette. Tests remain
   // in the graph for focus/impact, but do not crowd out the code being shipped.
@@ -703,7 +703,7 @@ export const focus = async (
   const state = ensured ?? (await ensureState(root));
   const g = state.graph;
   const session = getSession(root);
-  const B = clampBudget(budget, 2000);
+  const B = clampBudget(budget, 512);
   const { seeds, note, suggestions } = resolveSeeds(state, query, options);
   if (!seeds.length) {
     const renderMiss = (count: number): string => {
@@ -792,7 +792,7 @@ export const dwell = async (root: string, factor?: number, budget?: number): Pro
   const state = await ensureState(root);
   const g = state.graph;
   const session = getSession(root);
-  const B = clampBudget(budget, 2000);
+  const B = clampBudget(budget, 512);
   if (!session.seeds.length) {
     return {
       text: "fovea dwell: no focus yet. Call fovea_focus with a symbol or route first; dwell then deepens that field.",
@@ -851,7 +851,7 @@ export interface ImpactArgs {
 export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState): Promise<OpResult> => {
   const state = ensured ?? (await ensureState(root));
   const g = state.graph;
-  const B = clampBudget(args.budget, 2000);
+  const B = clampBudget(args.budget, 512);
   const files = new Set<string>(args.files ?? []);
   if (args.base) for (const f of await prFiles(root, args.base)) files.add(f);
   if (args.includeUncommitted !== false && !args.base) for (const f of await uncommittedFiles(root)) files.add(f);

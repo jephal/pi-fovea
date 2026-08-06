@@ -80,7 +80,7 @@ change reloads extensions, so Pi and pi-fabric capture the same behavior.
 Captured extension tools live under Fabric's `extensions` provider. Use the direct proxy when the action is known:
 
 ```ts
-const result = await extensions.fovea_focus({ query: "CreateUserHandler", maxTokens: 2000 });
+const result = await extensions.fovea_focus({ query: "CreateUserHandler", maxTokens: 512 });
 return result.text;
 ```
 
@@ -210,11 +210,11 @@ with `fabric.json`.
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
 | `sync.enabled` | `true` | pre-agent and post-turn continuous sync |
-| `sync.budget` | `1024` | token cap for proactive steering context |
+| `sync.budget` | `512` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |
 | `sync.pushFocus` | `true` | embed a budgeted focus preview of the top drift target in red syncs |
-| `tools.defaultBudget` | `2000` | fallback maxTokens for the fovea_* tools |
+| `tools.defaultBudget` | `512` | fallback maxTokens for the fovea_* tools |
 | `tools.grepMode` | `"augment"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
 | `tools.grepAugmentBudget` | `512` | token cap for the appended graph section |
 

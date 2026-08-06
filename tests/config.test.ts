@@ -24,9 +24,10 @@ const setup = (stored: unknown) => {
 };
 
 describe("fovea config grep integration", () => {
-  it("defaults to augment with a bounded append budget", () => {
+  it("defaults every budget knob to 512", () => {
+    expect(DEFAULT_FOVEA_CONFIG.sync.budget).toBe(512);
     expect(DEFAULT_FOVEA_CONFIG.tools).toMatchObject({
-      defaultBudget: 2000,
+      defaultBudget: 512,
       grepMode: "augment",
       grepAugmentBudget: 512,
     });

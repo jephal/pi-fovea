@@ -48,7 +48,7 @@ export interface FoveaConfig {
 export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   sync: {
     enabled: true,
-    budget: 1024,
+    budget: 512,
     ackClean: false,
     // Masses are heat units leaked outside the changed files (1 unit seeded
     // per changed file), discounted by channel. Measured: a central fixture
@@ -59,7 +59,7 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
     pushFocus: true,
   },
   tools: {
-    defaultBudget: 2000,
+    defaultBudget: 512,
     grepMode: "augment",
     grepAugmentBudget: 512,
   },
