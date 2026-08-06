@@ -90,7 +90,7 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     const outcome = await sync(root, { files: ["server/users.go"], budget: 512, warmFileThreshold: 1 });
     expect(outcome.red).toBe(true);
     expect(outcome.tokens).toBeLessThanOrEqual(512);
-    expect(outcome.text).toContain("Fovea continuous update");
+    expect(outcome.text).toContain("Repository structure changed.");
     expect(outcome.text).toContain("Changed: server/users.go");
     expect(outcome.text).toContain("Newly relevant files:");
     expect(outcome.text).toContain("Steer: account for this update");

@@ -201,7 +201,7 @@ export const sync = async (
   const orderedWarm = [...warmNew].sort((a, b) =>
     Number(isTestScope(a)) - Number(isTestScope(b)) || a.localeCompare(b));
   const lines: string[] = [
-    "Fovea continuous update — repository structure changed.",
+    "Repository structure changed.",
     `Changed: ${changedSummary}`,
   ];
   for (const id of added.filter((anchor) => !newlyImplicit.includes(anchor)).slice(0, 6)) {
@@ -223,7 +223,7 @@ export const sync = async (
   lines.push(focusTarget
     ? `Next: fovea_focus ${JSON.stringify(focusTarget)} to see what it now connects to.`
     : "Next: fovea_sketch for the updated silhouette.");
-  lines.push("Steer: account for this update before continuing; inspect only the files relevant to the current task.");
+  lines.push("Steer: account for this update before continuing.");
   while (lines.length > 3 && Math.ceil(lines.join("\n").length / 4) > params.budget) {
     lines.splice(lines.length - 2, 1);
   }
