@@ -5,6 +5,7 @@
 
 import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { hasAstGrepAsync } from "./astgrep.js";
 import {
@@ -547,6 +548,12 @@ const seedVector = (n: number, seeds: number[]): Float64Array => {
 const clampBudget = (b: number | undefined, dflt: number): number =>
   Math.max(256, Math.min(16000, b ?? dflt));
 
+// Overflow artifacts: budgeted views stay lean; when they truncate, the full
+// list spills to a stable per-invocation tmp file whose path the footer names,
+// mirroring pi's bash output-accumulator so agents can read/grep the rest.
+const overflowArtifact = (op: string, key: string): string =>
+  join(tmpdir(), `pi-fovea-${op}-${createHash("sha1").update(key).digest("hex").slice(0, 8)}.txt`);
+
 export const isTestScope = (file: string): boolean =>
   isTestFile(file) || /(^|\/)(tests?|__tests__|fixtures?)(\/|$)/i.test(file);
 
@@ -675,6 +682,7 @@ export const sketch = async (root: string, budget?: number): Promise<OpResult> =
   const fit = revealGroups(groups, {
     header: `fovea sketch · ${g.files.length} files · ${g.nodes.length} symbols · ${anchorSummary}${extractionSuffix(state)}`,
     budget: B,
+    overflowTo: overflowArtifact("sketch", `${root}|sketch`),
   });
   return {
     text: fit.text,
@@ -769,6 +777,7 @@ export const focus = async (
     seeds,
     repeatNucleus: true,
     budget: B,
+    overflowTo: overflowArtifact("focus", `${root}|${query}`),
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);
   return {
@@ -820,6 +829,7 @@ export const dwell = async (root: string, factor?: number, budget?: number): Pro
     disclosed: session.disclosed,
     seeds: session.seeds,
     budget: B,
+    overflowTo: overflowArtifact("dwell", root),
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);
   return {
@@ -973,6 +983,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
   const fit = revealGroups(groups, {
     header: `fovea impact · changed: ${seedNames}${seeds.length > 5 ? ", …" : ""} · likely review order`,
     budget: B,
+    overflowTo: overflowArtifact("impact", `${root}|${(args.files ?? []).join(",")}`),
   });
   return {
     text: fit.text,

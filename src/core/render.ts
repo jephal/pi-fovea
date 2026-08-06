@@ -4,6 +4,7 @@
 // Budget conformance is a prefix fit: candidates sorted by heat, binary search
 // on prefix length — aider's render-and-count loop generalized to a field.
 
+import { writeFileSync } from "node:fs";
 import type { Edge, EdgeKind, Graph, NodeRec } from "./types.js";
 
 export const tokenEstimate = (text: string): number => Math.ceil(text.length / 4);
@@ -95,6 +96,7 @@ export interface FitResult {
   suppressed: number; // skipped because already disclosed
   litTotal: number;   // candidates above threshold before suppression
   truncated: boolean;
+  overflowPath?: string; // tmp artifact holding the full list, when it spilled
 }
 
 const cmpNodes = (g: Graph, field: Float64Array) => (x: number, y: number): number => {
@@ -114,6 +116,9 @@ export interface RevealOptions {
   repeatNucleus?: boolean;
   budget: number;
   maxCandidates?: number;
+  // When set and the fit truncates, the FULL list spills to this tmp file and
+  // the footer names the path — same contract as pi's bash output-accumulator.
+  overflowTo?: string;
 }
 
 export const revealFoveated = (
@@ -221,11 +226,12 @@ export const revealFoveated = (
 
   const header = `${opts.header ?? "fovea"}${suppressed ? ` · ${suppressed} prior results omitted` : ""}`;
   const collapsed = litTotal - individual;
-  const renderK = (k: number): string => {
+  const artifactNote = opts.overflowTo ? ` — full list saved to ${opts.overflowTo}` : "";
+  const renderK = (k: number, note = artifactNote): string => {
     const shownIndiv = Math.min(k, individual);
     const remaining = collapsed + individual - shownIndiv;
     const footer = remaining > 0
-      ? `\n… ${remaining} more results collapsed or outside budget — use fovea_dwell for wider context`
+      ? `\n… ${remaining} more results collapsed or outside budget${note} — use fovea_dwell for wider context`
       : "";
     return header + "\n" + items.slice(0, k).join("\n") + footer;
   };
@@ -242,16 +248,29 @@ export const revealFoveated = (
     }
     if (!fits(0)) k = -1; // extreme budgets: header + footer only
   }
-  const text = k >= 0 ? renderK(k) : header;
-  const tokens = tokenEstimate(text);
+  let text = k >= 0 ? renderK(k) : header;
   const shown = k >= 0 ? Math.min(k, individual) : 0;
+  const truncated = shown < individual || (k >= 0 && k < items.length);
+  let overflowPath: string | undefined;
+  if (truncated && opts.overflowTo) {
+    try {
+      writeFileSync(opts.overflowTo, `${header}\n${items.join("\n")}\n`);
+      overflowPath = opts.overflowTo;
+    } catch {
+      // An unwritable artifact drops the footer pointer; that only shortens
+      // the text, so the budget still holds.
+      text = k >= 0 ? renderK(k, "") : header;
+    }
+  }
+  const tokens = tokenEstimate(text);
   return {
     text,
     tokens,
     shown,
     suppressed,
     litTotal,
-    truncated: shown < individual || (k >= 0 && k < items.length),
+    truncated,
+    overflowPath,
     revealedIds: ids.slice(0, shown),
     revealed: revealed.slice(0, shown),
   };
@@ -263,37 +282,48 @@ export interface GroupLine { label: string; mass: number; detail: string; }
 
 export const revealGroups = (
   groups: GroupLine[],
-  opts: { header: string; budget: number },
+  opts: { header: string; budget: number; overflowTo?: string },
 ): FitResult => {
   const ordered = [...groups].sort((a, b) => b.mass - a.mass || (a.label < b.label ? -1 : 1));
-  const renderK = (k: number): string => {
+  const artifactNote = opts.overflowTo ? ` — full list saved to ${opts.overflowTo}` : "";
+  const renderK = (k: number, note = artifactNote): string => {
     const body = ordered.slice(0, k).map((gl) => `${gl.label.padEnd(2)} ${gl.detail}`);
     const rest = ordered.length - k;
-    const footer = rest > 0 ? [`\n… ${rest} more groups omitted — use fovea_focus for detail`] : [];
+    const footer = rest > 0 ? [`\n… ${rest} more groups omitted${note} — use fovea_focus for detail`] : [];
     return [opts.header, ...body, ...footer].join("\n");
   };
   let hi = ordered.length;
-  let best = renderK(hi);
-  if (tokenEstimate(best) > opts.budget) {
+  let kBest = ordered.length;
+  if (tokenEstimate(renderK(hi)) > opts.budget) {
     let lo = 0;
-    best = renderK(0);
+    kBest = 0;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      const text = renderK(mid);
-      if (tokenEstimate(text) <= opts.budget) {
-        best = text;
+      if (tokenEstimate(renderK(mid)) <= opts.budget) {
+        kBest = mid;
         lo = mid + 1;
       } else {
         hi = mid - 1;
       }
     }
   }
+  let text = renderK(kBest);
+  let overflowPath: string | undefined;
+  if (kBest < ordered.length && opts.overflowTo) {
+    try {
+      writeFileSync(opts.overflowTo, [opts.header, ...ordered.map((gl) => `${gl.label.padEnd(2)} ${gl.detail}`)].join("\n") + "\n");
+      overflowPath = opts.overflowTo;
+    } catch {
+      text = renderK(kBest, "");
+    }
+  }
   return {
-    text: best,
-    tokens: tokenEstimate(best),
+    text,
+    tokens: tokenEstimate(text),
     shown: Math.min(ordered.length, ordered.length),
     suppressed: 0,
     litTotal: ordered.length,
-    truncated: ordered.length > 0 && best.split("\n").some((l) => l.startsWith("…")),
+    truncated: ordered.length > 0 && kBest < ordered.length,
+    overflowPath,
   };
 };

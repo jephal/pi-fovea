@@ -373,7 +373,10 @@ export default function fovea(pi: ExtensionAPI) {
     description:
       "Survey a repository as a production-first silhouette: shipped feature anchors and directory regions first, with tests and fixtures collapsed. Cheap start of the progressive-disclosure loop.",
     promptSnippet: "Survey an unfamiliar repository with production architecture first",
-    promptGuidelines: ["Use fovea_sketch once at the start of work in an unfamiliar repository, then focus a surfaced symbol or path."],
+    promptGuidelines: [
+      "Use fovea_sketch once at the start of work in an unfamiliar repository, then focus a surfaced symbol or path.",
+      "If the result overflows its budget, the footer names a tmp file with the full list — read or grep it instead of rerunning with a huge budget.",
+    ],
     parameters: Type.Object({ root: RootParam, maxTokens: BudgetParam }),
     async execute(_id, params, signal, onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
@@ -394,7 +397,10 @@ export default function fovea(pi: ExtensionAPI) {
     description:
       "Center the graph on a symbol, close spelling, route, env key, or file. Returns exact signatures, typed direct relationships, scoped filters, suggested reads, and nearby symbols on a miss.",
     promptSnippet: "Locate a symbol or route and explain its direct graph relationships",
-    promptGuidelines: ["Use fovea_focus for graph navigation and dependency context; use fresh=true when a reproducible full view is required."],
+    promptGuidelines: [
+      "Use fovea_focus for graph navigation and dependency context; use fresh=true when a reproducible full view is required.",
+      "An overflow footer names a tmp file with the full list — read or grep it for the remainder; use fovea_dwell to widen the neighborhood semantically.",
+    ],
     parameters: Type.Object({
       query: Type.String({ description: "Symbol name or close spelling, route path, env key, or repo-relative file path." }),
       path: Type.Optional(Type.String({ description: "Optional repo-relative file or directory scope." })),

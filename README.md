@@ -218,6 +218,11 @@ with `fabric.json`.
 | `tools.grepMode` | `"augment"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
 | `tools.grepAugmentBudget` | `512` | token cap for the appended graph section |
 
+Budgets cap the rendered view, not the map: whenever sketch, focus, dwell, or
+impact truncate results for budget, the full list spills to
+`$TMPDIR/pi-fovea-<op>-<hash>.txt` and the footer names the path — read or grep
+the file for the remainder. `fovea_dwell` remains the semantic widen.
+
 ## How routes are found
 
 Route anchors come from five port shapes. Together they cover most of the

@@ -1,8 +1,11 @@
 // Renderer unit tests: budget hardness under a huge glow periphery, tier
 // boundaries, and the delta disclosure bookkeeping.
 
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { revealFoveated, tokenEstimate } from "../src/core/render.js";
+import { revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "../src/core/render.js";
 import { buildCsr, heatAt } from "../src/core/heat.js";
 import type { Graph, NodeRec } from "../src/core/types.js";
 
@@ -166,5 +169,60 @@ describe("revealFoveated", () => {
     expect(fit.tokens).toBeLessThanOrEqual(256);
     expect(fit.text).toContain("more results collapsed"); // periphery was truncated, budget intact
     expect(fit.truncated).toBe(true);
+  });
+});
+
+describe("overflow artifacts", () => {
+  it("spills the full foveated list to a tmp file and names it in the footer", () => {
+    const g = fanGraph(90);
+    const csr = buildCsr(g);
+    const s = new Float64Array(g.nodes.length);
+    s[0] = 1;
+    const field = heatAt(csr, s, 3);
+    const path = join(tmpdir(), "pi-fovea-test-overflow.txt");
+
+    const fit = revealFoveated(g, field, { header: "t", budget: 300, overflowTo: path });
+
+    expect(fit.truncated).toBe(true);
+    expect(fit.overflowPath).toBe(path);
+    expect(fit.tokens).toBeLessThanOrEqual(300);
+    expect(fit.text).toContain(`full list saved to ${path}`);
+    expect(fit.text).toContain("fovea_dwell"); // semantic-widen hint survives
+    const artifact = readFileSync(path, "utf8");
+    // The deep-tail periphery is in the file but not in the budgeted prefix.
+    expect(artifact).toContain("helper0Mod89");
+    expect(fit.text).not.toContain("helper0Mod89");
+  });
+
+  it("spills group overflow for sketch/impact renders", () => {
+    const groups: GroupLine[] = Array.from({ length: 60 }, (_, i) => ({
+      label: `d${i}`,
+      mass: 60 - i,
+      detail: `${i} files · top: x${i}`,
+    }));
+    const path = join(tmpdir(), "pi-fovea-test-groups-overflow.txt");
+
+    const fit = revealGroups(groups, { header: "t", budget: 300, overflowTo: path });
+
+    expect(fit.truncated).toBe(true);
+    expect(fit.overflowPath).toBe(path);
+    expect(fit.tokens).toBeLessThanOrEqual(300);
+    const artifact = readFileSync(path, "utf8");
+    expect(artifact).toContain("d59");
+    expect(fit.text).not.toContain("d59");
+  });
+
+  it("leaves non-overflowing fits and footer wording alone", () => {
+    const g = fanGraph(8);
+    const csr = buildCsr(g);
+    const s = new Float64Array(g.nodes.length);
+    s[0] = 1;
+    const path = join(tmpdir(), "pi-fovea-test-nooverflow.txt");
+
+    const fit = revealFoveated(g, heatAt(csr, s, 2), { header: "t", budget: 4000, overflowTo: path });
+
+    expect(fit.truncated).toBe(false);
+    expect(fit.overflowPath).toBeUndefined();
+    expect(fit.text).not.toContain("full list saved");
   });
 });
