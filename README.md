@@ -214,4 +214,8 @@ pnpm run bench        # rate–distortion bench against ../pi-fabric
 
 pi loads the extension straight from `src/` via jiti; there is no build step. Per-repo caches live in `$TMPDIR` behind per-file content sha1 hashes, and only dirty files re-run ast-grep. Bump `CACHE_VERSION` in `src/core/build.ts` whenever extractor semantics change.
 
+## Acknowledgments
+
+Thanks to [Alp](https://www.patreon.com/cw/alpderps), the original user whose request for a better LSP extension started this project.
+
 [MIT](LICENSE).
