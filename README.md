@@ -144,7 +144,7 @@ A rule may declare `prefixPattern` so a class-level prefix like `@Controller('ap
 The repo compiles to a typed graph. Your question is a source vector $s$ over its nodes, and the field the model receives is the heat kernel at time $t$ over the Laplacian $L$:
 
 $$
-v(t) = e^{-tL}\cdot s \qquad L = I - D^{-1/2} W D^{-1/2}
+v(t) = e^{-tL} \cdot s \quad \text{with} \quad L = I - D^{-1/2} W D^{-1/2}
 $$
 
 The four tools are the same operator at four timescales: sketch at $t=16$ with hub and anchor seeds, focus at $t=4$ with your query as seed, dwell doubling $t$ per call with a disclosed-set delta, and impact using the changed files as seed.
@@ -152,15 +152,15 @@ The four tools are the same operator at four timescales: sketch at $t=16$ with h
 The kernel is evaluated with a Chebyshev expansion. Rescale $M = L - I$ so the spectrum sits in $[-1,1]$; then with $T_k$ the Chebyshev polynomials and $I_k$ the modified Bessel functions:
 
 $$
-e^{-tL} = e^{-t}\Big[ I_0(t)\,T_0(M) + 2 \sum_{k\ge 1} (-1)^k I_k(t)\,T_k(M) \Big]
+e^{-tL} = e^{-t} \left[ I_0(t) T_0(M) + 2 \sum_{k\ge 1} (-1)^k I_k(t) T_k(M) \right]
 $$
 
-The vectors $T_k(M)\,s$ are cached in the session. A new timescale costs coefficient recombination, never a second graph walk.
+The vectors $T_k(M) s$ are cached in the session. A new timescale costs coefficient recombination, never a second graph walk.
 
 Discovery asks how often the argument at one slot of one call shape carries a route path, and promotes the shape past a Jeffreys-smoothed posterior:
 
 $$
-\hat{p} = \frac{\mathrm{pathN} + \tfrac{1}{2}}{\mathrm{n} + 1} \ge 0.55 \quad \text{with} \quad \mathrm{n} \ge 4 \text{ sites},\ \ge 2 \text{ files}
+\hat{p} = \frac{\mathrm{pathN} + \frac{1}{2}}{\mathrm{n} + 1} \ge 0.55 \quad \text{with} \quad \mathrm{n} \ge 4 \text{ sites and} \ge 2 \text{ files}
 $$
 
 Measured against eight cloned projects, corpus junk sits below $\hat{p} \approx 0.27$ and real route shapes above $\hat{p} \approx 0.75$. The cutoff stays mid-cliff regardless of repo size.
