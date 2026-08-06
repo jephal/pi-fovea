@@ -138,7 +138,13 @@ fovea rules /path/to/repo
 fovea status /path/to/repo
 ```
 
-`fovea` runs `cli.ts` via `tsx`. Install `tsx` globally, or use `pnpm fovea` from a checkout.
+Install the CLI globally — the published bin is a single self-contained bundle, so it runs on plain Node.js (no tsx, no node_modules):
+
+```sh
+npm i -g pi-fovea      # or: pnpm add -g pi-fovea, bun add -g pi-fovea
+```
+
+From a checkout, `pnpm fovea` runs the live source via `tsx`, and `pnpm run build:cli` rebuilds `dist/cli.mjs` (the `prepack` hook keeps the published bundle in sync).
 
 ## Large workspaces and startup
 
