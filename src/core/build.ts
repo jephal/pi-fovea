@@ -118,8 +118,6 @@ export const listFiles = async (root: string, routeRes?: RegExp[]): Promise<stri
   return files.slice(0, MAX_FILES);
 };
 
-// --- stat manifest ------------------------------------------------------------
-
 export interface FileMeta { size: number; mtime: number }
 
 const statFile = async (root: string, rel: string): Promise<FileMeta | undefined> => {
@@ -168,8 +166,6 @@ const makeTextBudget = () => {
     used += text.length;
   };
 };
-
-// --- persistent fact store -----------------------------------------------------
 
 /**
  * In-memory facts for one root, plus the stat manifest that makes refresh a
@@ -333,8 +329,6 @@ export const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
   (timer as unknown as { unref?: () => void }).unref?.();
   persistDebounce.set(store.root, timer);
 };
-
-// --- staged extraction -----------------------------------------------------------
 
 /**
  * Run all extraction stages for a batch of files, replacing their records in
@@ -738,8 +732,6 @@ export const refreshFacts = async (
   };
 };
 
-// --- import resolution indexes ------------------------------------------------
-
 const CODE_EXTS_BY_LANGFAMILY: Record<string, string[]> = {
   ts: [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
   py: [".py"],
@@ -866,8 +858,6 @@ export const resolveImportToFile = (
   );
   return hits.length === 1 ? hits[0] : undefined;
 };
-
-// --- assembly ------------------------------------------------------------------
 
 const addNode = (nodes: NodeRec[], seen: Map<string, number>, rec: NodeRec): number => {
   const hit = seen.get(rec.id);

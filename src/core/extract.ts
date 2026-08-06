@@ -24,8 +24,6 @@ import type {
   SymbolRec,
 } from "./types.js";
 
-// --- symbols via `ast-grep outline` ----------------------------------------
-
 type NamedSig = { name: string; kind: NodeKind };
 
 const RX = (re: RegExp, kind: NodeKind, parentGroup?: number, nameGroup?: number) => ({ re, kind, parentGroup, nameGroup });
@@ -264,8 +262,6 @@ export const extractSymbols = async (files: string[], cwd: string, source: FileS
   return out.filter((symbol) => symbol.file);
 };
 
-// --- imports ------------------------------------------------------------------
-
 const IMPORT_PATTERNS: Record<string, string[]> = {
   TypeScript: [
     'import $$$I from "$M"',
@@ -307,8 +303,6 @@ export const extractImports = async (files: string[], cwd: string): Promise<Impo
   }));
   return dedupe(out, (i) => `${i.file}|${i.spec}|${i.line}`);
 };
-
-// --- calls -------------------------------------------------------------------
 
 const CALL_PATTERNS = ["$O.$M($$$A)", "$F($$$A)"];
 
@@ -360,8 +354,6 @@ export const extractCalls = async (files: string[], cwd: string): Promise<CallSi
   }));
   return out.filter((c) => c.callee && c.callee.length > 1);
 };
-
-// --- literals ------------------------------------------------------------------
 
 const STRING_PATTERNS: Record<string, string[]> = {
   TypeScript: ['"$S"', "'$S'", "`$S`"],

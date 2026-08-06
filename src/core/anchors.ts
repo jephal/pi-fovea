@@ -320,8 +320,6 @@ export const extractAnchors = async (
   });
 };
 
-// --- file-convention routes -------------------------------------------------
-
 // Frameworks where the route *is* the file path (no route string exists in
 // code at all): Next App Router, SvelteKit, Nuxt. Each rule is a regex with
 // capture group 1 = route stem, plus how verbs are known.
