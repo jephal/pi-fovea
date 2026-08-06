@@ -259,10 +259,14 @@ const buildItems = (
       "Embed a budgeted focus preview of the top drift target in red sync messages so no extra probe turn is needed. Off keeps the Next: advisory. Default on.",
     values: BOOLEANS,
   }),
-  setting("tools.replaceGrep", "Hybrid grep", config.tools.replaceGrep ? "true" : "false", {
+  setting("tools.grepMode", "Grep integration", config.tools.grepMode, {
     description:
-      "Preserve native grep for scoped/regex/text searches and use Fovea only for bare symbol queries. Default on; changing it reloads extensions.",
-    values: BOOLEANS,
+      "augment keeps native grep and appends a Fovea graph section to symbol-query results (default; also reaches pi.grep inside fabric_exec). replace installs the takeover where bare symbol queries navigate the graph only (legacy; changing it reloads extensions). off is native grep only.",
+    values: ["augment", "replace", "off"],
+  }),
+  setting("tools.grepAugmentBudget", "Grep augment budget", String(config.tools.grepAugmentBudget), {
+    description: "Max tokens for the graph section appended to grep results in augment mode.",
+    submenu: numericSubmenu(theme, BUDGETS, "Grep augment budget", "Max tokens for the appended Fovea graph section."),
   }),
   setting("tools.defaultBudget", "Default tool budget", String(config.tools.defaultBudget), {
     description: "Token budget applied when a fovea_* tool call omits maxTokens.",
@@ -295,7 +299,7 @@ export const openFoveaSettings = async (
   };
   let saveScope: FoveaConfigScope = scopes.projectTrusted ? "project" : "global";
   let config = loadFoveaConfig(scopes);
-  const initialReplaceGrep = config.tools.replaceGrep;
+  const initialGrepRegistration = config.tools.grepMode === "replace";
   let dirty = false;
 
   const apply = (id: string, value: unknown): void => {
@@ -333,7 +337,7 @@ export const openFoveaSettings = async (
   });
 
   if (dirty) context.ui.notify("Fovea settings saved.", "info");
-  return { grepRegistrationChanged: config.tools.replaceGrep !== initialReplaceGrep };
+  return { grepRegistrationChanged: (config.tools.grepMode === "replace") !== initialGrepRegistration };
 };
 
 // Local in-place merge so subsequent edits in the same overlay start from the

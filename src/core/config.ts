@@ -24,11 +24,20 @@ interface FoveaSyncConfig {
   pushFocus: boolean;
 }
 
+export const GREP_MODES = ["off", "replace", "augment"] as const;
+export type GrepMode = (typeof GREP_MODES)[number];
+
 interface FoveaToolsConfig {
   /** Budget applied when a fovea_* tool call omits maxTokens. */
   defaultBudget: number;
-  /** Install hybrid grep: native text semantics plus bare-query Fovea navigation. */
-  replaceGrep: boolean;
+  /** Grep integration: "off" leaves pi's native grep untouched; "replace"
+   * installs the takeover where bare symbol queries navigate the graph
+   * instead of returning matching lines; "augment" (default) keeps native
+   * grep always and appends a Fovea graph section to symbol-query results,
+   * which also reaches pi.grep calls inside fabric_exec. */
+  grepMode: GrepMode;
+  /** Token budget for the graph section appended in augment mode. */
+  grepAugmentBudget: number;
 }
 
 export interface FoveaConfig {
@@ -51,7 +60,8 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   },
   tools: {
     defaultBudget: 2000,
-    replaceGrep: true,
+    grepMode: "augment",
+    grepAugmentBudget: 512,
   },
 };
 
@@ -75,6 +85,7 @@ export const projectFoveaConfigPath = (cwd: string): string => path.join(cwd, CO
 const BOUNDS: Record<string, [number, number]> = {
   "sync.budget": [128, 8192],
   "tools.defaultBudget": [256, 16000],
+  "tools.grepAugmentBudget": [256, 8192],
   "sync.steerThreshold": [0.02, 8],
 };
 
@@ -85,6 +96,11 @@ const clamp = (id: string, value: number): number => {
 
 const boolValue = (value: unknown, fallback: boolean): boolean =>
   typeof value === "boolean" ? value : fallback;
+
+const grepModeValue = (value: unknown, fallback: GrepMode): GrepMode =>
+  typeof value === "string" && (GREP_MODES as readonly string[]).includes(value)
+    ? (value as GrepMode)
+    : fallback;
 
 const intValue = (id: string, value: unknown, fallback: number): number =>
   clamp(id, typeof value === "number" && Number.isFinite(value) ? value : fallback);
@@ -110,7 +126,13 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
     },
     tools: {
       defaultBudget: intValue("tools.defaultBudget", tools.defaultBudget, base.tools.defaultBudget),
-      replaceGrep: boolValue(tools.replaceGrep, base.tools.replaceGrep),
+      // Legacy `replaceGrep` (v0.10): true -> "replace", false -> "off". An
+      // explicit `grepMode` always wins over the legacy key.
+      grepMode: grepModeValue(
+        tools.grepMode,
+        typeof tools.replaceGrep === "boolean" ? (tools.replaceGrep ? "replace" : "off") : base.tools.grepMode,
+      ),
+      grepAugmentBudget: intValue("tools.grepAugmentBudget", tools.grepAugmentBudget, base.tools.grepAugmentBudget),
     },
   };
 };

@@ -45,4 +45,4 @@ The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON
 
 ## Settings
 
-Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`. `tools.replaceGrep` installs hybrid grep: native text semantics plus bare-query graph navigation.
+Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`. `tools.grepMode` controls the grep integration: `"augment"` (default) keeps native grep semantics and appends a Fovea graph section to symbol-query results — including `pi.grep` calls inside fabric_exec — `"replace"` keeps the legacy bare-query takeover, `"off"` is native only.

@@ -12,11 +12,11 @@ const keybindings = {
 } as unknown as Pick<KeybindingsManager, "matches" | "getKeys">;
 
 describe("Fovea settings", () => {
-  it("renders and persists the Hybrid grep toggle", async () => {
+  it("renders and persists the grep integration mode", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-settings-"));
     const configPath = path.join(root, ".pi", "fovea.json");
     mkdirSync(path.dirname(configPath), { recursive: true });
-    writeFileSync(configPath, JSON.stringify({ tools: { replaceGrep: false } }));
+    writeFileSync(configPath, JSON.stringify({ tools: { grepMode: "augment" } }));
     const notify = vi.fn();
     const theme = {
       fg: (_color: string, text: string) => text,
@@ -35,7 +35,7 @@ describe("Fovea settings", () => {
             keybindings,
             () => resolve(),
           );
-          expect(component.render(100).join("\n")).toContain("Hybrid grep");
+          expect(component.render(100).join("\n")).toContain("Grep integration");
           for (let index = 0; index < 5; index++) component.handleInput("\u001b[B");
           component.handleInput("\r");
           component.handleInput("\u001b");
@@ -47,7 +47,7 @@ describe("Fovea settings", () => {
       const result = await openFoveaSettings(context);
       expect(result).toEqual({ grepRegistrationChanged: true });
       expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
-        tools: { replaceGrep: true },
+        tools: { grepMode: "replace" },
       });
       expect(notify).toHaveBeenCalledWith("Fovea settings saved.", "info");
     } finally {

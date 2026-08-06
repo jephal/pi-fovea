@@ -44,6 +44,13 @@ const REGEX_META = /[\\^$.*+?()[\]{}|]/;
 const QUALIFIED_SYMBOL = /^[A-Za-z_$][\w$]*(?:[.#:][A-Za-z_$][\w$]*)+$/;
 const REPO_PATH = /^(?:\.\/)?[\w@.-]+(?:\/[\w@.{}:$-]+)+$/;
 const ROUTE_PATH = /^\/[\w@.{}:$/-]+$/;
+
+/** Queries the graph can answer: bare words, qualified symbols, repo paths, routes. */
+const isSymbolLikeGrepQuery = (pattern: string): boolean =>
+  !REGEX_META.test(pattern) ||
+  QUALIFIED_SYMBOL.test(pattern) ||
+  REPO_PATH.test(pattern) ||
+  ROUTE_PATH.test(pattern);
 const requestsNativeGrep = (params: {
   pattern: string;
   path?: string;
@@ -106,6 +113,40 @@ export default function fovea(pi: ExtensionAPI) {
 
   let lifecycleEpoch = 0;
   let grepOverrideRegistered = false;
+
+  // Augment mode (default): native grep keeps core semantics in every host
+  // (pi's model-facing loop AND pi.grep inside fabric_exec, which re-emits
+  // the lifecycle for nested core tools), and Fovea appends a graph section
+  // to symbol-query results through the tool_result middleware. Never throws:
+  // a broken or seedless graph simply yields native grep unchanged.
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName !== "grep" || event.isError) return undefined;
+    const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
+    if (cfg.tools.grepMode !== "augment") return undefined;
+    const input = (event.input ?? {}) as { pattern?: unknown; path?: unknown };
+    const pattern = typeof input.pattern === "string" ? input.pattern.trim() : "";
+    if (!pattern || !isSymbolLikeGrepQuery(pattern)) return undefined;
+    try {
+      const result = await focus(ctx.cwd, pattern, cfg.tools.grepAugmentBudget, {
+        path: typeof input.path === "string" ? input.path : undefined,
+        fresh: true,
+      });
+      if (Number(result.details.seeds ?? 0) === 0) return undefined;
+      const details =
+        typeof event.details === "object" && event.details !== null && !Array.isArray(event.details)
+          ? (event.details as Record<string, unknown>)
+          : {};
+      return {
+        content: [
+          ...event.content,
+          text(`\n${result.text.replace(/^fovea focus/, "fovea graph")}`),
+        ],
+        details: { ...details, backend: "hybrid", foveaAppended: true, query: pattern },
+      };
+    } catch {
+      return undefined;
+    }
+  });
   const registerGrepOverride = (): void => {
     if (grepOverrideRegistered) return;
     grepOverrideRegistered = true;
@@ -160,7 +201,7 @@ export default function fovea(pi: ExtensionAPI) {
     // baselines are session-local and must never cross that boundary.
     resetSessions();
     resetSyncBaselines();
-    if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.replaceGrep) registerGrepOverride();
+    if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.grepMode === "replace") registerGrepOverride();
     // Kick indexing in the background — the very first prompt must never
     // wait on hashing/ast-grep. Slow cold builds surface a ready notice so
     // the freeze feels like progress instead of a hang.
@@ -494,7 +535,7 @@ export default function fovea(pi: ExtensionAPI) {
           `${failedCount ? ` · !${failedCount} files failed extraction` : ""}` +
           `${unreadableCount ? ` · !${unreadableCount} files unreadable` : ""}` +
           `${oversizedCount ? ` · !${oversizedCount} files over size cap` : ""} · ` +
-          `sync ${cfg.sync.enabled ? "continuous" : "off"} · grep ${cfg.tools.replaceGrep ? "hybrid" : "native"} · ` +
+          `sync ${cfg.sync.enabled ? "continuous" : "off"} · grep ${cfg.tools.grepMode} · ` +
           `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",
         );

@@ -215,7 +215,8 @@ with `fabric.json`.
 | `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |
 | `sync.pushFocus` | `true` | embed a budgeted focus preview of the top drift target in red syncs |
 | `tools.defaultBudget` | `2000` | fallback maxTokens for the fovea_* tools |
-| `tools.replaceGrep` | `true` | install hybrid native-text / bare-query graph grep |
+| `tools.grepMode` | `"augment"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
+| `tools.grepAugmentBudget` | `512` | token cap for the appended graph section |
 
 ## How routes are found
 

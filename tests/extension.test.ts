@@ -92,7 +92,7 @@ const enableGrep = async () => {
   mkdirSync(path.join(root, ".pi"), { recursive: true });
   writeFileSync(
     path.join(root, ".pi", "fovea.json"),
-    JSON.stringify({ tools: { replaceGrep: true } }),
+    JSON.stringify({ tools: { grepMode: "replace" } }),
   );
   const loaded = load();
   await loaded.emit("session_start", { reason: "reload" }, fakeCtx(root, true));
@@ -112,7 +112,8 @@ describe("extension entry", () => {
     expect(commands.get("fovea")!.getArgumentCompletions?.("").map((item) => item.value)).toEqual([
       "status", "settings", "reset", "reload",
     ]);
-    expect(DEFAULT_FOVEA_CONFIG.tools.replaceGrep).toBe(true);
+    expect(DEFAULT_FOVEA_CONFIG.tools.grepMode).toBe("augment");
+    expect(DEFAULT_FOVEA_CONFIG.tools.grepAugmentBudget).toBe(512);
   });
 
   it("reloads extension source through /fovea reload", async () => {
@@ -149,7 +150,7 @@ describe("extension entry", () => {
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-agent-dir-"));
     const agentDir = path.join(root, "agent");
     mkdirSync(agentDir, { recursive: true });
-    writeFileSync(path.join(agentDir, "fovea.json"), JSON.stringify({ tools: { replaceGrep: false } }));
+    writeFileSync(path.join(agentDir, "fovea.json"), JSON.stringify({ tools: { grepMode: "off" } }));
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     const loaded = load();
     try {
@@ -219,7 +220,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(message).toContain("tracked files indexed");
     expect(message).toContain("production anchors");
     expect(message).toContain("sync continuous");
-    expect(message).toContain("grep hybrid");
+    expect(message).toContain("grep augment");
     expect(message).toContain("ast-grep");
   });
 
@@ -314,6 +315,103 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     }
   });
 
+
+  it("co-existence: native grep results gain a Fovea graph section for symbol queries", async () => {
+    resetSessions();
+    const loaded = load();
+    const [patch] = await loaded.emit("tool_result", {
+      type: "tool_result",
+      toolName: "grep",
+      toolCallId: "t-augment",
+      input: { pattern: "GetUserHandler" },
+      content: [{ type: "text", text: "server/users.go:5: func GetUserHandler(id string) string {" }],
+      details: { matches: 1 },
+      isError: false,
+    }, fakeCtx(FIXTURE));
+    const result = patch as { content: Array<{ text: string }>; details: Record<string, unknown> };
+    expect(result.content).toHaveLength(2);
+    expect(result.content[0]!.text).toContain("func GetUserHandler");
+    expect(result.content[1]!.text).toContain("fovea graph");
+    expect(result.content[1]!.text).toContain("server/users.go");
+    expect(result.details).toMatchObject({
+      matches: 1,
+      backend: "hybrid",
+      foveaAppended: true,
+      query: "GetUserHandler",
+    });
+
+    // Native-only options stay native AND scope the graph lookup: `path`
+    // narrows the Fovea query instead of suppressing it.
+    const [scopedPatch] = await loaded.emit("tool_result", {
+      type: "tool_result",
+      toolName: "grep",
+      toolCallId: "t-augment-scoped",
+      input: { pattern: "GetUserHandler", path: "server", limit: 20 },
+      content: [{ type: "text", text: "server/users.go:5: func GetUserHandler(id string) string {" }],
+      details: {},
+      isError: false,
+    }, fakeCtx(FIXTURE));
+    expect((scopedPatch as { content: Array<{ text: string }> }).content).toHaveLength(2);
+  });
+
+  it("skips augmentation for regex patterns, errors, non-grep tools, and off/replace modes", async () => {
+    resetSessions();
+    const loaded = load();
+    const baseEvent = (input: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+      type: "tool_result",
+      toolName: "grep",
+      toolCallId: "t",
+      input,
+      content: [{ type: "text", text: "native lines" }],
+      details: {},
+      isError: false,
+      ...extra,
+    });
+    const [regex] = await loaded.emit("tool_result", baseEvent({ pattern: "Get.*Handler" }), fakeCtx(FIXTURE));
+    expect(regex).toBeUndefined();
+    const [errored] = await loaded.emit("tool_result", baseEvent({ pattern: "GetUserHandler" }, { isError: true }), fakeCtx(FIXTURE));
+    expect(errored).toBeUndefined();
+    const [readTool] = await loaded.emit("tool_result", baseEvent({ pattern: "GetUserHandler" }, { toolName: "read" }), fakeCtx(FIXTURE));
+    expect(readTool).toBeUndefined();
+
+    // Symbol queries that WOULD seed on this fixture stay untouched when the
+    // mode says no augmentation (global scope, so untrusted projects apply).
+    const agentDirRoot = mkdtempSync(path.join(tmpdir(), "pi-fovea-augment-mode-"));
+    try {
+      for (const mode of ["off", "replace"] as const) {
+        writeFileSync(path.join(agentDirRoot, "fovea.json"), JSON.stringify({ tools: { grepMode: mode } }));
+        vi.stubEnv("PI_CODING_AGENT_DIR", agentDirRoot);
+        const fresh = load();
+        const [blocked] = await fresh.emit("tool_result", baseEvent({ pattern: "GetUserHandler" }), fakeCtx(FIXTURE, true));
+        expect(blocked, mode).toBeUndefined();
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(agentDirRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("augment mode swallows graph failures so native grep passes through untouched", async () => {
+    resetSessions();
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-augment-broken-"));
+    vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
+    try {
+      const loaded = load();
+      const [patch] = await loaded.emit("tool_result", {
+        type: "tool_result",
+        toolName: "grep",
+        toolCallId: "t",
+        input: { pattern: "WhateverSymbol" },
+        content: [{ type: "text", text: "native" }],
+        details: {},
+        isError: false,
+      }, fakeCtx(root));
+      expect(patch).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it("defers hintless out-of-band drift instead of blocking the send", async () => {
     // A raw filesystem write (bash / external editor / fabric_exec) has no
