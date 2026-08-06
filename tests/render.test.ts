@@ -212,6 +212,38 @@ describe("overflow artifacts", () => {
     expect(fit.text).not.toContain("d59");
   });
 
+  it("writes the artifact when only the glow periphery overflows", () => {
+    // hub -> mid -> ten warm siblings in one file: only the first four render
+    // individually, the rest collapse to a glow line. The prefix fits the
+    // budget untouched, so only the footer knows anything was omitted — and
+    // the artifact must exist and hold those nodes as real entries.
+    const nodes: NodeRec[] = [
+      { id: "hub@src/hub.ts", name: "hub", kind: "function", file: "src/hub.ts", line: 1, sig: "export function hub()", lang: "TypeScript" },
+      { id: "mid@src/mid.ts", name: "mid", kind: "function", file: "src/mid.ts", line: 1, sig: "export function mid()", lang: "TypeScript" },
+      { id: "file:src/big.ts", name: "big.ts", kind: "file", file: "src/big.ts", line: 0, sig: "src/big.ts", lang: "TypeScript" },
+    ];
+    const edges: Graph["edges"] = [{ a: 0, b: 1, kind: "invokes", w: 0.9 }];
+    for (let j = 0; j < 10; j++) {
+      const idx = nodes.length;
+      nodes.push({ id: `helper${j}@src/big.ts`, name: `helper${j}`, kind: "function", file: "src/big.ts", line: 3 + j, sig: `function helper${j}() {}`, lang: "TypeScript" });
+      edges.push({ a: 1, b: idx, kind: "invokes", w: 0.9 });
+    }
+    const g: Graph = { nodes, edges, byName: new Map(), byFile: new Map(), anchors: [], files: [] };
+    const csr = buildCsr(g);
+    const s = new Float64Array(g.nodes.length);
+    s[0] = 1;
+    const path = join(tmpdir(), "pi-fovea-test-collapsed-overflow.txt");
+
+    const fit = revealFoveated(g, heatAt(csr, s, 2), { header: "t", budget: 4000, overflowTo: path });
+
+    expect(fit.text).toContain(`full list saved to ${path}`);
+    expect(fit.truncated).toBe(true);
+    expect(fit.overflowPath).toBe(path);
+    const artifact = readFileSync(path, "utf8");
+    expect(artifact).toContain("helper9");
+    expect(fit.text).not.toContain("helper9");
+  });
+
   it("leaves non-overflowing fits and footer wording alone", () => {
     const g = fanGraph(8);
     const csr = buildCsr(g);

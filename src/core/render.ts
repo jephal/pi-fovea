@@ -163,6 +163,9 @@ export const revealFoveated = (
   const glowCounts = new Map<string, number>();
   const warmPerFile = new Map<string, number>();
   const lines: string[] = [];
+  // One line per lit node — glow aggregation is display-only; the overflow
+  // artifact must always back the footer's "full list" claim.
+  const allItems: string[] = [];
   const ids: string[] = [];
   const revealed: RevealedNode[] = [];
   for (const i of capped) {
@@ -192,29 +195,31 @@ export const revealFoveated = (
         seedId: relation ? g.nodes[relation.seed]!.id : undefined,
       });
     };
+    const glowLine = `  · ${node.name} (${node.kind}) ${formatNodeLocation(node)}`;
     if (h >= HOT_TIER || seedSet.has(i)) {
-      lines.push(
-        node.kind === "file"
-          ? `▪ ${node.file}${context}`
-          : node.kind === "anchor"
-            ? `⚑ ${node.sig}${context}`
-            : `▲ ${formatNodeLocation(node)}  ${node.sig}${context}`,
-      );
+      const line = node.kind === "file"
+        ? `▪ ${node.file}${context}`
+        : node.kind === "anchor"
+          ? `⚑ ${node.sig}${context}`
+          : `▲ ${formatNodeLocation(node)}  ${node.sig}${context}`;
+      lines.push(line);
+      allItems.push(line);
       remember(seedSet.has(i) ? "focus" : semanticRelation ? "direct" : "hot");
     } else if (h >= WARM_TIER || semanticRelation) {
       const warmCount = warmPerFile.get(node.file) ?? 0;
+      const warmLine = semanticRelation
+        ? `  ${displayRelation}  ${node.name} (${node.kind}) ${formatNodeLocation(node)}`
+        : glowLine;
+      allItems.push(warmLine);
       if (!semanticRelation && node.kind !== "file" && warmCount >= MAX_UNRELATED_WARM_PER_FILE) {
         glowCounts.set(node.file, (glowCounts.get(node.file) ?? 0) + 1);
         continue;
       }
       if (!semanticRelation && node.kind !== "file") warmPerFile.set(node.file, warmCount + 1);
-      lines.push(
-        semanticRelation
-          ? `  ${displayRelation}  ${node.name} (${node.kind}) ${formatNodeLocation(node)}`
-          : `  · ${node.name} (${node.kind}) ${formatNodeLocation(node)}`,
-      );
+      lines.push(warmLine);
       remember(semanticRelation ? "direct" : "warm");
     } else {
+      allItems.push(glowLine);
       glowCounts.set(node.file, (glowCounts.get(node.file) ?? 0) + 1);
     }
   }
@@ -250,11 +255,14 @@ export const revealFoveated = (
   }
   let text = k >= 0 ? renderK(k) : header;
   const shown = k >= 0 ? Math.min(k, individual) : 0;
-  const truncated = shown < individual || (k >= 0 && k < items.length);
+  // The footer appears whenever anything was omitted — a collapsed glow
+  // periphery counts even when the rendered prefix fit — so the artifact
+  // write must gate on the same condition, or the footer names a dead path.
+  const truncated = collapsed + individual - shown > 0;
   let overflowPath: string | undefined;
   if (truncated && opts.overflowTo) {
     try {
-      writeFileSync(opts.overflowTo, `${header}\n${items.join("\n")}\n`);
+      writeFileSync(opts.overflowTo, `${header}\n${allItems.join("\n")}\n`);
       overflowPath = opts.overflowTo;
     } catch {
       // An unwritable artifact drops the footer pointer; that only shortens
