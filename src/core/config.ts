@@ -44,10 +44,18 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   },
 };
 
+export type FoveaConfigScope = "global" | "project";
+
 export interface FoveaConfigScopes {
   cwd: string;
   agentDir: string;
   projectTrusted: boolean;
+  /**
+   * Explicit save scope from the settings UI (Ctrl+G). Defaults to project
+   * when trusted, global otherwise; saveFoveaConfig rejects a project save
+   * for an untrusted project.
+   */
+  scope?: FoveaConfigScope;
 }
 
 export const globalFoveaConfigPath = (agentDir: string): string => path.join(agentDir, "fovea.json");
@@ -127,8 +135,12 @@ const mergeDeep = (existing: Record<string, unknown>, partial: Record<string, un
 export const saveFoveaConfig = (
   scopes: FoveaConfigScopes,
   partial: Record<string, unknown>,
-): { scope: "global" | "project"; path: string } => {
-  const targetPath = scopes.projectTrusted
+): { scope: FoveaConfigScope; path: string } => {
+  const scope = scopes.scope ?? (scopes.projectTrusted ? "project" : "global");
+  if (scope === "project" && !scopes.projectTrusted) {
+    throw new Error("Cannot save project Fovea configuration for an untrusted project");
+  }
+  const targetPath = scope === "project"
     ? projectFoveaConfigPath(scopes.cwd)
     : globalFoveaConfigPath(scopes.agentDir);
   const merged = mergeDeep(readConfigFile(targetPath), partial);
@@ -136,7 +148,7 @@ export const saveFoveaConfig = (
   const tmp = `${targetPath}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n");
   fs.renameSync(tmp, targetPath);
-  return { scope: scopes.projectTrusted ? "project" : "global", path: targetPath };
+  return { scope, path: targetPath };
 };
 
 export const defaultAgentDir = (): string => path.join(os.homedir(), ".pi", "agent");

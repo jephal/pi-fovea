@@ -2,7 +2,8 @@
 // settings component structure (SettingsList in a bordered Container,
 // SelectList submenus, dotted-id coercion) so both extensions feel like one
 // settings surface. Persistence: fovea.json under the pi agent dir, with a
-// project override at <repo>/.pi/fovea.json for trusted projects.
+// project override at <repo>/.pi/fovea.json for trusted projects; Ctrl+G in
+// the overlay toggles which scope the next change saves to.
 
 import {
   DynamicBorder,
@@ -13,6 +14,8 @@ import {
 import {
   Container,
   type Component,
+  Key,
+  matchesKey,
   SelectList,
   type SelectItem,
   type SelectListLayoutOptions,
@@ -28,6 +31,7 @@ import {
   loadFoveaConfig,
   saveFoveaConfig,
   type FoveaConfig,
+  type FoveaConfigScope,
 } from "../core/config.js";
 
 const BOOLEANS = ["true", "false"] as const;
@@ -38,6 +42,8 @@ const SELECT_LAYOUT: SelectListLayoutOptions = {
   minPrimaryColumnWidth: 12,
   maxPrimaryColumnWidth: 32,
 };
+
+const SAVE_SCOPE_SHORTCUT = Key.ctrl("g");
 
 type SettingsSubmenu = (currentValue: string, done: (selectedValue?: string) => void) => Component;
 
@@ -117,17 +123,39 @@ const numericSubmenu = (
   );
 };
 
-class FoveaSettingsComponent extends Container {
+export interface FoveaSettingsComponentOptions {
+  initialSaveScope?: FoveaConfigScope;
+  projectScopeAvailable?: boolean;
+  onSaveScopeChange?: (scope: FoveaConfigScope) => void;
+}
+
+export class FoveaSettingsComponent extends Container {
   readonly settingsList: SettingsList;
+  private readonly theme: Theme;
+  private readonly saveScopeText: Text;
+  private readonly projectScopeAvailable: boolean;
+  private readonly onSaveScopeChange: (scope: FoveaConfigScope) => void;
+  private saveScope: FoveaConfigScope;
 
   constructor(
     theme: Theme,
     items: SettingItem[],
     onChange: (id: string, newValue: string) => void,
     onCancel: () => void,
+    options: FoveaSettingsComponentOptions = {},
   ) {
     super();
+    this.theme = theme;
+    this.projectScopeAvailable = options.projectScopeAvailable ?? true;
+    this.saveScope = options.initialSaveScope === "global" || !this.projectScopeAvailable
+      ? "global"
+      : "project";
+    this.onSaveScopeChange = options.onSaveScopeChange ?? (() => {});
     this.addChild(new DynamicBorder((text) => theme.fg("border", text)));
+    this.saveScopeText = new Text("", 1, 0);
+    this.updateSaveScopeText();
+    this.addChild(this.saveScopeText);
+    this.addChild(new Spacer(1));
     this.settingsList = new SettingsList(items, 10, settingsListTheme(theme), onChange, onCancel, {
       enableSearch: true,
     });
@@ -136,7 +164,28 @@ class FoveaSettingsComponent extends Container {
   }
 
   handleInput(data: string): void {
+    if (matchesKey(data, SAVE_SCOPE_SHORTCUT)) {
+      if (!this.projectScopeAvailable) return;
+      this.saveScope = this.saveScope === "project" ? "global" : "project";
+      this.updateSaveScopeText();
+      this.onSaveScopeChange(this.saveScope);
+      return;
+    }
     this.settingsList.handleInput(data);
+  }
+
+  private updateSaveScopeText(): void {
+    const destination = this.saveScope === "project"
+      ? "Project (.pi/fovea.json)"
+      : "Global (~/.pi/agent/fovea.json)";
+    const hint = this.projectScopeAvailable
+      ? " · Ctrl+G toggles save scope"
+      : " · project scope unavailable for untrusted projects";
+    this.saveScopeText.setText(
+      this.theme.fg("muted", "Save scope: ") +
+      this.theme.fg("accent", destination) +
+      this.theme.fg("dim", hint),
+    );
   }
 }
 
@@ -229,13 +278,14 @@ export const openFoveaSettings = async (
     agentDir,
     projectTrusted: context.isProjectTrusted(),
   };
+  let saveScope: FoveaConfigScope = scopes.projectTrusted ? "project" : "global";
   let config = loadFoveaConfig(scopes);
   const initialReplaceGrep = config.tools.replaceGrep;
   let dirty = false;
 
   const apply = (id: string, value: unknown): void => {
     try {
-      saveFoveaConfig(scopes, buildPartialFromId(id, value));
+      saveFoveaConfig({ ...scopes, scope: saveScope }, buildPartialFromId(id, value));
     } catch (error) {
       context.ui.notify(
         `Failed to save Fovea settings: ${error instanceof Error ? error.message : String(error)}`,
@@ -248,13 +298,21 @@ export const openFoveaSettings = async (
     deps.onConfigApplied?.();
   };
 
-  await context.ui.custom<void>((_tui, theme, _keybindings, done) => {
+  await context.ui.custom<void>((tui, theme, _keybindings, done) => {
     const items = buildItems(theme, config, apply);
     return new FoveaSettingsComponent(
       theme,
       items,
       (id, newValue) => apply(id, coerceValue(id, newValue, config)),
       () => done(),
+      {
+        initialSaveScope: saveScope,
+        projectScopeAvailable: scopes.projectTrusted,
+        onSaveScopeChange: (scope) => {
+          saveScope = scope;
+          tui.requestRender();
+        },
+      },
     );
   });
 

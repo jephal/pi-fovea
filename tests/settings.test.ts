@@ -1,9 +1,10 @@
-import { readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text, type SettingItem } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
-import { openFoveaSettings } from "../src/ui/settings.js";
+import { FoveaSettingsComponent, openFoveaSettings } from "../src/ui/settings.js";
 
 describe("Fovea settings", () => {
   it("renders and persists the Hybrid grep toggle", async () => {
@@ -47,5 +48,119 @@ describe("Fovea settings", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("persists trusted-project changes globally after Ctrl+G", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-settings-global-"));
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    const inheritedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    mkdirSync(cwd, { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    };
+    const requestRender = vi.fn();
+    const context = {
+      mode: "tui",
+      cwd,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: vi.fn(),
+        custom: async (factory: (...args: any[]) => any) => {
+          const component = factory({ requestRender }, theme, {}, () => {});
+          component.handleInput("\x07");
+          const list = component.settingsList as any;
+          list.selectedIndex = list.items.findIndex(
+            (item: { id: string }) => item.id === "sync.enabled",
+          );
+          list.activateItem();
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    try {
+      const result = await openFoveaSettings(context);
+      expect(result).toEqual({ grepRegistrationChanged: false });
+      expect(requestRender).toHaveBeenCalledOnce();
+      expect(JSON.parse(readFileSync(path.join(agentDir, "fovea.json"), "utf8"))).toMatchObject({
+        sync: { enabled: false },
+      });
+      expect(existsSync(path.join(cwd, ".pi", "fovea.json"))).toBe(false);
+    } finally {
+      if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("FoveaSettingsComponent save scope", () => {
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  } as never;
+
+  const buildItems = (): SettingItem[] => [
+    {
+      id: "sync.enabled",
+      label: "Continuous sync",
+      currentValue: "true",
+      values: ["true", "false"],
+    },
+    {
+      id: "sync.budget",
+      label: "Sync budget",
+      currentValue: "1024",
+      submenu: (_current, done) => {
+        void done;
+        return new Text("budget submenu", 0, 0);
+      },
+    },
+  ];
+
+  it("toggles save scope with Ctrl+G from the root and active submenus", () => {
+    const scopes: string[] = [];
+    const component = new FoveaSettingsComponent(theme, buildItems(), () => {}, () => {}, {
+      initialSaveScope: "project",
+      projectScopeAvailable: true,
+      onSaveScopeChange: (scope) => scopes.push(scope),
+    });
+
+    expect(component.render(100).join("\n")).toContain("Save scope: Project (.pi/fovea.json)");
+
+    component.handleInput("\x07");
+    expect(component.render(100).join("\n")).toContain(
+      "Save scope: Global (~/.pi/agent/fovea.json)",
+    );
+
+    const list = component.settingsList as any;
+    list.selectedIndex = list.items.findIndex((item: { id: string }) => item.id === "sync.budget");
+    list.activateItem();
+    component.handleInput("\x07");
+
+    expect(list.submenuComponent).not.toBeNull();
+    expect(component.render(100).join("\n")).toContain("Save scope: Project (.pi/fovea.json)");
+    expect(scopes).toEqual(["global", "project"]);
+  });
+
+  it("keeps untrusted projects global-only", () => {
+    const onSaveScopeChange = vi.fn();
+    const component = new FoveaSettingsComponent(theme, buildItems(), () => {}, () => {}, {
+      initialSaveScope: "global",
+      projectScopeAvailable: false,
+      onSaveScopeChange,
+    });
+
+    component.handleInput("\x07");
+
+    expect(component.render(100).join("\n")).toContain(
+      "Save scope: Global (~/.pi/agent/fovea.json)",
+    );
+    expect(component.render(100).join("\n")).toContain(
+      "project scope unavailable for untrusted projects",
+    );
+    expect(onSaveScopeChange).not.toHaveBeenCalled();
   });
 });
