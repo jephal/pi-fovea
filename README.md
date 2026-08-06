@@ -1,113 +1,159 @@
-# pi-fovea
+<div align="center">
 
-**Token-budgeted repo mapping for agent sessions — foveated heat diffusion over a cross-language code graph.**
+# 👁️ pi-fovea
 
-Sharp where you look, whole-picture-but-cheap in the periphery. A pi extension that turns a repository into a field you can survey, focus, and deepen — instead of a list of files you grep.
+**A foveated repo-mapping extension for [Pi](https://github.com/earendil-works/pi-coding-agent)**
 
-## The idea
+_Survey, focus, dwell, impact — a budget-capped field of view instead of a folder dump._
 
-The repo is extracted into a typed graph (symbols, files, route anchors) whose edges carry *conductance*: imports are weak bridges, calls solid, and shared literals — route paths, env keys — are the cross-language bridges, weighted by specificity (a path seen in 2 files conducts well; seen in 30 it's noise). Your interest is a heat source `s`; the map you receive is the heat equation run for time `t` over the graph Laplacian:
+<p>
+  <img src="https://raw.githubusercontent.com/monotykamary/pi-fovea/main/media/cover.svg" alt="pi-fovea: a code graph seen through a fovea — hot at the center, collapsed at the rim" width="1100">
+</p>
 
-```
+[![npm version](https://img.shields.io/npm/v/pi-fovea?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/pi-fovea)
+[![checks](https://img.shields.io/github/actions/workflow/status/monotykamary/pi-fovea/test.yml?branch=main&style=for-the-badge&label=checks)](https://github.com/monotykamary/pi-fovea/actions/workflows/test.yml)
+[![pi extension](https://img.shields.io/badge/pi-extension-8b5cf6?style=for-the-badge)](https://github.com/earendil-works/pi-coding-agent)
+[![license](https://img.shields.io/badge/license-MIT-f4c430?style=for-the-badge)](LICENSE)
+
+</div>
+
+---
+
+Large models have small context. pi-fovea turns a repository into a **heat field** over a cross-language code graph — symbols, files, route anchors — and hands the model exactly `maxTokens` of it at a time, sharp where you look and whole-picture-but-cheap everywhere else. After every edit it silently re-syncs, and only speaks up when the change didn't stay local.
+
+## Why Fovea?
+
+|     | Capability | What it unlocks |
+| :-: | ---------- | --------------- |
+| 🔭 | **Survey** | `fovea_sketch` renders the whole repo as a low-acuity silhouette — feature anchors and basins by mass, never raw file lists. |
+| 🎯 | **Focus** | `fovea_focus` centers on a symbol, route, or env key: hot nodes as signatures, warm nodes as one-liners, periphery collapsed. |
+| ⏱️ | **Dwell** | `fovea_dwell` diffuses longer and returns only the delta. Chebyshev vectors are cached — a new timescale is coefficient recombination, not a re-walk. |
+| 🌡️ | **Impact** | `fovea_impact` predicts the co-change cascade across languages — what a file, symbol, or PR base warms up. |
+| 🩸 | **Turn sync** | After every edit turn the graph re-syncs for free. Anchor shifts and unwatched warmings surface as red flags; stable turns stay silent. |
+| 🪙 | **Token truth** | Budgets are hard caps, not hopes: the renderer fits a monotonic prefix and never exceeds `maxTokens`. |
+
+## How it works
+
+The repo compiles to a typed graph whose edges carry **conductance**: imports are bridges, calls are solid, and shared literals — route paths, env keys — are the cross-language welds, weighted by specificity. Your interest is a heat source `s`; the map the model receives is the heat kernel run for time `t` over the graph Laplacian:
+
+```text
 v(t) = e^{−tL} · s
 ```
 
-- **sketch** — large `t`, hub+anchor seeds: a blurry but valid silhouette of the whole repo (feature anchors and directory regions ranked by mass).
-- **focus** — point the fovea at a symbol, route path, env key, or file. Hot nodes render with full signatures, warm nodes as one-liners, the periphery collapses to per-file counts.
-- **dwell** — let the current field diffuse longer (`t` grows ×2 per call) and receive **only the newly-luminous nodes**. Every answer is a delta: already-shown nodes stay suppressed, and the cached Chebyshev vectors make a new `t` nearly free (coefficient recombination, no re-walk).
-- **impact** — seed from changed files (uncommitted by default) and read what warms up: the predicted review/co-change cascade, across languages, ordered by warmth.
+- **sketch** — large `t`, hub + anchor seeds: the whole repo in one blurry-but-valid silhouette.
+- **focus** — small `t`, your query as the seed: the fovea on exactly that feature.
+- **dwell** — `t` ×2 per call; only newly-luminous nodes are returned.
+- **impact** — changed files as the seed; warmth = predicted blast radius.
 
-Budget conformance is a monotonic prefix fit — the renderer binary-searches the candidate prefix until the text fits `maxTokens`, so the token spend is never exceeded.
-
-Lineage: spectral graph wavelets (heat kernel as multi-scale structure, evaluated by shared Chebyshev recurrence), progressive image coding (budget as bitrate over significance-thresholded coefficients), foveated rendering. Personalization-PageRank repo maps (aider) are the fixed-timescale special case.
-
-## Requirements
-
-- [`pi`](https://github.com/earendil-works/pi-coding-agent)
-- `ast-grep` on PATH (or set `FOVEA_AST_GREP=/path/to/sg`)
+Lineage: spectral-graph heat kernels (SGWT evaluated by shared Chebyshev recurrence), progressive image coding (budget as bitrate over significance-sorted coefficients), foveated rendering. Nanobridge: aider's PageRank repo map is the fixed-timescale special case.
 
 ## Install
 
+Requires Node.js 20+ and [ast-grep](https://ast-grep.github.io/) on PATH (`brew install ast-grep`, `npm i -g @ast-grep/cli`, or set `FOVEA_AST_GREP=/path/to/sg`).
+
 ```sh
-pi install /path/to/pi-fovea          # local path
-# or once published:
 pi install npm:pi-fovea
 ```
 
-Then, in any repo session: `/fovea status` shows graph stats, `/fovea settings` opens the overlay; the model gets the four `fovea_*` tools.
+<details>
+<summary>Other install methods</summary>
+
+From GitHub:
+
+```sh
+pi install git:github.com/monotykamary/pi-fovea
+```
+
+From a local checkout:
+
+```sh
+pnpm install
+pi install /absolute/path/to/pi-fovea
+```
+
+</details>
+
+Then, in any repo session, the model gets the four `fovea_*` tools; you get:
+
+- `/fovea status` — graph stats, sync on/off
+- `/fovea settings` — an overlay built from the same SettingsList idiom as pi-fabric's `/fabric settings`
 
 ### CLI
 
-The same ops as a shell command (stateless, pipe-friendly):
+The same ops, stateless and pipe-friendly — for agent shells, CI, and `llmc`-style uses:
 
 ```sh
-pnpm fovea sketch /path/to/repo 900
-pnpm fovea focus /path/to/repo "/v1/messages" 800
-pnpm fovea impact /path/to/repo --base main 1200
+fovea sketch /path/to/repo 900
+fovea focus /path/to/repo "/v1/messages" 800
+fovea impact /path/to/repo --base main 1200
+fovea status /path/to/repo
 ```
 
-### Repo rule packs
-
-Drop `.fovea/rules.json` in a repo to extend route/anchor detection beyond the built-ins (express/orval-style chains, NestJS decorators, Flask/FastAPI decorators, Go chi/mux, axum):
-
-```json
-{ "rules": [{ "id": "fiber", "langs": ["Go"], "pattern": "$R.$M(\"$P\", $$H)", "methods": "^(get|post)$", "kind": "route" }] }
-```
-
-Changing the rules file invalidates only the anchor extraction cache.
-
-Supported today: TypeScript/JavaScript/Python/Go/Rust with full symbol+call extraction; Elixir, Ruby, C, C++, Java, Kotlin, Lua, PHP, Swift, Scala, Haskell, Bash via outline-based symbols with heuristic naming. Config files (YAML/JSON/TOML/env/Markdown/OpenAPI specs) join through literals.
-
-## How the agent uses it
-
-```
-fovea_sketch  { }                                    # silhouette, ~1.4k tok
-fovea_focus   { "query": "/api/users/{id}" }         # route → handler+client+spec
-fovea_dwell   { }                                    # deepen: t 2→4, deltas only
-fovea_impact  { "files": ["server/users.go"] }       # what this edit touches
-fovea_impact  { "base": "main" }                        # PR cascade (git diff main…HEAD)
-```
-
-Cursor lines tell the model what remains (`… 37 lit below threshold — call fovea_dwell`), so progressive disclosure is tool-driven, not one-shot.
+(`fovea` bins to `cli.ts` via `tsx`; install `tsx` globally or use `pnpm fovea` from a checkout.)
 
 ## Turn-sync (default on)
 
-After every assistant turn, fovea re-syncs the graph incrementally (content-sha'd — no edit, no cost) and gives a verdict: **green** stays silent in the model's context (a UI toast only when `sync.ackClean` is on), **red** lands a budget-capped custom message listing route anchors that appeared or vanished and files the edit cascade warmed that the model hasn't focused yet. The first sync of a session only establishes the baseline; the first drift calibrates the warm neighborhood instead of escalating, so noise stays low. New edits to the same steady cone stay green.
+After every assistant turn, fovea re-syncs the graph — guaranteed incremental by content hash — no edits means zero work. The verdict:
 
-Opt out per-repo or globally: `/fovea settings` → "Turn sync → false", or `FOVEA_TURN_SYNC=off pi`.
+- **green** → silent in the model's context (a UI toast only if `sync.ackClean` is on).
+- **red** → a capped custom message: route anchors that appeared/disappeared, plus files the edit cascade warmed that the model hasn't focused yet.
+
+The first sync establishes the baseline; the first drift after it calibrates the warm neighborhood rather than alarming, so a steady feature cone doesn't page the model every edit.
+
+Opt out per-repo or globally: `/fovea settings` → "Turn sync → false", or
+
+```sh
+FOVEA_TURN_SYNC=off pi
+```
 
 ## Configuration
 
-Global `~/.pi/agent/fovea.json`, project override at `<repo>/.pi/fovea.json` when the project is trusted — same two-scope model as pi-fabric's fabric.json. Keys:
+Global `~/.pi/agent/fovea.json`; project override `<repo>/.pi/fovea.json` when trusted — the same two-scope model as pi-fabric's `fabric.json`.
 
 | Key | Default | Meaning |
-|---|---|---|
-| `sync.enabled` | `true` | the turn-sync loop (this section) |
+| --- | :-----: | ------- |
+| `sync.enabled` | `true` | the turn-sync loop |
 | `sync.budget` | `1024` | tokens for the red model-visible report |
 | `sync.ackClean` | `false` | toast on clean structural turns (no model tokens either way) |
 | `sync.warmFileThreshold` | `2` | newly-warm undisclosed files that justify red |
 | `tools.defaultBudget` | `2000` | fallback maxTokens for fovea_* tool calls |
 
-## Feature hubs and basins
+## Repo rule packs
 
-Route declarations and every client call of the same normalized path collapse to ONE feature node — `POST /auth/login` in an express router and in axios clients are occurrences of the same thing, and the anchor hub is where they meet. Where no routes exist at all (CLIs, libraries, kernels), `sketch` infers **basins**: greedy conductance-cut regions around triangle-dense seeds — implicit features that hold together under diffusion.
+Drop `.fovea/rules.json` in a repo to extend anchor detection beyond the built-ins (express/orval chains, NestJS decorators, Flask/FastAPI decorators, Go chi/mux, axum):
+
+```json
+{
+  "rules": [
+    { "id": "fiber", "langs": ["Go"], "pattern": "$R.$M(\"$P\", $$H)", "methods": "^(get|post)$", "kind": "route" }
+  ]
+}
+```
+
+Changing the rules file invalidates **only** the anchor extraction cache — green-node reuse one level up.
 
 ## How the graph is joined
 
-- imports, outline contains/inherits, tests, call edges (specificity-tiered; language builtins and log/test entry points are warded off)
-- literal joins across languages (route paths, env keys, distinguishing strings) — document-frequency-gated cliques so rare literals bridge strongly and ubiquitous ones don't become gravity wells; `focus` can still seed from any literal
-- co-change edges mined from recent git history (Jaccard-tilted, per-file capped, cached by HEAD) — files that commute together warm each other even without a static edge
+- **imports / contains / inherits / tests** — outline-derived; call edges specificity-tiered, with language builtins and log/test entry points warded off
+- **literal joins** — route paths, env keys, OpenAPI operation paths; document-frequency-gated cliques so rare literals bridge strongly and ubiquitous ones don't become gravity wells
+- **co-change** — mined from recent git history (Jaccard-tilted, per-file capped, cached by HEAD), so files that commute together warm each other even without a static edge
+- **feature hubs** — route declarations and every client call of the same normalized path collapse to ONE anchor node: where client, server, and spec meet
+- **basins** — where there are no routes at all (CLIs, kernels), sketch infers implicit features as conductance-cut regions around triangle-dense seeds
+
+## Language matrix
+
+Full symbol + call extraction: **TypeScript/TSX · JavaScript · Python · Go · Rust**.
+Outline-based symbols with heuristic naming: **Elixir · Ruby · C · C++ · Java · Kotlin · Lua · PHP · Swift · Scala · Haskell · Bash**.
+Config joins through literals: **YAML · JSON · TOML · env · Markdown · OpenAPI**.
 
 ## Development
 
 ```sh
 pnpm install
-pnpm run check        # typecheck + full test suite
+pnpm run check        # typecheck + full vitest suite
 pnpm run bench        # rate–distortion bench against ../pi-fabric
 ```
 
-The extension is loaded by pi via jiti straight from `src/` — there is no build step. Tests (`vitest`) cover the diffusion core against an independent scaled-Taylor reference, the extractors against a cross-language fixture monorepo, budget conformance, and the session delta contract.
+pi loads the extension straight from `src/` via jiti — **there is no build step**. Per-repo caches live in `$TMPDIR` (content sha1 per file; only dirty files re-run ast-grep). Bump `CACHE_VERSION` in `src/core/build.ts` when extractor semantics change.
 
-Cache: per-repo content-hash cache in `$TMPDIR` (sha1 per file; only dirty files re-run ast-grep). Bump `CACHE_VERSION` in `src/core/build.ts` when extractor semantics change.
-
-MIT.
+[MIT](LICENSE).
