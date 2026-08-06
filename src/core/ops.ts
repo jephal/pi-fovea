@@ -315,7 +315,7 @@ export interface ImpactArgs {
   budget?: number;
 }
 
-const uncommittedFiles = (root: string): string[] => {
+export const uncommittedFiles = (root: string): string[] => {
   const res = spawnSync("git", ["-C", root, "status", "--porcelain", "-z"], { encoding: "utf8", timeout: 15_000 });
   if (res.error || res.status !== 0 || !res.stdout) return [];
   const out: string[] = [];
@@ -391,7 +391,19 @@ export const impact = (root: string, args: ImpactArgs): OpResult => {
     header: `fovea impact · ${seeds.length} seed${seeds.length === 1 ? "" : "s"} (${seedNames}${seeds.length > 5 ? ", …" : ""}) · t=${t} · review order by warmth`,
     budget: B,
   });
-  return { text: fit.text, tokens: fit.tokens, details: { seeds: seeds.length, warmed: groups.length, truncated: fit.truncated } };
+  return {
+    text: fit.text,
+    tokens: fit.tokens,
+    details: {
+      seeds: seeds.length,
+      warmed: groups.length,
+      truncated: fit.truncated,
+      // Structured form for consumers (turn-sync): warmed anchor ids + files,
+      // no text re-parsing.
+      warmedAnchors: anchorHits.map((h) => h.label.replace(/^⚑\s*/, "")),
+      warmedFiles: groups.filter((grp) => !grp.label.startsWith("⚑")).map((grp) => grp.label),
+    },
+  };
 };
 
 // For tests and benches: token estimate passthrough.

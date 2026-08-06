@@ -5,8 +5,11 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { defaultAgentDir, loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { dwell, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
+import { resetSyncBaselines, sync } from "./core/sync.js";
+import { openFoveaSettings } from "./ui/settings.js";
 
 const BudgetParam = Type.Optional(
   Type.Number({ description: "Max tokens for the response (256..16000). Estimate: 4 chars/token.", minimum: 256, maximum: 16000 }),
@@ -18,8 +21,66 @@ const RootParam = Type.Optional(
 const text = (s: string) => ({ type: "text" as const, text: s });
 
 export default function fovea(pi: ExtensionAPI) {
+  // Per-root config cache; invalidated by settings saves (/fovea settings).
+  const configs = new Map<string, FoveaConfig>();
+  const configFor = (root: string, trusted = false, agentDir?: string): FoveaConfig => {
+    const hit = configs.get(root);
+    if (hit) return hit;
+    const cfg = loadFoveaConfig({ cwd: root, agentDir: agentDir ?? defaultAgentDir(), projectTrusted: trusted });
+    configs.set(root, cfg);
+    return cfg;
+  };
+
   pi.on("session_start", async (event) => {
-    if (event.reason === "new" || event.reason === "fork") resetSessions();
+    if (event.reason === "new" || event.reason === "fork") {
+      resetSessions();
+      resetSyncBaselines();
+    }
+  });
+
+  // Turn-sync loop. Edits discovered via the files touched by tool calls in
+  // the turn's results; the graph drifts only when content actually changed,
+  // so pure conversation turns exit early at zero cost.
+  // Per-turn mutation accumulator. tool_execution_start carries typed args,
+  // so edit/write paths are tracked without parsing completed tool messages.
+  let turnFiles: string[] = [];
+  pi.on("turn_start", () => {
+    turnFiles = [];
+  });
+  pi.on("tool_execution_start", (event) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+    const args = event.args as { path?: unknown };
+    if (typeof args.path === "string") turnFiles.push(args.path);
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    try {
+      const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
+      const rels = turnFiles
+        .map((p) => (p.startsWith(ctx.cwd + "/") ? p.slice(ctx.cwd.length + 1) : p))
+        .filter((p) => !p.startsWith("/"));
+      turnFiles = [];
+      if (!cfg.sync.enabled) return;
+      const outcome = sync(ctx.cwd, {
+        files: rels,
+        budget: cfg.sync.budget,
+        warmFileThreshold: cfg.sync.warmFileThreshold,
+      });
+      if (!outcome.structural) return;
+      if (outcome.red && outcome.text) {
+        // Lands in session context; the model sees it on the next LLM call.
+        // No triggerTurn: a red flag never spends a turn on its own.
+        pi.sendMessage({
+          customType: "pi-fovea-sync",
+          content: outcome.text,
+          display: true,
+        }, { deliverAs: "nextTurn" });
+      } else if (cfg.sync.ackClean && ctx.hasUI) {
+        ctx.ui.notify(`fovea sync clean · v ${String(outcome.details.version ?? "?")}`, "info");
+      }
+    } catch {
+      // Turn-sync must never break the agent loop: log and move on.
+    }
   });
 
   pi.registerTool({
@@ -31,7 +92,7 @@ export default function fovea(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
-        const r = sketch(root, params.maxTokens);
+        const r = sketch(root, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (e) {
         return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
@@ -52,7 +113,7 @@ export default function fovea(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
-        const r = focus(root, params.query, params.maxTokens);
+        const r = focus(root, params.query, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (e) {
         return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
@@ -73,7 +134,7 @@ export default function fovea(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = params.root ?? ctx.cwd;
       try {
-        const r = dwell(root, params.factor, params.maxTokens);
+        const r = dwell(root, params.factor, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (e) {
         return { content: [text(String(e instanceof Error ? e.message : e))], details: {}, isError: true };
@@ -102,7 +163,7 @@ export default function fovea(pi: ExtensionAPI) {
           symbols: params.symbols,
           includeUncommitted: params.includeUncommitted,
           base: params.base,
-          budget: params.maxTokens,
+          budget: params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget,
         });
         return { content: [text(r.text)], details: r.details };
       } catch (e) {
@@ -111,12 +172,23 @@ export default function fovea(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("fovea-status", {
-    description: "Show pi-fovea graph/session stats for this repo",
-    handler: async (_args, ctx) => {
+  pi.registerCommand("fovea", {
+    description: "pi-fovea status and settings",
+    getArgumentCompletions: (prefix) =>
+      ["status", "settings"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
+    handler: async (args, ctx) => {
+      const sub = args.trim().split(/\s+/)[0] ?? "status";
+      if (sub === "settings") {
+        await openFoveaSettings(ctx, { onConfigApplied: () => configs.clear() });
+        return;
+      }
       try {
         const s = sketch(ctx.cwd, 256);
-        ctx.ui.notify(`pi-fovea: ${s.details.files ?? 0} files, ${s.details.nodes ?? 0} nodes, ${s.details.anchors ?? 0} anchors`, "info");
+        const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
+        ctx.ui.notify(
+          `pi-fovea: ${s.details.files ?? 0} files, ${s.details.nodes ?? 0} nodes, ${s.details.anchors ?? 0} anchors · sync ${cfg.sync.enabled ? "on" : "off"}`,
+          "info",
+        );
       } catch (e) {
         ctx.ui.notify(`pi-fovea: ${e instanceof Error ? e.message : e}`, "error");
       }

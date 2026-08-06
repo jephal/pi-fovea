@@ -13,7 +13,7 @@ export interface FoveaSession {
   tkKey: string;
 }
 
-export const T0 = 2;
+const T0 = 2;
 export const TK_ORDER = 80; // covers dwell up to t ~ 33 with full accuracy
 
 const sessions = new Map<string, FoveaSession>();

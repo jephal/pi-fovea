@@ -15,11 +15,16 @@ interface ToolDef {
   execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: unknown, ctx: { cwd: string }) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 }
 
+// Command/tool execute ctx must satisfy the parts the extension uses: cwd
+// plus trust lookup for per-root config scoping (config stays global here).
+const fakeCtx = (cwd: string) => ({ cwd, isProjectTrusted: () => false });
+
 const load = () => {
   const tools = new Map<string, ToolDef>();
   const commands: string[] = [];
   extension({
     on: () => {},
+    sendMessage: async () => {},
     registerTool: (d: ToolDef) => tools.set(d.name, d),
     registerCommand: (name: string) => commands.push(name),
   } as never);
@@ -27,19 +32,19 @@ const load = () => {
 };
 
 describe.skipIf(!hasAstGrep())("extension entry", () => {
-  it("registers the four ops as pi tools plus the status command", () => {
+  it("registers the four ops as pi tools plus the /fovea command", () => {
     const { tools, commands } = load();
     for (const name of ["fovea_sketch", "fovea_focus", "fovea_dwell", "fovea_impact"]) {
       expect(tools.has(name), name).toBe(true);
     }
-    expect(commands).toContain("fovea-status");
+    expect(commands).toContain("fovea");
   });
 
   it("fovea_focus executes through the pi tool contract", async () => {
     resetSessions();
     const { tools } = load();
     const focusTool = tools.get("fovea_focus")!;
-    const res = await focusTool.execute("t1", { query: "GetUserHandler" }, new AbortController().signal, undefined, { cwd: FIXTURE });
+    const res = await focusTool.execute("t1", { query: "GetUserHandler" }, new AbortController().signal, undefined, fakeCtx(FIXTURE));
     const text = res.content[0]!.text;
     expect(text).toContain("fovea focus");
     expect(text).toContain("server/users.go");
@@ -50,7 +55,7 @@ describe.skipIf(!hasAstGrep())("extension entry", () => {
     resetSessions();
     const { tools } = load();
     const impactTool = tools.get("fovea_impact")!;
-    const res = await impactTool.execute("t2", { symbols: ["LoadUser"], includeUncommitted: false, maxTokens: 1200 }, new AbortController().signal, undefined, { cwd: FIXTURE });
+    const res = await impactTool.execute("t2", { symbols: ["LoadUser"], includeUncommitted: false, maxTokens: 1200 }, new AbortController().signal, undefined, fakeCtx(FIXTURE));
     const text = res.content[0]!.text;
     expect(text).toContain("fovea impact");
     expect(text).toContain("web/api.ts");

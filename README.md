@@ -70,6 +70,24 @@ fovea_impact  { "base": "main" }                        # PR cascade (git diff m
 
 Cursor lines tell the model what remains (`… 37 lit below threshold — call fovea_dwell`), so progressive disclosure is tool-driven, not one-shot.
 
+## Turn-sync (default on)
+
+After every assistant turn, fovea re-syncs the graph incrementally (content-sha'd — no edit, no cost) and gives a verdict: **green** stays silent in the model's context (a UI toast only when `sync.ackClean` is on), **red** lands a budget-capped custom message listing route anchors that appeared or vanished and files the edit cascade warmed that the model hasn't focused yet. The first sync of a session only establishes the baseline; the first drift calibrates the warm neighborhood instead of escalating, so noise stays low. New edits to the same steady cone stay green.
+
+Opt out per-repo or globally: `/fovea settings` → "Turn sync → false", or `FOVEA_TURN_SYNC=off pi`.
+
+## Configuration
+
+Global `~/.pi/agent/fovea.json`, project override at `<repo>/.pi/fovea.json` when the project is trusted — same two-scope model as pi-fabric's fabric.json. Keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `sync.enabled` | `true` | the turn-sync loop (this section) |
+| `sync.budget` | `1024` | tokens for the red model-visible report |
+| `sync.ackClean` | `false` | toast on clean structural turns (no model tokens either way) |
+| `sync.warmFileThreshold` | `2` | newly-warm undisclosed files that justify red |
+| `tools.defaultBudget` | `2000` | fallback maxTokens for fovea_* tool calls |
+
 ## Feature hubs and basins
 
 Route declarations and every client call of the same normalized path collapse to ONE feature node — `POST /auth/login` in an express router and in axios clients are occurrences of the same thing, and the anchor hub is where they meet. Where no routes exist at all (CLIs, libraries, kernels), `sketch` infers **basins**: greedy conductance-cut regions around triangle-dense seeds — implicit features that hold together under diffusion.
