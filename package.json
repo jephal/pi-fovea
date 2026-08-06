@@ -1,21 +1,56 @@
 {
   "name": "pi-fovea",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Token-budgeted repo mapping for agent sessions: foveated heat diffusion over a cross-language code graph, with progressive disclosure.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "author": "monotykamary",
   "packageManager": "pnpm@11.20.0",
-  "repository": { "type": "git", "url": "git+https://github.com/monotykamary/pi-fovea.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monotykamary/pi-fovea.git"
+  },
   "homepage": "https://github.com/monotykamary/pi-fovea#readme",
   "bugs": "https://github.com/monotykamary/pi-fovea/issues",
-  "keywords": ["pi-package", "pi-extension", "repo-map", "code-graph", "heat-diffusion", "progressive-disclosure", "context-engineering", "agents"],
-  "pi": { "extensions": ["./src/index.ts"], "skills": ["./skills"], "image": "https://raw.githubusercontent.com/monotykamary/pi-fovea/main/media/cover.svg" },
-  "exports": { "./ops": "./src/core/ops.ts" },
-  "files": ["src", "cli.ts", "skills", "media", "README.md", "LICENSE"],
-  "publishConfig": { "access": "public" },
-  "bin": { "fovea": "cli.ts" },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "repo-map",
+    "code-graph",
+    "heat-diffusion",
+    "progressive-disclosure",
+    "context-engineering",
+    "agents"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "image": "https://raw.githubusercontent.com/monotykamary/pi-fovea/main/media/cover.svg"
+  },
+  "exports": {
+    "./ops": "./src/core/ops.ts"
+  },
+  "files": [
+    "src",
+    "cli.ts",
+    "skills",
+    "media",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "fovea": "cli.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
