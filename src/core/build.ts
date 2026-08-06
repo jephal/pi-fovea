@@ -30,7 +30,7 @@ export interface FileFacts {
   sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 6; // bump when extractor semantics change
+const CACHE_VERSION = 7; // bump when extractor semantics change
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods"]);
 const MAX_FILES = 24000;
 // Generated dependency manifests are enormous and carry no first-class routes.

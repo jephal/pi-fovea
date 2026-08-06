@@ -22,7 +22,7 @@ export type EdgeKind =
   | "tests"      // test file -> unit under test
   | "join"       // shared normalized literal (cross-language bridge)
   | "anchors"    // route anchor -> handler symbol (site-collapsed feature hub)
-| "cochange";  // git-history co-change conductance   // route anchor -> handler symbol
+  | "cochange";  // git-history co-change conductance
 
 export interface NodeRec {
   id: string;        // stable identity: "name@file" (methods: "Type.name@file")
@@ -30,6 +30,7 @@ export interface NodeRec {
   kind: NodeKind;
   file: string;      // repo-relative path
   line: number;      // 1-indexed
+  lineApproximate?: boolean; // legacy outlines only know the enclosing declaration
   sig: string;       // one-line signature for foveated rendering
   lang: string;      // ast-grep language name, or "config" / "text"
 }
@@ -65,6 +66,7 @@ export interface SymbolRec {
   kind: NodeKind;
   file: string;
   line: number;
+  lineApproximate?: boolean;
   sig: string;
   lang: string;
 }

@@ -17,7 +17,7 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 </div>
 
-pi-fovea hands the model a map of your repo on every prompt. The repo compiles once into a code graph across languages, where symbols, files, and route anchors join into one network. Each question becomes an interest vector that diffuses over the graph as heat. The renderer converts the field into a token-capped view: full signatures near your task, one-liners a hop away, a skeleton of the rest.
+pi-fovea hands the model a map of your repo on every prompt. The repo compiles once into a code graph across languages, where symbols, files, and route anchors join into one network. Each question becomes an interest vector that diffuses over the graph as heat. The renderer converts the field into a token-capped view: exact source locations and full signatures near your task, typed one-hop relationships next, and a skeleton of the rest.
 
 After each assistant turn the map re-syncs incrementally. Detection reads content hashes instead of tool events, so edits made by pi's edit/write tools, a fabric_exec inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all land identically. A clean turn stays silent. A turn that moves route anchors or warms files you have not looked at says so.
 
@@ -26,10 +26,12 @@ After each assistant turn the map re-syncs incrementally. Detection reads conten
 | Command | Ask | Answer |
 |---|---|---|
 | `fovea_sketch` | where is everything? | the repo as a silhouette, with feature anchors and inferred regions ranked by mass |
-| `fovea_focus` | what is this? | centered on a symbol, route path, or env key: hot nodes as signatures, neighbors as one-liners |
+| `fovea_focus` | what is this? | centered on a symbol, route path, or env key: exact hot signatures, typed direct relationships, then warm one-liners |
 | `fovea_dwell` | what else? | diffuses the field one step further and returns the delta |
 | `fovea_impact` | what does this touch? | warms everything a file, symbol, or PR base reaches across languages |
 | `grep` *(default override)* | where does this concept lead? | the same graph-backed focus through grep's familiar `pattern/path/glob/...` signature |
+
+Focus normalizes camelCase and common inflections, so an approximate name such as `switchServer` can resolve `switchingServers`. If a query is still uncertain, Fovea returns nearby symbols with locations instead of a dead miss. Direct graph edges are labeled (caller, callee, route, shared literal, co-change), while unrelated same-file siblings remain collapsed.
 
 The **Replace grep** toggle makes Fovea own Pi's `grep` tool slot. It is on by default. Familiar calls such as `grep({ pattern: "CreateUser", path: "src" })` navigate the code graph first; use `bash` with `rg` only when you need exact matching lines. Disable the toggle to restore the previous grep implementation. Changing the toggle reloads extensions so pi-fabric captures the same override and `pi.grep(...)` follows it inside `fabric_exec`.
 

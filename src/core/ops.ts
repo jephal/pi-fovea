@@ -11,11 +11,11 @@ import { hasAstGrep } from "./astgrep.js";
 import { assembleGraph, listFiles, loadFacts, type FileFacts } from "./build.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
-import { revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "./render.js";
+import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "./render.js";
 import { getSession, TK_ORDER } from "./session.js";
 import { detectBasins } from "./basins.js";
 import { classifyLiteral, normalizeLiteral, buildJoinIndex, type JoinIndex } from "./join.js";
-import type { Graph } from "./types.js";
+import type { Graph, NodeRec } from "./types.js";
 
 export interface OpResult {
   text: string;
@@ -81,7 +81,87 @@ export const ensureState = (root: string): RepoState => {
 
 // --- seed resolution ------------------------------------------------------------
 
-export interface SeedResolution { seeds: number[]; note: string; }
+export interface SeedSuggestion {
+  index: number;
+  name: string;
+  file: string;
+  line: number;
+  lineApproximate?: boolean;
+  score: number;
+}
+
+export interface SeedResolution {
+  seeds: number[];
+  note: string;
+  suggestions: SeedSuggestion[];
+}
+
+const QUERY_STOP_WORDS = new Set([
+  "a", "an", "and", "are", "do", "does", "find", "for", "happen", "happens", "how",
+  "in", "is", "of", "on", "please", "the", "this", "to", "what", "where", "which", "with",
+]);
+
+const stemIdentifier = (term: string): string => {
+  if (term.length > 5 && term.endsWith("ing")) return term.slice(0, -3);
+  if (term.length > 4 && term.endsWith("ies")) return `${term.slice(0, -3)}y`;
+  if (term.length > 4 && /(ches|shes|sses|xes|zes)$/.test(term)) return term.slice(0, -2);
+  if (term.length > 3 && term.endsWith("s") && !term.endsWith("ss")) return term.slice(0, -1);
+  return term;
+};
+
+const identifierTerms = (value: string): string[] => {
+  const split = value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((term) => term.length > 1 && !QUERY_STOP_WORDS.has(term))
+    .map(stemIdentifier)
+    .filter((term) => !QUERY_STOP_WORDS.has(term));
+  return [...new Set(split)];
+};
+
+const shortSymbolName = (name: string): string => name.slice(name.lastIndexOf(".") + 1);
+
+const diceSimilarity = (a: string, b: string): number => {
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+  const left = new Map<string, number>();
+  for (let i = 0; i < a.length - 1; i++) {
+    const pair = a.slice(i, i + 2);
+    left.set(pair, (left.get(pair) ?? 0) + 1);
+  }
+  let overlap = 0;
+  for (let i = 0; i < b.length - 1; i++) {
+    const pair = b.slice(i, i + 2);
+    const count = left.get(pair) ?? 0;
+    if (count > 0) {
+      overlap++;
+      left.set(pair, count - 1);
+    }
+  }
+  return (2 * overlap) / (a.length + b.length - 2);
+};
+
+const symbolSimilarity = (query: string, node: NodeRec): number => {
+  const queryTerms = identifierTerms(query);
+  const candidateTerms = identifierTerms(shortSymbolName(node.name));
+  const candidateSet = new Set(candidateTerms);
+  const shared = queryTerms.filter((term) => candidateSet.has(term)).length;
+  const coverage = queryTerms.length ? shared / queryTerms.length : 0;
+  const precision = candidateTerms.length ? shared / candidateTerms.length : 0;
+  const tokenScore = 0.72 * coverage + 0.28 * precision;
+  const charScore = diceSimilarity(queryTerms.join(""), candidateTerms.join(""));
+  return Math.max(tokenScore, charScore);
+};
+
+const sameIdentifierTerms = (query: string, name: string): boolean => {
+  const queryTerms = identifierTerms(query);
+  const candidateTerms = identifierTerms(shortSymbolName(name));
+  if (!queryTerms.length || queryTerms.length !== candidateTerms.length) return false;
+  const candidateSet = new Set(candidateTerms);
+  return queryTerms.every((term) => candidateSet.has(term));
+};
 
 export const resolveSeeds = (state: RepoState, query: string): SeedResolution => {
   const g = state.graph;
@@ -134,6 +214,13 @@ export const resolveSeeds = (state: RepoState, query: string): SeedResolution =>
       }
     }
   }
+  if (scored.size === 0) {
+    g.nodes.forEach((node, i) => {
+      if (node.kind !== "file" && node.kind !== "anchor" && sameIdentifierTerms(q, node.name)) {
+        bump(i, 0.7);
+      }
+    });
+  }
   // File path suffix (e.g. "web/api.ts").
   for (const f of g.files) {
     if (f === q || f.endsWith(`/${q}`)) {
@@ -148,7 +235,22 @@ export const resolveSeeds = (state: RepoState, query: string): SeedResolution =>
   const seeds = ranked.map(([i]) => i);
   const names = ranked.slice(0, 4).map(([i, s]) => `${g.nodes[i]!.name}${s < 1 ? "~" : ""}`);
   const note = seeds.length ? `${seeds.length} seeds (${names.join(", ")}${seeds.length > 4 ? ", …" : ""})` : "no seeds matched";
-  return { seeds, note };
+  const suggestions = seeds.length
+    ? []
+    : g.nodes
+      .map((node, index) => ({ node, index, score: symbolSimilarity(q, node) }))
+      .filter(({ node, score }) => node.kind !== "file" && node.kind !== "anchor" && score >= 0.34)
+      .sort((a, b) => b.score - a.score || a.node.name.localeCompare(b.node.name) || a.node.file.localeCompare(b.node.file))
+      .slice(0, 5)
+      .map(({ node, index, score }) => ({
+        index,
+        name: node.name,
+        file: node.file,
+        line: node.line,
+        lineApproximate: node.lineApproximate,
+        score,
+      }));
+  return { seeds, note, suggestions };
 };
 
 const seedVector = (n: number, seeds: number[]): Float64Array => {
@@ -260,12 +362,38 @@ export const focus = (root: string, query: string, budget?: number): OpResult =>
   const g = state.graph;
   const session = getSession(root);
   const B = clampBudget(budget, 2000);
-  const { seeds, note } = resolveSeeds(state, query);
+  const { seeds, note, suggestions } = resolveSeeds(state, query);
   if (!seeds.length) {
+    const renderMiss = (count: number): string => {
+      const nearby = suggestions.slice(0, count).map((suggestion) => {
+        const node = g.nodes[suggestion.index]!;
+        return `  ? ${node.name} — ${formatNodeLocation(node)} — ${node.sig}`;
+      });
+      const guidance = suggestions.length
+        ? "Retry fovea_focus with one of these names, a route path (/api/...), or a file path."
+        : "Try a symbol name, a route path (/api/...), or a file path. Run fovea_sketch for the map silhouette first.";
+      return [
+        `fovea focus "${query}": ${note}.`,
+        ...(nearby.length ? ["Nearby symbols:", ...nearby] : []),
+        guidance,
+      ].join("\n");
+    };
+    let shown = suggestions.length;
+    let text = renderMiss(shown);
+    while (shown > 0 && tokenEstimate(text) > B) text = renderMiss(--shown);
     return {
-      text: `fovea focus "${query}": ${note}. Try a symbol name, a route path (/api/...), or a file path. Run fovea_sketch for the map silhouette first.`,
-      tokens: 0,
-      details: { seeds: 0 },
+      text,
+      tokens: tokenEstimate(text),
+      details: {
+        seeds: 0,
+        suggestions: suggestions.slice(0, shown).map(({ name, file, line, lineApproximate, score }) => ({
+          name,
+          file,
+          line,
+          lineApproximate,
+          score: Number(score.toFixed(3)),
+        })),
+      },
     };
   }
   const key = `${state.version}:${[...seeds].sort((a, b) => a - b).join(",")}`;
@@ -280,6 +408,7 @@ export const focus = (root: string, query: string, budget?: number): OpResult =>
   const fit = revealFoveated(g, field, {
     header: `fovea focus "${query}" · ${note} · t=${t}`,
     disclosed: session.disclosed,
+    seeds,
     budget: B,
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);
@@ -315,6 +444,7 @@ export const dwell = (root: string, factor?: number, budget?: number): OpResult 
   const fit = revealFoveated(g, field, {
     header: `fovea dwell · t ${from}→${to} · delta`,
     disclosed: session.disclosed,
+    seeds: session.seeds,
     budget: B,
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);

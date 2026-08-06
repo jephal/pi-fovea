@@ -83,10 +83,52 @@ export const groupByLang = (files: string[]): Map<string, string[]> => {
   return m;
 };
 
-// `ast-grep outline` — uniform symbol source across languages. Text format:
-//   <file>
-//   <line>: <signature source line>
-//        <kind>: <name>        (children: methods/fields, indented)
+// `ast-grep outline` is the uniform symbol source across languages.
+// Expanded JSON is primary; the legacy text view remains as a compatibility fallback.
+export interface OutlineRange {
+  start: { line: number; column: number };
+  end?: { line: number; column: number };
+}
+
+export interface OutlineSymbol {
+  role: "item" | "member";
+  symbolType: string;
+  name: string;
+  range: OutlineRange;
+  signature: string;
+  astKind?: string;
+  members?: OutlineSymbol[];
+}
+
+export interface OutlineFile {
+  path: string;
+  language: string;
+  items: OutlineSymbol[];
+}
+
+// Expanded JSON preserves each member's own range and signature. Return
+// undefined when the installed ast-grep predates this interface so callers can
+// fall back without presenting parent locations as exact member locations.
+export const outlineStructured = (files: string[], lang: string, cwd: string): OutlineFile[] | undefined => {
+  const out: OutlineFile[] = [];
+  for (let i = 0; i < files.length; i += CHUNK) {
+    const stdout = run(
+      ["outline", "--json=compact", "--view=expanded", ...files.slice(i, i + CHUNK)],
+      cwd,
+    );
+    if (!stdout.trim()) return undefined;
+    try {
+      const parsed = JSON.parse(stdout) as OutlineFile[];
+      if (!Array.isArray(parsed)) return undefined;
+      for (const file of parsed) out.push(file);
+    } catch {
+      return undefined;
+    }
+  }
+  void lang;
+  return out;
+};
+
 export const outline = (files: string[], lang: string, cwd: string): string => {
   let out = "";
   for (let i = 0; i < files.length; i += CHUNK) {

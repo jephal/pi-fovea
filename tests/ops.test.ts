@@ -57,6 +57,37 @@ describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
     expect(r.text).toContain("loadUser");
   });
 
+
+  it("recovers equivalent camelCase and inflected symbol queries", () => {
+    resetSessions();
+    const plural = focus(FIXTURE, "loadsUsers", 1200);
+    expect(Number(plural.details.seeds)).toBeGreaterThan(0);
+    expect(plural.text).toContain("loadUser");
+
+    resetSessions();
+    const switchQuery = focus(FIXTURE, "switchServer", 1200);
+    expect(Number(switchQuery.details.seeds)).toBeGreaterThan(0);
+    expect(switchQuery.text).toContain("ClientConnection.switchingServers");
+    expect(switchQuery.text).toContain("web/server-switcher.ts:2");
+  });
+
+  it("suggests nearby symbols when a typo cannot seed the graph", () => {
+    resetSessions();
+    const r = focus(FIXTURE, "loadUsr", 256);
+    expect(r.tokens).toBeLessThanOrEqual(256);
+    expect(r.details.seeds).toBe(0);
+    expect(r.text).toContain("Nearby symbols:");
+    expect(r.text).toContain("loadUser");
+    expect(Array.isArray(r.details.suggestions)).toBe(true);
+  });
+
+  it("explains direct call relationships before the thermal periphery", () => {
+    resetSessions();
+    const r = focus(FIXTURE, "loadUser", 1600);
+    expect(r.text).toContain("← caller");
+    expect(r.text).toContain("GetUserHandler");
+  });
+
   it("second identical focus returns a delta, not a repeat", () => {
     resetSessions();
     const a = focus(FIXTURE, "loadUser", 2000);

@@ -7,7 +7,7 @@ import { extractAnchors, extractFileRoutes } from "../src/core/anchors.js";
 import type { SymbolRec } from "../src/core/types.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
-const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "web/airports.controller.ts", "worker/jobs.py", "worker/search.rs"];
+const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "web/airports.controller.ts", "web/server-switcher.ts", "worker/jobs.py", "worker/search.rs"];
 const ECO = ["server/mux.go", "server/SpringUsersController.java", "worker/urls.py", "server/routes.rb", "server/router.ex", "server/App.kt", "web/api.ts", "worker/jobs.py"];
 const FILE_ROUTES = ["app/api/orders/route.ts", "app/(shop)/reports/page.tsx", "pages/api/health.ts", "src/routes/channels/[name]/+server.ts", "server/api/session.get.ts"];
 const ALL = [...CODE, "openapi.yaml"];
@@ -38,6 +38,26 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(byId.get("UserName@web/types.ts")?.kind).toBe("type");
     expect(byId.get("sync_users@worker/jobs.py")?.kind).toBe("function");
     expect(byId.get("fetch_all@worker/jobs.py")).toBeTruthy();
+
+    expect(byId.get("AirportsController@web/airports.controller.ts")).toMatchObject({
+      line: 5,
+      sig: "export class AirportsController {",
+    });
+    expect(byId.get("AirportsController.search@web/airports.controller.ts")).toMatchObject({
+      line: 7,
+      sig: "search(@Query('q') q?: string): string[] {",
+    });
+    expect(byId.get("AirportsController.find@web/airports.controller.ts")?.line).toBe(12);
+    expect(byId.get("ClientConnection.switchingServers@web/server-switcher.ts")).toMatchObject({
+      line: 2,
+      sig: "private switchingServers = false",
+    });
+    expect(byId.get("ClientConnection.connectToServer@web/server-switcher.ts")?.line).toBe(4);
+    expect(byId.get("Router.GET@server/main.go")?.line).toBe(21);
+    expect(byId.get("User.id@web/api.ts")?.line).toBe(4);
+    expect(byId.get("UserSearch.new@worker/search.rs")?.line).toBe(9);
+    expect(byId.get("UserSearch.fetch@worker/search.rs")?.line).toBe(13);
+    expect(byId.get("AirportsController.search@web/airports.controller.ts")?.lineApproximate).not.toBe(true);
   });
 
   it("extracts imports across languages", () => {

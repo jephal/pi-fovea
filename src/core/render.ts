@@ -4,13 +4,73 @@
 // Budget conformance is a prefix fit: candidates sorted by heat, binary search
 // on prefix length — aider's render-and-count loop generalized to a field.
 
-import type { Graph } from "./types.js";
+import type { Edge, EdgeKind, Graph, NodeRec } from "./types.js";
 
 export const tokenEstimate = (text: string): number => Math.ceil(text.length / 4);
 
 export const HOT_TIER = 0.3;
 export const WARM_TIER = 0.02;
 export const HEAT_EPS = 1e-9;
+export const MAX_UNRELATED_WARM_PER_FILE = 4;
+
+export const formatNodeLocation = (node: NodeRec): string => {
+  if (node.kind === "file" || node.line <= 0) return node.file;
+  if (node.lineApproximate) return `${node.file} (member line unavailable)`;
+  return `${node.file}:${node.line}`;
+};
+
+interface DirectRelation {
+  kind: EdgeKind;
+  label: string;
+  priority: number;
+  weight: number;
+}
+
+const RELATION_PRIORITY: Record<EdgeKind, number> = {
+  contains: 0,
+  cochange: 1,
+  imports: 2,
+  join: 3,
+  anchors: 4,
+  tests: 5,
+  inherits: 6,
+  invokes: 7,
+};
+
+const relationLabel = (edge: Edge, seedAtA: boolean, candidate: NodeRec): string => {
+  switch (edge.kind) {
+    case "invokes": return seedAtA ? "→ callee" : "← caller";
+    case "imports": return seedAtA ? "→ import" : "← importer";
+    case "tests": return seedAtA ? "→ subject" : "← test";
+    case "inherits": return seedAtA ? "→ parent" : "← subclass";
+    case "anchors": return seedAtA ? candidate.kind === "file" ? "→ feature file" : "→ handler" : "← route";
+    case "join": return "↔ shared literal";
+    case "cochange": return "↔ co-change";
+    case "contains": return seedAtA ? "◇ member" : "◇ file";
+  }
+};
+
+const directRelations = (g: Graph, seeds: ReadonlySet<number>): Map<number, DirectRelation> => {
+  const out = new Map<number, DirectRelation>();
+  for (const edge of g.edges) {
+    const aSeed = seeds.has(edge.a);
+    const bSeed = seeds.has(edge.b);
+    if (aSeed === bSeed) continue;
+    const node = aSeed ? edge.b : edge.a;
+    const relation: DirectRelation = {
+      kind: edge.kind,
+      label: relationLabel(edge, aSeed, g.nodes[node]!),
+      priority: RELATION_PRIORITY[edge.kind],
+      weight: edge.w,
+    };
+    const current = out.get(node);
+    if (!current || relation.priority > current.priority ||
+      (relation.priority === current.priority && relation.weight > current.weight)) {
+      out.set(node, relation);
+    }
+  }
+  return out;
+};
 
 export interface FitResult {
   text: string;
@@ -33,6 +93,7 @@ export interface RevealOptions {
   header?: string;
   disclosed?: ReadonlySet<string>;
   exclude?: ReadonlySet<string>; // hard exclusion (e.g. seeds for impact)
+  seeds?: readonly number[];
   budget: number;
   maxCandidates?: number;
 }
@@ -47,17 +108,25 @@ export const revealFoveated = (
   if (vmax <= 0) {
     return { text: `${opts.header ?? "fovea"}\n(nothing lit — field is zero)`, tokens: 0, shown: 0, suppressed: 0, litTotal: 0, truncated: false, revealedIds: [] };
   }
+  const seedSet = new Set(opts.seeds ?? []);
+  const relations = directRelations(g, seedSet);
   const candidates: number[] = [];
   let suppressed = 0;
   for (let i = 0; i < g.nodes.length; i++) {
     const h = field[i]! / vmax;
-    if (h < WARM_TIER * 0.1 || field[i]! < HEAT_EPS) continue;
+    const direct = relations.get(i);
+    if ((!direct || direct.kind === "contains") && (h < WARM_TIER * 0.1 || field[i]! < HEAT_EPS)) continue;
     const id = g.nodes[i]!.id;
     if (opts.exclude?.has(id)) continue;
     if (opts.disclosed?.has(id)) { suppressed++; continue; }
     candidates.push(i);
   }
-  candidates.sort(cmpNodes(g, field));
+  const byHeat = cmpNodes(g, field);
+  candidates.sort((a, b) => {
+    const aPriority = seedSet.has(a) ? 2 : relations.get(a)?.kind === "contains" ? 0 : relations.has(a) ? 1 : 0;
+    const bPriority = seedSet.has(b) ? 2 : relations.get(b)?.kind === "contains" ? 0 : relations.has(b) ? 1 : 0;
+    return bPriority - aPriority || byHeat(a, b);
+  });
   const cap = opts.maxCandidates ?? 400;
   const capped = candidates.slice(0, cap);
   const litTotal = capped.length;
@@ -67,19 +136,39 @@ export const revealFoveated = (
   // budget can shrink the periphery too; appending is byte-monotone, hence the
   // binary search is exact and the output can never exceed the budget.
   const glowCounts = new Map<string, number>();
+  const warmPerFile = new Map<string, number>();
   const lines: string[] = [];
   const ids: string[] = [];
   for (const i of capped) {
-    const n = g.nodes[i]!;
+    const node = g.nodes[i]!;
     const h = field[i]! / vmax;
-    if (h >= HOT_TIER) {
-      lines.push(n.kind === "file" ? `▒ ${n.file}` : n.kind === "anchor" ? `⚑ ${n.sig}` : `▲ ${n.file}:${n.line}  ${n.sig}`);
-      ids.push(n.id);
-    } else if (h >= WARM_TIER) {
-      lines.push(`  · ${n.name} (${n.kind}) ${n.file}:${n.line}`);
-      ids.push(n.id);
+    const relation = relations.get(i);
+    const semanticRelation = relation && relation.kind !== "contains" ? relation : undefined;
+    const context = seedSet.has(i) ? "  [focus]" : relation ? `  [${relation.label}]` : "";
+    if (h >= HOT_TIER || seedSet.has(i)) {
+      lines.push(
+        node.kind === "file"
+          ? `▒ ${node.file}${context}`
+          : node.kind === "anchor"
+            ? `⚑ ${node.sig}${context}`
+            : `▲ ${formatNodeLocation(node)}  ${node.sig}${context}`,
+      );
+      ids.push(node.id);
+    } else if (h >= WARM_TIER || semanticRelation) {
+      const warmCount = warmPerFile.get(node.file) ?? 0;
+      if (!semanticRelation && node.kind !== "file" && warmCount >= MAX_UNRELATED_WARM_PER_FILE) {
+        glowCounts.set(node.file, (glowCounts.get(node.file) ?? 0) + 1);
+        continue;
+      }
+      if (!semanticRelation && node.kind !== "file") warmPerFile.set(node.file, warmCount + 1);
+      lines.push(
+        semanticRelation
+          ? `  ${semanticRelation.label}  ${node.name} (${node.kind}) ${formatNodeLocation(node)}`
+          : `  · ${node.name} (${node.kind}) ${formatNodeLocation(node)}`,
+      );
+      ids.push(node.id);
     } else {
-      glowCounts.set(n.file, (glowCounts.get(n.file) ?? 0) + 1);
+      glowCounts.set(node.file, (glowCounts.get(node.file) ?? 0) + 1);
     }
   }
   const glowLines = [...glowCounts.entries()]
@@ -89,11 +178,12 @@ export const revealFoveated = (
   const individual = lines.length;
 
   const header = `${opts.header ?? "fovea"} · lit ${litTotal}${suppressed ? `, ${suppressed} seen` : ""}`;
+  const collapsed = litTotal - individual;
   const renderK = (k: number): string => {
     const shownIndiv = Math.min(k, individual);
-    const remaining = litTotal - shownIndiv;
+    const remaining = collapsed + individual - shownIndiv;
     const footer = remaining > 0
-      ? `\n… ${remaining} lit below threshold — call fovea_dwell to expand (t grows, periphery sharpens)`
+      ? `\n… ${remaining} low-acuity nodes remain collapsed or outside budget — fovea_dwell returns newly warmed neighbors`
       : "";
     return header + "\n" + items.slice(0, k).join("\n") + footer;
   };

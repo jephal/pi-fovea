@@ -61,11 +61,11 @@ All four tools call the same kernel at different timescales with different seeds
 | Tool | Seeds | $t$ |
 |---|---|:--:|
 | sketch | anchors ∪ basins (cap 64) | $16$ |
-| focus | resolved symbols / literal sites | $4$ |
+| focus | resolved symbols / literal sites | $2$ |
 | dwell | same source re-seeded | $\times 2$ each call |
 | impact | changed files | $4$ |
 
-The renderer then reads the field $v(t)$ and normalizes by the peak $v_{\max}$. A node above $0.3 v_{\max}$ prints its full signature; a node above $0.02 v_{\max}$ prints as a one-liner; the remainder collapses to per-file glow counts. A binary search over the heat-sorted candidate list produces a monotonic prefix that never passes the $budget$ in tokens.
+The renderer then reads the field $v(t)$ and normalizes by the peak $v_{\max}$. A node above $0.3 v_{\max}$ prints its full signature; a node above $0.02 v_{\max}$ prints as a one-liner; the remainder collapses to per-file glow counts. Typed one-hop neighbors of the focus are presented before anonymous thermal periphery, and unrelated warm nodes are capped per file so a large class cannot consume the view. A binary search over the resulting fixed candidate order still produces a monotonic prefix that never passes the $budget$ in tokens.
 
 `dwell` carries a `disclosed` set across the session, so repeat calls return the delta alone.
 

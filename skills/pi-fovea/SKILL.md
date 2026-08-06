@@ -10,8 +10,8 @@ pi-fovea maintains a cross-language code graph of the working repository — rou
 ## The loop
 
 1. **`fovea_sketch`** — silhouettes only. Route/anchor inventory plus directory blobs ranked by heat. Start here in an unfamiliar repo. ~256–1024 tokens.
-2. **`fovea_focus` `<query>`** — point at a symbol name, route path (`/api/users/{id}`), env key, or file path. Hot nodes come back with full signatures; warm neighbors as one-liners; the periphery stays collapsed. Already-shown nodes are suppressed, so repeated focus calls stay cheap.
-3. **`fovea_dwell`** — optional second look. If a focus footer says more nodes are lit below the token threshold, dwell (diffusion time ×2) surfaces exactly those newcomers.
+2. **`fovea_focus` `<query>`** — point at a symbol name (close spellings work), route path (`/api/users/{id}`), env key, or file path. Hot nodes carry exact source locations and signatures; direct callers/callees and other typed edges are labeled; the periphery stays collapsed. A true miss suggests nearby symbols. Already-shown nodes are suppressed, so repeated focus calls stay cheap.
+3. **`fovea_dwell`** — optional second look. If a focus footer reports a remaining low-acuity periphery, dwell (diffusion time ×2) returns newly warmed neighbors.
 4. **`fovea_impact`** — blast radius. Seed with explicit repo-relative `files`, symbol names for what-if analysis, or uncommitted changes (`base` works PR-style against a ref). Output is the predicted co-change cascade ordered by warmth.
 
 All four accept `maxTokens` (256–16000). Budget is roughly 4 chars per token.

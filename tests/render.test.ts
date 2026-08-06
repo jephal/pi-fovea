@@ -49,6 +49,67 @@ describe("revealFoveated", () => {
     expect(fit.revealedIds).toContain("hub@src/hub.ts");
   });
 
+
+  it("labels direct graph relationships from the focus", () => {
+    const nodes: NodeRec[] = [
+      { id: "focus@src/focus.ts", name: "focus", kind: "function", file: "src/focus.ts", line: 5, sig: "function focus()", lang: "TypeScript" },
+      { id: "callee@src/callee.ts", name: "callee", kind: "function", file: "src/callee.ts", line: 10, sig: "function callee()", lang: "TypeScript" },
+      { id: "caller@src/caller.ts", name: "caller", kind: "function", file: "src/caller.ts", line: 20, sig: "function caller()", lang: "TypeScript" },
+    ];
+    const g: Graph = {
+      nodes,
+      edges: [
+        { a: 0, b: 1, kind: "invokes", w: 0.7 },
+        { a: 2, b: 0, kind: "invokes", w: 0.7 },
+      ],
+      byName: new Map(),
+      byFile: new Map(),
+      anchors: [],
+      files: [],
+    };
+    const fit = revealFoveated(g, new Float64Array([1, 0.005, 0.005]), {
+      header: "t",
+      budget: 1000,
+      seeds: [0],
+    });
+    expect(fit.text).toContain("→ callee  callee");
+    expect(fit.text).toContain("← caller  caller");
+  });
+
+  it("collapses anonymous warm siblings instead of flooding one file", () => {
+    const nodes: NodeRec[] = [
+      { id: "focus@src/large.ts", name: "focus", kind: "method", file: "src/large.ts", line: 10, sig: "focus()", lang: "TypeScript" },
+    ];
+    for (let i = 0; i < 10; i++) {
+      nodes.push({ id: `sibling${i}@src/large.ts`, name: `sibling${i}`, kind: "method", file: "src/large.ts", line: 20 + i, sig: `sibling${i}()`, lang: "TypeScript" });
+    }
+    const g: Graph = { nodes, edges: [], byName: new Map(), byFile: new Map(), anchors: [], files: [] };
+    const fit = revealFoveated(g, new Float64Array([1, ...Array(10).fill(0.1)]), {
+      header: "t",
+      budget: 2000,
+      seeds: [0],
+    });
+    expect(fit.text.match(/^  · sibling/gm)).toHaveLength(4);
+    expect(fit.text).toContain("~ +6 more in src/large.ts");
+  });
+
+  it("never presents a legacy parent line as an exact member location", () => {
+    const node: NodeRec = {
+      id: "Client.connect@src/client.ts",
+      name: "Client.connect",
+      kind: "method",
+      file: "src/client.ts",
+      line: 86,
+      lineApproximate: true,
+      sig: "method Client.connect",
+      lang: "TypeScript",
+    };
+    const g: Graph = { nodes: [node], edges: [], byName: new Map(), byFile: new Map(), anchors: [], files: [] };
+    const fit = revealFoveated(g, new Float64Array([1]), { header: "t", budget: 500, seeds: [0] });
+    expect(fit.text).toContain("src/client.ts (member line unavailable)");
+    expect(fit.text).not.toContain("src/client.ts:86");
+  });
+
   it("disclosed nodes are suppressed from later reveals (delta bookkeeping)", () => {
     const g = fanGraph(10);
     const csr = buildCsr(g);
@@ -68,7 +129,7 @@ describe("revealFoveated", () => {
     s[0] = 1;
     const fit = revealFoveated(g, heatAt(csr, s, 3), { header: "fovea focus x", budget: 256 });
     expect(fit.tokens).toBeLessThanOrEqual(256);
-    expect(fit.text).toContain("below threshold"); // periphery was truncated, budget intact
+    expect(fit.text).toContain("low-acuity nodes remain collapsed"); // periphery was truncated, budget intact
     expect(fit.truncated).toBe(true);
   });
 });

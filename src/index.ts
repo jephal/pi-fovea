@@ -156,9 +156,9 @@ export default function fovea(pi: ExtensionAPI) {
     name: "fovea_focus",
     label: "Fovea Focus",
     description:
-      "Center the fovea on a query (symbol name, route path like /api/users/{id}, env key, or file). Returns a foveated field: hot nodes with full signatures, warm nodes as one-liners, the periphery collapsed. Sets the session focus that fovea_dwell deepens. Only new information is returned — already-shown nodes are suppressed.",
+      "Center the fovea on a query (symbol name or close spelling, route path like /api/users/{id}, env key, or file). Returns exact hot signatures, typed direct relationships, warm one-liners, and a collapsed periphery. Misses include nearby symbols. Sets the session focus that fovea_dwell deepens; already-shown nodes are suppressed.",
     parameters: Type.Object({
-      query: Type.String({ description: "Symbol name, route path, env key, or repo-relative file path." }),
+      query: Type.String({ description: "Symbol name or close spelling, route path, env key, or repo-relative file path." }),
       root: RootParam,
       maxTokens: BudgetParam,
     }),
@@ -177,7 +177,7 @@ export default function fovea(pi: ExtensionAPI) {
     name: "fovea_dwell",
     label: "Fovea Dwell",
     description:
-      "Let the current focus diffuse longer (heat time t grows, default x2) and return only the newly-luminous periphery. Use after fovea_focus when the footer says more nodes are lit below threshold.",
+      "Let the current focus diffuse longer (heat time t grows, default x2) and return only newly warmed neighbors. Use after fovea_focus when its footer reports a remaining low-acuity periphery.",
     parameters: Type.Object({
       factor: Type.Optional(Type.Number({ description: "Multiply diffusion time by this (default 2).", minimum: 1.1, maximum: 16 })),
       root: RootParam,

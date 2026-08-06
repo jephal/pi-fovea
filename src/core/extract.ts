@@ -9,7 +9,10 @@ import {
   groupByLang,
   isConfigFile,
   outline,
+  outlineStructured,
   patternRunAll,
+  type OutlineFile,
+  type OutlineSymbol,
 } from "./astgrep.js";
 import type {
   CallSite,
@@ -102,6 +105,104 @@ export const deriveName = (sig: string, lang: string, parentHint?: string): Name
   return { name: first.replace(/^[*&]+/, "") || "?", kind: "decl" };
 };
 
+const OUTLINE_KINDS: Record<string, NodeKind> = {
+  class: "class",
+  struct: "class",
+  object: "class",
+  interface: "interface",
+  trait: "interface",
+  protocol: "interface",
+  enum: "type",
+  type: "type",
+  alias: "type",
+  function: "function",
+  method: "method",
+  field: "field",
+  property: "field",
+  constant: "decl",
+  variable: "decl",
+};
+
+const outlineKind = (symbol: OutlineSymbol, lang: string): NodeKind => {
+  if (symbol.symbolType === "constructor") return "method";
+  const mapped = OUTLINE_KINDS[symbol.symbolType];
+  if (symbol.role === "member" && mapped) return mapped;
+  const derived = deriveName(symbol.signature, lang).kind;
+  if (derived !== "decl") return derived;
+  return mapped ?? derived;
+};
+
+const identifierRe = (name: string): RegExp =>
+  new RegExp(`(^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9_$]|$)`);
+
+const topLocation = (
+  file: string,
+  item: OutlineSymbol,
+  cwd: string,
+  sourceCache: Map<string, string[]>,
+): { line: number; sig: string } => {
+  let line = item.range.start.line + 1;
+  let sig = cleanSig(item.signature || item.name);
+  if (item.name && (!identifierRe(item.name).test(sig) || /^@/.test(sig))) {
+    let lines = sourceCache.get(file);
+    if (!lines) {
+      try {
+        lines = readFileSync(join(cwd, file), "utf8").split("\n");
+      } catch {
+        lines = [];
+      }
+      sourceCache.set(file, lines);
+    }
+    const end = Math.min(lines.length - 1, item.range.end?.line ?? item.range.start.line + 12);
+    for (let i = item.range.start.line; i <= end; i++) {
+      const candidate = lines[i];
+      if (candidate && identifierRe(item.name).test(candidate)) {
+        line = i + 1;
+        sig = cleanSig(candidate);
+        break;
+      }
+    }
+  }
+  return { line, sig };
+};
+
+const parseStructuredOutline = (files: OutlineFile[], cwd: string): SymbolRec[] => {
+  const out: SymbolRec[] = [];
+  const sourceCache = new Map<string, string[]>();
+  for (const record of files) {
+    const file = record.path.replace(/^\.\//, "");
+    const concreteParents = new Set(
+      record.items.filter((item) => item.symbolType !== "object").map((item) => item.name),
+    );
+    for (const item of record.items) {
+      const kind = outlineKind(item, record.language);
+      let name = item.name;
+      if (kind === "method") {
+        const derived = deriveName(item.signature, record.language);
+        if (derived.kind === "method" && derived.name.includes(".")) name = derived.name;
+      }
+      // Rust impl/object outlines repeat the concrete type. Keep its members,
+      // but do not emit a duplicate parent node when the struct is local.
+      if (!(item.symbolType === "object" && concreteParents.has(item.name))) {
+        const location = topLocation(file, item, cwd, sourceCache);
+        out.push({ name, kind, file, line: location.line, sig: location.sig, lang: record.language });
+      }
+      for (const member of item.members ?? []) {
+        const memberKind = outlineKind(member, record.language);
+        out.push({
+          name: `${item.name}.${member.name}`,
+          kind: memberKind,
+          file,
+          line: member.range.start.line + 1,
+          sig: cleanSig(member.signature || `${memberKind} ${item.name}.${member.name}`),
+          lang: record.language,
+        });
+      }
+    }
+  }
+  return dedupe(out, (symbol) => `${symbol.name}@${symbol.file}`);
+};
+
 const parseOutlineText = (text: string, lang: string): SymbolRec[] => {
   const out: SymbolRec[] = [];
   let file = "";
@@ -128,7 +229,8 @@ const parseOutlineText = (text: string, lang: string): SymbolRec[] => {
           name: `${top.name}.${name}`,
           kind: kindOf(child[2]!),
           file,
-          line: top.line, // outline children carry no line; point at parent
+          line: top.line,
+          lineApproximate: true,
           sig: `${kindOf(child[2]!)} ${top.name}.${name}`,
           lang,
         });
@@ -145,11 +247,19 @@ const parseOutlineText = (text: string, lang: string): SymbolRec[] => {
 export const extractSymbols = (files: string[], cwd: string): SymbolRec[] => {
   const out: SymbolRec[] = [];
   for (const [lang, langFiles] of groupByLang(files)) {
+    const structured = outlineStructured(langFiles, lang, cwd);
+    if (structured) {
+      const parsed = parseStructuredOutline(structured, cwd);
+      if (parsed.length || structured.some((file) => file.items.length > 0)) {
+        pushAll(out, parsed);
+        continue;
+      }
+    }
     const text = outline(langFiles, lang, cwd);
     if (!text.trim()) continue;
     pushAll(out, parseOutlineText(text, lang));
   }
-  return out.filter((s) => s.file);
+  return out.filter((symbol) => symbol.file);
 };
 
 // --- imports ------------------------------------------------------------------
