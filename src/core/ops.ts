@@ -90,9 +90,25 @@ export const resolveSeeds = (state: RepoState, query: string): SeedResolution =>
   const terms = q.split(/\s+/).filter((t) => t.length > 1);
 
   // Literal route: treat the query itself as a join token (path/env/word).
-  if (classifyLiteral(q)) {
-    for (const occ of state.joinIndex.byKey.get(normalizeLiteral(q, classifyLiteral(q)!))?.occ ?? []) {
-      bump(occ.node, 1);
+  const cls = classifyLiteral(q);
+  if (cls) {
+    const norm = normalizeLiteral(q, cls);
+    for (const occ of state.joinIndex.byKey.get(norm)?.occ ?? []) bump(occ.node, 1);
+    if (cls === "path") {
+      // Route-prefix queries ("/api/airports") seed everything mounted below
+      // them — the query is rarely a literal in code, which is the point: the
+      // model shouldn't have to guess the full route string to look at it.
+      const under = `${norm}/`;
+      for (const [key, bucket] of state.joinIndex.byKey) {
+        if (bucket.cls !== "path" || !key.startsWith(under)) continue;
+        for (const occ of bucket.occ) bump(occ.node, 0.8);
+      }
+      // Anchors whose route sits under the query get seeded directly.
+      state.graph.nodes.forEach((n, i) => {
+        if (n.kind !== "anchor") return;
+        const route = n.name.slice(n.name.indexOf(" ") + 1);
+        if (route === norm || route.startsWith(under)) bump(i, 0.9);
+      });
     }
   }
 

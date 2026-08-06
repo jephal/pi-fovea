@@ -132,6 +132,8 @@ Drop `.fovea/rules.json` in a repo to extend anchor detection beyond the built-i
 
 Changing the rules file invalidates **only** the anchor extraction cache — green-node reuse one level up.
 
+A rule may additionally declare `prefixPattern` (e.g. NestJS `@Controller('api/airports')`) so per-method paths like `@Get('search')` compose into the full router-visible anchor `GET /api/airports/search` — see `ts-http-decorator*` in `src/core/anchors.ts`.
+
 ## How the graph is joined
 
 - **imports / contains / inherits / tests** — outline-derived; call edges specificity-tiered, with language builtins and log/test entry points warded off

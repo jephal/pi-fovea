@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
-import { groupByLang, patternRun } from "./astgrep.js";
+import { groupByLang, patternRun, patternRunAll } from "./astgrep.js";
 import { PATH_TOKEN_RE } from "./extract.js";
 import { classifyLiteral, normalizeLiteral } from "./join.js";
 import type { Anchor } from "./types.js";
@@ -18,6 +18,12 @@ export interface AnchorRule {
   pattern: string;
   methods: string; // regex tested against the captured method metavar
   kind: string;
+  /**
+   * Optional class-level prefix patterns (e.g. NestJS '@Controller("api/x")').
+   * Their $P captures are collected per file; a matched route path is composed
+   * prefix + suffix so the anchor id is the full router-visible path.
+   */
+  prefixPattern?: string[];
 }
 
 const PLACEHOLDER_ONLY = /^(:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$/;
@@ -53,6 +59,16 @@ export const DEFAULT_PACK: AnchorRule[] = [
     pattern: '@$M("$P")',
     methods: "^(?i:get|post|put|delete|patch|options|head)$",
     kind: "route",
+    prefixPattern: ['@Controller("$P")', "@Controller('$P')"],
+  },
+  {
+    // Single-quotes dominate real NestJS codebases (NOMAD, starters, docs).
+    id: "ts-http-decorator-singlequote",
+    langs: ["TypeScript", "Tsx"],
+    pattern: "@$M('$P')",
+    methods: "^(?i:get|post|put|delete|patch|options|head)$",
+    kind: "route",
+    prefixPattern: ['@Controller("$P")', "@Controller('$P')"],
   },
   {
     id: "python-decorator-route",
@@ -86,6 +102,14 @@ export const DEFAULT_PACK: AnchorRule[] = [
 
 export interface AnchorDraft extends Anchor {}
 
+// NestJS mounts every controller at the router root, so the joined path is
+// always slash-rooted regardless of how each framework writes the pieces.
+const joinRoute = (prefix: string, child: string): string => {
+  const p = prefix.replace(/^\/+|\/+$/g, "");
+  const c = child.replace(/^\/+|\/+$/g, "");
+  return c ? `/${[p, c].filter(Boolean).join("/")}` : `/${p}`;
+};
+
 export const extractAnchors = (
   files: string[],
   cwd: string,
@@ -99,15 +123,23 @@ export const extractAnchors = (
     for (const lang of rule.langs) {
       const langFiles = byLang.get(lang);
       if (!langFiles?.length) continue;
+      const prefixes = new Map<string, string>(); // file -> @Controller prefix
+      if (rule.prefixPattern?.length) {
+        for (const pm of patternRunAll(rule.prefixPattern, lang, langFiles, cwd)) {
+          const p = pm.single.P?.trim();
+          if (p !== undefined && !prefixes.has(pm.file)) prefixes.set(pm.file, p);
+        }
+      }
       for (const m of patternRun(rule.pattern, lang, langFiles, cwd)) {
         const method = m.single.M;
         const path = m.single.P;
         if (!method || !path || !methodRe.test(method)) continue;
-        const raw = path.trim();
+        const prefix = prefixes.get(m.file);
+        const raw = prefix !== undefined && prefix !== "" ? joinRoute(prefix, path.trim()) : path.trim();
         // $R.$M(...) also matches Map.get("key")-style data access; only real
         // paths (or router-relative placeholders like ":id") may anchor.
         if (!PATH_TOKEN_RE.test(raw) && !PLACEHOLDER_ONLY.test(raw)) continue;
-        const norm = normalizeLiteral(path, "path");
+        const norm = normalizeLiteral(raw, "path");
         const httpMethod = method.toUpperCase() === "ROUTE" || method.toLowerCase() === "route" || method.toLowerCase() === "use" || method.toLowerCase() === "any"
           ? method.toUpperCase()
           : method.toUpperCase();

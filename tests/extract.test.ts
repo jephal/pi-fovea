@@ -7,7 +7,7 @@ import { extractAnchors } from "../src/core/anchors.js";
 import type { SymbolRec } from "../src/core/types.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
-const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "worker/jobs.py", "worker/search.rs"];
+const CODE = ["server/main.go", "server/users.go", "server/config.go", "web/api.ts", "web/types.ts", "web/api.test.ts", "web/airports.controller.ts", "worker/jobs.py", "worker/search.rs"];
 const ALL = [...CODE, "openapi.yaml"];
 
 const enclosing = (syms: SymbolRec[]) => (file: string, line: number): string | undefined => {
@@ -73,5 +73,8 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(labels.some((l) => l.startsWith("POST /api/users"))).toBe(true);
     const get = anchors.find((a) => a.id.startsWith("GET "))!;
     expect(get.file).toBe("server/main.go");
+    // NestJS style: single quotes + @Controller prefix composed into the path.
+    expect(labels.some((l) => l.startsWith("GET /api/airports/search"))).toBe(true);
+    expect(labels.some((l) => l.startsWith("GET /api/airports/{*}"))).toBe(true);
   });
 });
