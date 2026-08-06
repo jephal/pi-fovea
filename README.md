@@ -19,18 +19,23 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 pi-fovea hands the model a map of your repo on every prompt. The repo compiles once into a code graph across languages, where symbols, files, and route anchors join into one network. Each question becomes an interest vector that diffuses over the graph as heat. The renderer converts the field into a token-capped view: exact source locations and full signatures near your task, typed one-hop relationships next, and a skeleton of the rest.
 
-At agent start Fovea establishes or checks its semantic baseline, so out-of-band edits made while Pi was idle enter context before the first model call. After each assistant turn it re-syncs again. Detection does not trust tool events: edits made by Pi tools, fabric_exec, bash, subagents, or an editor land identically, while comment- and formatting-only drift stays silent. A meaningful post-turn change is delivered as a **steer**, and Fovea triggers the continuation itself if the agent would otherwise wait.
+When a session starts, Fovea records a baseline of the repo. If files
+changed while Pi was idle, those changes enter context before the first model
+call. Fovea checks the repo again after each assistant turn. Detection uses
+file content hashes. An edit from a Pi tool, fabric_exec, bash, a subagent,
+or an editor looks the same to Fovea. Edits that touch only comments or
+formatting stay silent. A meaningful change arrives as a **steer**. When the
+agent is about to stop, Fovea starts the next turn itself.
 
 ## Where fovea fits in shipping a feature
 
-Feature work in a large codebase has two costs: the change itself, and
-everything around it — finding where the feature lives, mapping what the
-change touches, keeping pace with edits landing from other branches, and
-handing reviewers an honest blast radius. In long-lived enterprise repos the
-second cost usually dominates the first. Fovea is built for that second cost:
-orientation, impact assessment, and mid-task re-sync become cheap, repeatable
-calls. The rest of the pipeline — testing, review gates, CI, rollout — stays
-with the tools built for it.
+Shipping a feature in a large codebase costs time before the first edit.
+First you find where the feature lives. Then the change needs a map of
+everything it touches. Other branches keep landing while you work. Reviewers
+want the blast radius. In long-lived enterprise repos, these steps cost more
+time than the change itself. Fovea handles these steps. Each step becomes a
+cheap call against the code graph. Tests, review gates, CI, and rollout keep
+their own tools.
 
 ## When not to reach for fovea
 
