@@ -11,6 +11,10 @@ the extension from `src/` via jiti, so a green check means the change is live.
 
 ## Cache invalidation
 
+Two caches live in \`$TMPDIR\`: per-file extraction facts (\`pi-fovea-*.json\`,
+keyed by content sha1 + \`CACHE_VERSION\` + rules hash) and co-change pairs
+(\`pi-fovea-cochange-*.json\`, keyed by HEAD + tracked-file set).
+
 Facts (symbols/imports/calls/literals per file) are content-hash cached in
 `$TMPDIR/pi-fovea-*.json`. If you change *extractor semantics* (what a parser
 emits for unchanged file content), bump `CACHE_VERSION` in

@@ -21,7 +21,8 @@ export type EdgeKind =
   | "inherits"   // class extends / implements (outline-derived)
   | "tests"      // test file -> unit under test
   | "join"       // shared normalized literal (cross-language bridge)
-  | "anchors";   // route anchor -> handler symbol
+  | "anchors"    // route anchor -> handler symbol (site-collapsed feature hub)
+| "cochange";  // git-history co-change conductance   // route anchor -> handler symbol
 
 export interface NodeRec {
   id: string;        // stable identity: "name@file" (methods: "Type.name@file")

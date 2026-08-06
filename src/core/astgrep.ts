@@ -121,6 +121,11 @@ export const patternRun = (
 };
 
 // First match of any of the patterns, per language/file set, concatenated.
+// Spread-pushing big match arrays overflows the argument-list limit, so
+// concatenate manually.
+const pushAll = <T>(out: T[], more: T[]): void => { for (const x of more) out.push(x); };
+
+// First match of any of the patterns, per language/file set, concatenated.
 export const patternRunAll = (
   patterns: string[],
   lang: string,
@@ -128,6 +133,6 @@ export const patternRunAll = (
   cwd: string,
 ): AgMatch[] => {
   const out: AgMatch[] = [];
-  for (const p of patterns) out.push(...patternRun(p, lang, files, cwd));
+  for (const p of patterns) pushAll(out, patternRun(p, lang, files, cwd));
   return out;
 };

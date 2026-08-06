@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "bench": "tsx scripts/bench.ts",
+    "fovea": "tsx cli.ts",
     "check": "pnpm run typecheck && pnpm run test"
   },
   "dependencies": {

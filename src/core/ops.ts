@@ -256,6 +256,12 @@ export const dwell = (root: string, factor?: number, budget?: number): OpResult 
   const from = session.t;
   const to = Math.min(64, from * Math.max(1.2, factor ?? 2));
   session.t = to;
+  // The cached T_k(M)s vectors are exact for t up to ~TK_ORDER/2.2-16; beyond
+  // that, extend the recurrence instead of silently degrading accuracy.
+  if (chooseOrder(to) > session.tk.length - 1) {
+    session.tk = chebyshevVectors(state.csr, seedVector(g.nodes.length, session.seeds), chooseOrder(to) + 8);
+    session.tkKey += "+ext";
+  }
   const field = heatField(session.tk, to, g.nodes.length);
   const fit = revealFoveated(g, field, {
     header: `fovea dwell · t ${from}→${to} · delta`,
@@ -274,6 +280,8 @@ export interface ImpactArgs {
   files?: string[];
   symbols?: string[];
   includeUncommitted?: boolean;
+  /** Base ref for PR-style cascades: seeds from `git diff base...HEAD`. */
+  base?: string;
   budget?: number;
 }
 
@@ -290,12 +298,19 @@ const uncommittedFiles = (root: string): string[] => {
   return out.filter(Boolean);
 };
 
+const prFiles = (root: string, base: string): string[] => {
+  const res = spawnSync("git", ["-C", root, "diff", "--name-only", `${base}...HEAD`], { encoding: "utf8", timeout: 15_000 });
+  if (res.error || res.status !== 0 || !res.stdout) return [];
+  return res.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+};
+
 export const impact = (root: string, args: ImpactArgs): OpResult => {
   const state = ensureState(root);
   const g = state.graph;
   const B = clampBudget(args.budget, 2000);
   const files = new Set<string>(args.files ?? []);
-  if (args.includeUncommitted !== false) for (const f of uncommittedFiles(root)) files.add(f);
+  if (args.base) for (const f of prFiles(root, args.base)) files.add(f);
+  if (args.includeUncommitted !== false && !args.base) for (const f of uncommittedFiles(root)) files.add(f);
 
   const seedSet = new Set<number>();
   for (const rel of files) {

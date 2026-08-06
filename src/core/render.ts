@@ -73,7 +73,7 @@ export const revealFoveated = (
     const n = g.nodes[i]!;
     const h = field[i]! / vmax;
     if (h >= HOT_TIER) {
-      lines.push(`▲ ${n.file}:${n.line}  ${n.sig}`);
+      lines.push(n.kind === "file" ? `▒ ${n.file}` : n.kind === "anchor" ? `⚑ ${n.sig}` : `▲ ${n.file}:${n.line}  ${n.sig}`);
       ids.push(n.id);
     } else if (h >= WARM_TIER) {
       lines.push(`  · ${n.name} (${n.kind}) ${n.file}:${n.line}`);

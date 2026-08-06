@@ -89,7 +89,8 @@ export default function fovea(pi: ExtensionAPI) {
     parameters: Type.Object({
       files: Type.Optional(Type.Array(Type.String(), { description: "Repo-relative changed files." })),
       symbols: Type.Optional(Type.Array(Type.String(), { description: "Changed symbol names (what-if mode)." })),
-      includeUncommitted: Type.Optional(Type.Boolean({ description: "Seed from uncommitted changes (default true)." })),
+      includeUncommitted: Type.Optional(Type.Boolean({ description: "Seed from uncommitted changes (default true; ignored when base is set)." })),
+      base: Type.Optional(Type.String({ description: "Base ref for PR-style cascades: seeds come from `git diff <base>...HEAD`." })),
       root: RootParam,
       maxTokens: BudgetParam,
     }),
@@ -100,6 +101,7 @@ export default function fovea(pi: ExtensionAPI) {
           files: params.files,
           symbols: params.symbols,
           includeUncommitted: params.includeUncommitted,
+          base: params.base,
           budget: params.maxTokens,
         });
         return { content: [text(r.text)], details: r.details };

@@ -124,7 +124,7 @@ export const extractSymbols = (files: string[], cwd: string): SymbolRec[] => {
   for (const [lang, langFiles] of groupByLang(files)) {
     const text = outline(langFiles, lang, cwd);
     if (!text.trim()) continue;
-    out.push(...parseOutlineText(text, lang));
+    pushAll(out, parseOutlineText(text, lang));
   }
   return out.filter((s) => s.file);
 };
@@ -173,6 +173,35 @@ export const extractImports = (files: string[], cwd: string): ImportSite[] => {
 
 const CALL_PATTERNS = ["$O.$M($$$A)", "$F($$$A)"];
 
+// Language builtins and log/test-framework entry points resolve to mega-hubs
+// on real repos (python `str(`, jest `it(`, fmt.Sprintf, rust unwrap).
+// They carry no cross-file meaning; exclude them at extraction.
+export const CALL_WARDS = new Set([
+  // generic member-call noise and loggers
+  "log", "info", "warn", "debug", "trace", "close", "flush", "tostring", "valueof",
+  "tolowercase", "touppercase", "printf", "sprintf", "fprintf", "errorf",
+  "fatal", "fatalf", "panic", "panicf", "println", "print",
+  // JS/TS runtime + test frameworks
+  "require", "console", "settimeout", "setinterval", "cleartimeout", "clearinterval",
+  "queuemicrotask", "parseint", "parsefloat", "isnan", "isfinite",
+  "it", "describe", "test", "expect", "xit", "xdescribe",
+  "beforeeach", "aftereach", "beforeall", "afterall",
+  "jest", "vitest", "vi", "mock", "spyon",
+  // python builtins
+  "str", "int", "float", "bool", "bytes", "bytearray", "list", "dict", "set",
+  "tuple", "frozenset", "super", "isinstance", "issubclass", "getattr", "setattr",
+  "hasattr", "delattr", "open", "range", "enumerate", "zip", "sorted", "next",
+  "all", "any", "sum", "abs", "round", "format", "chr", "ord", "hex", "oct",
+  "bin", "id", "input", "vars", "dir", "callable", "hash", "object", "property",
+  "staticmethod", "classmethod", "memoryview", "slice", "type", "repr", "len",
+  // go builtins
+  "append", "cap", "clear", "delete", "make", "new", "copy", "complex", "real",
+  "imag", "recover", "min", "max",
+  // rust std noise
+  "unwrap", "expect", "clone", "into", "from", "collect", "iter", "eprintln",
+  "format", "vec", "assert", "asserteq", "assertne", "dbg",
+]);
+
 const isTestFile = (file: string): boolean =>
   /(^|\/)(test_|conftest)|\.(test|spec)\.[tj]sx?$|_test\.go$/.test(file);
 
@@ -185,7 +214,9 @@ export const extractCalls = (files: string[], cwd: string): CallSite[] => {
     for (const m of matches) {
       const callee = m.single.M ?? m.single.F;
       if (!callee) continue;
-      out.push({ file: m.file, line: m.line, callee: callee.trim() });
+      const name = callee.trim();
+      if (CALL_WARDS.has(name.toLowerCase())) continue;
+      out.push({ file: m.file, line: m.line, callee: name });
     }
   }
   return out.filter((c) => c.callee && c.callee.length > 1);
@@ -265,7 +296,7 @@ export const extractLiterals = (files: string[], cwd: string): LiteralSite[] => 
       if (t) out.push({ file: m.file, line: m.line, text: t });
     }
   }
-  out.push(...extractConfigLiterals(files, cwd));
+  pushAll(out, extractConfigLiterals(files, cwd));
   for (const f of files) {
     if (isConfigFile(f)) continue;
     let src = "";
@@ -284,6 +315,9 @@ export const extractLiterals = (files: string[], cwd: string): LiteralSite[] => 
   }
   return dedupe(out, (l) => `${l.file}|${l.line}|${l.text}`);
 };
+
+// Spread-pushing big arrays overflows the argument-list limit on large repos.
+const pushAll = <T>(out: T[], more: T[]): void => { for (const x of more) out.push(x); };
 
 const dedupe = <T>(arr: T[], key: (t: T) => string): T[] => {
   const seen = new Set<string>();

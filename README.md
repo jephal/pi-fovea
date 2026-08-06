@@ -36,6 +36,26 @@ pi install npm:pi-fovea
 
 Then, in any repo session: `/fovea-status` shows graph stats; the model gets the four `fovea_*` tools.
 
+### CLI
+
+The same ops as a shell command (stateless, pipe-friendly):
+
+```sh
+pnpm fovea sketch /path/to/repo 900
+pnpm fovea focus /path/to/repo "/v1/messages" 800
+pnpm fovea impact /path/to/repo --base main 1200
+```
+
+### Repo rule packs
+
+Drop `.fovea/rules.json` in a repo to extend route/anchor detection beyond the built-ins (express/orval-style chains, NestJS decorators, Flask/FastAPI decorators, Go chi/mux, axum):
+
+```json
+{ "rules": [{ "id": "fiber", "langs": ["Go"], "pattern": "$R.$M(\"$P\", $$H)", "methods": "^(get|post)$", "kind": "route" }] }
+```
+
+Changing the rules file invalidates only the anchor extraction cache.
+
 Supported today: TypeScript/JavaScript, Python, Go, Rust for symbols/calls; plus literal joins from YAML/JSON/TOML/HCL/env/Markdown config files (OpenAPI specs join routers and clients automatically).
 
 ## How the agent uses it
@@ -45,9 +65,16 @@ fovea_sketch  { }                                    # silhouette, ~1.4k tok
 fovea_focus   { "query": "/api/users/{id}" }         # route → handler+client+spec
 fovea_dwell   { }                                    # deepen: t 2→4, deltas only
 fovea_impact  { "files": ["server/users.go"] }       # what this edit touches
+fovea_impact  { "base": "main" }                        # PR cascade (git diff main…HEAD)
 ```
 
 Cursor lines tell the model what remains (`… 37 lit below threshold — call fovea_dwell`), so progressive disclosure is tool-driven, not one-shot.
+
+## How the graph is joined
+
+- imports, outline contains/inherits, tests, call edges (specificity-tiered; language builtins and log/test entry points are warded off)
+- literal joins across languages (route paths, env keys, distinguishing strings) — document-frequency-gated cliques so rare literals bridge strongly and ubiquitous ones don't become gravity wells; `focus` can still seed from any literal
+- co-change edges mined from recent git history (Jaccard-tilted, per-file capped, cached by HEAD) — files that commute together warm each other even without a static edge
 
 ## Development
 

@@ -11,9 +11,10 @@ import { spawnSync } from "node:child_process";
 import { LANG_BY_EXT, isConfigFile } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
 import { buildJoinIndex } from "./join.js";
-import { extractAnchors } from "./anchors.js";
+import { extractAnchors, loadRepoRules } from "./anchors.js";
 import type { CallSite, Edge, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
+import { coChangePairs } from "./cochange.js";
 
 export interface FileFacts {
   sha1: string;
@@ -24,9 +25,21 @@ export interface FileFacts {
   anchors: AnchorDraft[];
 }
 
-const CACHE_VERSION = 2; // bump when extractor semantics change
+const CACHE_VERSION = 3; // bump when extractor semantics change
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea"]);
-const MAX_FILES = 8000;
+const MAX_FILES = 24000;
+// Generated dependency manifests are enormous and carry no first-class routes.
+const LOCKFILE_NAMES = new Set([
+  "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb",
+  "pipfile.lock", "poetry.lock", "cargo.lock", "composer.lock", "gemfile.lock", "go.sum",
+]);
+
+const isJunk = (f: string): boolean => {
+  const segs = f.split("/");
+  for (const s of segs) if (IGNORE_DIRS.has(s)) return true;
+  const base = segs[segs.length - 1]!.toLowerCase();
+  return LOCKFILE_NAMES.has(base) || base.endsWith(".lock");
+};
 
 const supported = (f: string): boolean => {
   const ext = f.split(".").pop()?.toLowerCase() ?? "";
@@ -61,7 +74,7 @@ export const listFiles = (root: string): string[] => {
     };
     walk(root, "");
   }
-  files = files.filter(supported);
+  files = files.filter((f) => supported(f) && !isJunk(f));
   files.sort();
   return files.slice(0, MAX_FILES);
 };
@@ -75,7 +88,7 @@ const sha1Of = (root: string, rel: string): string => {
   }
 };
 
-interface CacheFile { version: number; root: string; facts: Record<string, FileFacts>; }
+interface CacheFile { version: number; root: string; rulesSha: string; facts: Record<string, FileFacts>; }
 
 export const cachePathFor = (root: string): string =>
   joinPath(tmpdir(), `pi-fovea-${createHash("sha1").update(root).digest("hex").slice(0, 16)}.json`);
@@ -88,7 +101,8 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
   } catch {
     cached = undefined;
   }
-  if (cached && (cached.version !== CACHE_VERSION || cached.root !== root)) cached = undefined;
+  const { pack: anchorPack, sha: rulesSha } = loadRepoRules(root);
+  if (cached && (cached.version !== CACHE_VERSION || cached.root !== root || cached.rulesSha !== rulesSha)) cached = undefined;
   const facts: Record<string, FileFacts> = {};
   const dirty: string[] = [];
   for (const rel of files) {
@@ -127,11 +141,11 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
       for (const s of syms) if (s.line <= line && (!best || s.line > best.line)) best = s;
       return best ? `${best.name}@${best.file}` : `file:${file}`;
     };
-    putByFile(extractAnchors(code, root, enclosingId), (f, v) => f.anchors.push(v));
+    putByFile(extractAnchors(code, root, enclosingId, anchorPack), (f, v) => f.anchors.push(v));
   }
   try {
     mkdirSync(dirname(cacheFile), { recursive: true });
-    writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, root, facts } satisfies CacheFile));
+    writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, root, rulesSha, facts } satisfies CacheFile));
   } catch {
     // Cache is an optimization; never fail the build over it.
   }
@@ -300,21 +314,23 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
   }
 
   // Call edges: resolve callee by name, prefer same-file, then imported files,
-  // then a globally unique definition. Ambiguous names (many candidates) are
-  // left unresolved rather than wired to noise.
+  // then a globally unique definition. Conductance decays with definition
+  // cardinality: a name defined twice is a pointer, a name defined 40 times
+  // is ambient noise (the dynamic-language `str(`/`it(` hub failure mode).
   for (const rel of files) {
     const f = facts[rel];
     if (!f) continue;
     const imported = new Set(importTargets.get(rel) ?? []);
     for (const call of f.calls) {
       const cands = byName.get(call.callee.toLowerCase()) ?? [];
-      if (!cands.length) continue;
+      if (!cands.length || cands.length > 48) continue;
       let chosen: number[] = cands.filter((i) => nodes[i]!.file === rel);
       if (!chosen.length) chosen = cands.filter((i) => imported.has(nodes[i]!.file));
       if (!chosen.length && cands.length === 1) chosen = cands;
       if (!chosen.length || chosen.length > 3) continue;
+      const w = cands.length <= 8 ? 0.7 : cands.length <= 24 ? 0.45 : 0.25;
       const from = enclosingIdx(rel, call.line);
-      for (const to of chosen) pushEdge(from, to, "invokes", 0.7);
+      for (const to of chosen) pushEdge(from, to, "invokes", w);
     }
   }
 
@@ -338,17 +354,44 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
   const joinIdx = buildJoinIndex(allSites, (file, line) => enclosingIdx(file, line));
   for (const je of joinIdx.edges) pushEdge(je.a, je.b, "join", je.w);
 
-  // Anchors: one node per anchor, hard edge to its handler.
-  const anchors = files.flatMap((rel) => facts[rel]?.anchors ?? []);
-  for (const a of anchors) {
+  // Anchors: ONE node per feature route, not per site. Server registration
+  // and every client call of "POST /auth/login" are occurrences of the same
+  // feature; the anchor hub is where they meet. Site conductance decays with
+  // sqrt(count) so a route consumed everywhere doesn't become a gravity well.
+  const drafts = files.flatMap((rel) => facts[rel]?.anchors ?? []);
+  const draftsByLabel = new Map<string, AnchorDraft[]>();
+  for (const a of drafts) {
+    (draftsByLabel.get(a.id) ?? draftsByLabel.set(a.id, []).get(a.id)!).push(a);
+  }
+  const anchors: Graph["anchors"] = [];
+  for (const [label, sites] of draftsByLabel) {
+    const first = sites[0]!;
+    const filesOf = [...new Set(sites.map((s) => s.file))];
+    anchors.push({ id: label, kind: first.kind, label: sites.length > 1 ? `${label} · ${sites.length} sites` : label, nodeId: first.nodeId, file: first.file, line: first.line });
     const idx = addNode(nodes, seen, {
-      id: `anchor:${a.id}@${a.file}:${a.line}`,
-      name: a.label, kind: "anchor", file: a.file, line: a.line, sig: a.label,
-      lang: "anchor",
+      id: `anchor:${label}`, name: label, kind: "anchor", file: first.file, line: first.line,
+      sig: sites.length > 1 ? `${label} (${sites.length} sites)` : label, lang: "anchor",
     });
-    (byFile.get(a.file) ?? byFile.set(a.file, []).get(a.file)!).push(idx);
-    const handler = seen.get(a.nodeId) ?? fileIdx.get(a.file)!;
-    pushEdge(idx, handler, "anchors", 1.0);
+    (byFile.get(first.file) ?? byFile.set(first.file, []).get(first.file)!).push(idx);
+    const w = 1 / Math.sqrt(sites.length);
+    for (const s of sites) {
+      const handler = seen.get(s.nodeId) ?? fileIdx.get(s.file)!;
+      pushEdge(idx, handler, "anchors", w);
+    }
+    // A multi-file route binds its files too (the feature's file hood).
+    if (filesOf.length > 1 && filesOf.length <= 12) {
+      const fw = 0.35 / Math.sqrt(filesOf.length);
+      for (const f of filesOf) pushEdge(idx, fileIdx.get(f)!, "anchors", fw);
+    }
+  }
+
+  // Co-change conductance from git history (bounded, HEAD-keyed, separately
+  // cached). Files that commute together belong together even without a
+  // static edge; reviewer-relevant warmth flows here.
+  for (const [fa, fb, w] of coChangePairs(root, files)) {
+    const ia = fileIdx.get(fa);
+    const ib = fileIdx.get(fb);
+    if (ia !== undefined && ib !== undefined) pushEdge(ia, ib, "cochange", w);
   }
 
   return { nodes, edges, byName, byFile, anchors, files };
