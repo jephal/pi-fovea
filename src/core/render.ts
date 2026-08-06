@@ -190,7 +190,7 @@ export const revealFoveated = (
     if (h >= HOT_TIER || seedSet.has(i)) {
       lines.push(
         node.kind === "file"
-          ? `▒ ${node.file}${context}`
+          ? `▪ ${node.file}${context}`
           : node.kind === "anchor"
             ? `⚑ ${node.sig}${context}`
             : `▲ ${formatNodeLocation(node)}  ${node.sig}${context}`,
