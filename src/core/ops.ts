@@ -8,7 +8,7 @@ import { existsSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { posix } from "node:path";
 import { hasAstGrep } from "./astgrep.js";
-import { assembleGraph, listFiles, loadFacts, type FileFacts } from "./build.js";
+import { assembleGraph, listFiles, loadFacts, type ExtractionReport, type FileFacts } from "./build.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
 import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine, type RevealedNode } from "./render.js";
@@ -31,6 +31,8 @@ export interface RepoState {
   csr: Csr;
   joinIndex: JoinIndex;
   facts: Record<string, FileFacts>;
+  /** What extraction dropped on the floor building this graph version. */
+  extraction: ExtractionReport;
   adjacency: Map<number, Array<{ to: number; kind: string; w: number }>>;
 }
 
@@ -54,7 +56,7 @@ export const ensureState = (root: string): RepoState => {
   const { fileRoutes } = loadRepoRules(root);
   const routeRes = fileRoutes.map((r) => new RegExp(r.re));
   const files = listFiles(root, routeRes);
-  const facts = loadFacts(root, files);
+  const { facts, report: extraction } = loadFacts(root, files);
   const version = graphVersion(facts);
   const cached = states.get(root);
   if (cached && cached.version === version) return cached;
@@ -75,10 +77,26 @@ export const ensureState = (root: string): RepoState => {
     (adjacency.get(e.a) ?? adjacency.set(e.a, []).get(e.a)!).push({ to: e.b, kind: e.kind, w: e.w });
     (adjacency.get(e.b) ?? adjacency.set(e.b, []).get(e.b)!).push({ to: e.a, kind: e.kind, w: e.w });
   }
-  const state: RepoState = { root, version, graph, csr, joinIndex, facts, adjacency };
+  const state: RepoState = { root, version, graph, csr, joinIndex, facts, extraction, adjacency };
   states.set(root, state);
   return state;
 };
+
+// Honest coverage: surface dropped extractions instead of letting a thin
+// graph read as a small repo. Suffixes go into rendered headers; the file
+// lists go into structured details for consumers that can act on them.
+const extractionSuffix = (state: RepoState): string => {
+  const parts: string[] = [];
+  if (state.extraction.failed.length) parts.push(`!${state.extraction.failed.length} files failed extraction`);
+  if (state.extraction.unreadable.length) parts.push(`!${state.extraction.unreadable.length} files unreadable`);
+  return parts.length ? ` · ${parts.join(", ")}` : "";
+};
+
+const extractionDetails = (state: RepoState): Record<string, unknown> => ({
+  extractionFailures: state.extraction.failed.length,
+  extractionFailedFiles: state.extraction.failed.slice(0, 20),
+  extractionUnreadable: state.extraction.unreadable,
+});
 
 // Seed resolution.
 
@@ -434,7 +452,7 @@ export const sketch = (root: string, budget?: number): OpResult => {
     ? `${productionAnchorIdx.length} production anchors · ${testAnchorIdx.length} test/fixture anchors collapsed`
     : `${productionAnchorIdx.length} anchors`;
   const fit = revealGroups(groups, {
-    header: `fovea sketch · ${g.files.length} files · ${g.nodes.length} symbols · ${anchorSummary}`,
+    header: `fovea sketch · ${g.files.length} files · ${g.nodes.length} symbols · ${anchorSummary}${extractionSuffix(state)}`,
     budget: B,
   });
   return {
@@ -447,6 +465,7 @@ export const sketch = (root: string, budget?: number): OpResult => {
       productionAnchors: productionAnchorIdx.length,
       testAnchors: testAnchorIdx.length,
       truncated: fit.truncated,
+      ...extractionDetails(state),
     },
   };
 };
@@ -467,6 +486,9 @@ export const focus = (root: string, query: string, budget?: number, options: Foc
         ? "Retry fovea_focus with one of these names, a route path (/api/...), or a file path."
         : "Try a symbol name, a route path (/api/...), or a file path. Run fovea_sketch for the map silhouette first.";
       return [
+        ...(state.extraction.failed.length
+          ? [`! ${state.extraction.failed.length} files failed extraction; matches may be incomplete.`]
+          : []),
         `fovea focus "${query}": ${note}.`,
         ...(nearby.length ? ["Nearby symbols:", ...nearby] : []),
         guidance,
@@ -488,6 +510,7 @@ export const focus = (root: string, query: string, budget?: number, options: Foc
           score: Number(score.toFixed(3)),
         })),
         scope: { path: options.path, language: options.language, kind: options.kind },
+        ...extractionDetails(state),
       },
     };
   }
@@ -511,7 +534,7 @@ export const focus = (root: string, query: string, budget?: number, options: Foc
     ? new Set(g.nodes.filter((node) => matchesFocusScope(node, options)).map((node) => node.id))
     : undefined;
   const fit = revealFoveated(g, field, {
-    header: `fovea focus "${query}" · ${note}`,
+    header: `fovea focus "${query}" · ${note}${extractionSuffix(state)}`,
     include: scopedIds,
     disclosed: session.disclosed,
     seeds,
@@ -531,6 +554,7 @@ export const focus = (root: string, query: string, budget?: number, options: Foc
       scope: { path: options.path, language: options.language, kind: options.kind },
       nodes: fit.revealed,
       suggestedReads: suggestedReads(fit.revealed),
+      ...extractionDetails(state),
     },
   };
 };
@@ -581,6 +605,7 @@ export const dwell = (root: string, factor?: number, budget?: number): OpResult 
       scope,
       nodes: fit.revealed,
       suggestedReads: suggestedReads(fit.revealed),
+      ...extractionDetails(state),
     },
   };
 };
@@ -741,6 +766,7 @@ export const impact = (root: string, args: ImpactArgs): OpResult => {
       seeds: seeds.length,
       warmed: groups.length,
       truncated: fit.truncated,
+      ...extractionDetails(state),
       // Structured form for consumers (turn-sync): warmed anchors, files,
       // and the strongest direct evidence channel without text re-parsing.
       warmedAnchors: anchorHits.map((h) => h.label.replace(/^⚑\s*/, "")),

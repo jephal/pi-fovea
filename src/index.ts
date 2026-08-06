@@ -3,11 +3,13 @@
 // per-conversation); the on-disk content-hash cache makes graph rebuilds
 // incremental across sessions.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createGrepTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { defaultAgentDir, loadFoveaConfig, type FoveaConfig } from "./core/config.js";
-import { dwell, focus, impact, sketch } from "./core/ops.js";
+import { hasAstGrep } from "./core/astgrep.js";
+import { cachePathFor } from "./core/build.js";
+import { dwell, ensureState, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
 import { resetSyncBaselines, sync } from "./core/sync.js";
 import { openFoveaSettings } from "./ui/settings.js";
@@ -77,6 +79,26 @@ export default function fovea(pi: ExtensionAPI) {
     return cfg;
   };
 
+  // A missing ast-grep throws the full install guidance on the first
+  // failure; subsequent calls answer with a short "proceed natively" result
+  // instead of burning turns on identical hard errors. Self-healing: once
+  // ast-grep is back the ops succeed and the flag becomes irrelevant.
+  let availabilityReported = false;
+  const softUnavailable = () => ({
+    content: [text(
+      "fovea unavailable: the ast-grep binary is not on PATH, so the code graph cannot build. " +
+      "Use native grep/read tools for the rest of this session, or install ast-grep (https://ast-grep.github.io/) and run /fovea reload.",
+    )],
+    details: { unavailable: "ast-grep" } as Record<string, unknown>,
+  });
+  const rethrowOrDegrade = (error: unknown): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } => {
+    if (!hasAstGrep()) {
+      if (availabilityReported) return softUnavailable();
+      availabilityReported = true;
+    }
+    throw error instanceof Error ? error : new Error(String(error));
+  };
+
   let grepOverrideRegistered = false;
   const registerGrepOverride = (): void => {
     if (grepOverrideRegistered) return;
@@ -110,7 +132,16 @@ export default function fovea(pi: ExtensionAPI) {
             details: { ...result.details, backend: "fovea", query },
           };
         } catch (error) {
-          throw error instanceof Error ? error : new Error(String(error));
+          // A broken graph backend must not break text search: degrade to
+          // native grep and mark the result, the way a graph miss does.
+          const message = error instanceof Error ? error.message : String(error);
+          const native = createGrepTool(root);
+          const fallback = await native.execute(id, params, signal, onUpdate);
+          return {
+            ...fallback,
+            content: [text(`fovea graph unavailable — native text results (${message})\n`), ...fallback.content],
+            details: { ...(fallback.details ?? {}), backend: "native", foveaError: message, query },
+          };
         }
       },
     });
@@ -122,6 +153,19 @@ export default function fovea(pi: ExtensionAPI) {
       resetSyncBaselines();
     }
     if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.replaceGrep) registerGrepOverride();
+    // Pre-warm: when the on-disk fact cache exists and git reports little
+    // drift, rebuilding now is cheap, so the first prompt's turn-sync meets a
+    // warm graph instead of paying the index build inline. Cold caches or
+    // heavily drifted working trees skip — the first sync pays once, as before.
+    try {
+      if (!hasAstGrep() || !existsSync(cachePathFor(ctx.cwd))) return;
+      const probe = await pi.exec("git", ["-C", ctx.cwd, "status", "--porcelain"], { timeout: 10_000 });
+      if (probe.code !== 0) return;
+      const drift = probe.stdout.split("\n").filter(Boolean).length;
+      if (drift <= 16) ensureState(ctx.cwd);
+    } catch {
+      // Pre-warm is strictly best-effort; the first ensureState call retries inline.
+    }
   });
 
   // Turn-sync loop. Tool events provide optional file hints, but content and
@@ -220,7 +264,7 @@ export default function fovea(pi: ExtensionAPI) {
         const r = sketch(root, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (error) {
-        throw error instanceof Error ? error : new Error(String(error));
+        return rethrowOrDegrade(error);
       }
     },
   });
@@ -262,7 +306,7 @@ export default function fovea(pi: ExtensionAPI) {
         );
         return { content: [text(r.text)], details: r.details };
       } catch (error) {
-        throw error instanceof Error ? error : new Error(String(error));
+        return rethrowOrDegrade(error);
       }
     },
   });
@@ -287,7 +331,7 @@ export default function fovea(pi: ExtensionAPI) {
         const r = dwell(root, params.factor, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (error) {
-        throw error instanceof Error ? error : new Error(String(error));
+        return rethrowOrDegrade(error);
       }
     },
   });
@@ -321,7 +365,7 @@ export default function fovea(pi: ExtensionAPI) {
         });
         return { content: [text(r.text)], details: r.details };
       } catch (error) {
-        throw error instanceof Error ? error : new Error(String(error));
+        return rethrowOrDegrade(error);
       }
     },
   });
@@ -368,11 +412,13 @@ export default function fovea(pi: ExtensionAPI) {
           ? tracked.stdout.split("\n").filter(Boolean).length
           : undefined;
         const coverage = trackedCount === undefined ? `${indexed} indexed files` : `${indexed}/${trackedCount} tracked files indexed`;
+        const failedCount = Number(state.details.extractionFailures ?? 0);
         const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
         ctx.ui.notify(
           `pi-fovea ${PACKAGE_VERSION} · ${coverage} · ${state.details.nodes ?? 0} symbols · ` +
           `${state.details.productionAnchors ?? state.details.anchors ?? 0} production anchors` +
-          `${Number(state.details.testAnchors ?? 0) ? ` (${state.details.testAnchors} test/fixture collapsed)` : ""} · ` +
+          `${Number(state.details.testAnchors ?? 0) ? ` (${state.details.testAnchors} test/fixture collapsed)` : ""}` +
+          `${failedCount ? ` · !${failedCount} files failed extraction` : ""} · ` +
           `sync ${cfg.sync.enabled ? "continuous" : "off"} · grep ${cfg.tools.replaceGrep ? "hybrid" : "native"} · ` +
           `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",

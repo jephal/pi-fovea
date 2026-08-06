@@ -21,6 +21,7 @@ All four accept `maxTokens` (256–16000). Budget is roughly 4 chars per token.
 - **Do not bulk-read to discover structure.** Focus first, then read its suggested ranges. Native grep semantics remain available whenever grep receives path/glob/literal/context/limit options or an obvious regex; unresolved graph queries fall back to native text.
 - **Impact before destructive edits.** One `fovea_impact` call is cheaper than rediscovering dependents by breaking them.
 - **Sketch is the safe opening bid.** If unsure, pay for a sketch; it almost never exceeds a few hundred tokens.
+- **Skip the map when the repo is tiny.** A few dozen files are cheaper to bulk-read than to sketch; Fovea's value grows with repos larger than context. Either way it points at windows to read — the project's own format/lint/typecheck/test commands and CI remain the final verification layer.
 
 ## Turn sync
 

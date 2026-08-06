@@ -166,6 +166,15 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
       lines.push(`  ${file} — ${(warmReasons[file] ?? ["graph path"]).join(", ")}`);
     }
   }
+  // Hand the model a next probe, not just a verdict: point focus at the
+  // most consequential consequence of the drift (new route > changed file >
+  // newly warm file), so the update continues graph navigation.
+  const focusTarget = added.find((id) => !newlyImplicit.includes(id))?.replace(/^\w+\s+(?=\/)/, "")
+    ?? files[0]
+    ?? orderedWarm[0];
+  lines.push(focusTarget
+    ? `Next: fovea_focus ${JSON.stringify(focusTarget)} to see what it now connects to.`
+    : "Next: fovea_sketch for the updated silhouette.");
   lines.push("Steer: account for this update before continuing; inspect only the files relevant to the current task.");
   while (lines.length > 3 && Math.ceil(lines.join("\n").length / 4) > params.budget) {
     lines.splice(lines.length - 2, 1);

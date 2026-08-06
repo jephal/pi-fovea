@@ -57,8 +57,10 @@ try {
   if (cmd === "status") {
     const s = sketch(rootAt(0), 256);
     const testAnchors = Number(s.details.testAnchors ?? 0);
+    const failed = Number(s.details.extractionFailures ?? 0);
     out = `${s.details.files} files, ${s.details.nodes} symbols, ${s.details.productionAnchors ?? s.details.anchors} production anchors` +
-      (testAnchors ? `, ${testAnchors} test/fixture anchors collapsed` : "");
+      (testAnchors ? `, ${testAnchors} test/fixture anchors collapsed` : "") +
+      (failed ? `, !${failed} files failed extraction` : "");
   } else if (cmd === "sketch") {
     const root = rootAt(0);
     const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 1400;

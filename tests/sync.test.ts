@@ -64,6 +64,7 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     expect(outcome.text).toContain("Changed: server/users.go");
     expect(outcome.text).toContain("Newly relevant files:");
     expect(outcome.text).toContain("Steer: account for this update");
+    expect(outcome.text).toContain('Next: fovea_focus "server/users.go" to see what it now connects to.');
     expect(outcome.text).not.toContain("undisclosed");
     expect(outcome.text).not.toMatch(/ · v [a-f0-9]+/);
     expect(outcome.details.semanticChangedFiles).toContain("server/users.go");
@@ -84,6 +85,7 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     expect(outcome.red).toBe(true);
     expect(outcome.text).toContain("GET /api/users/{*}/restore");
     expect(outcome.details.added).toContain("GET /api/users/{*}/restore");
+    expect(outcome.text).toContain('Next: fovea_focus "/api/users/{*}/restore"');
     execSync("git checkout -- server/main.go", { cwd: root });
     // Post-restore sync re-baselines; the restored repo is the new normal.
     sync(root, { files: ["server/main.go"], budget: 512, warmFileThreshold: 2 });

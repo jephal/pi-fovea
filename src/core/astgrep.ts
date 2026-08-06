@@ -49,7 +49,21 @@ export const hasAstGrep = (): boolean => {
 
 const CHUNK = 160;
 
-const run = (args: string[], cwd: string): string => {
+// Extraction honesty ledger: a failed ast-grep invocation implicates every
+// file in its chunk. build.ts drains this once per fact pass and folds it
+// into the extraction report surfaced by tools, /fovea status, `fovea status`.
+export interface ExtractionFailure {
+  op: "outline" | "outline-structured" | "run";
+  lang?: string;
+  files: string[];
+}
+const failures: ExtractionFailure[] = [];
+const recordFailure = (op: ExtractionFailure["op"], files: string[], lang?: string): void => {
+  failures.push({ op, lang, files });
+};
+export const drainExtractionFailures = (): ExtractionFailure[] => failures.splice(0, failures.length);
+
+const run = (args: string[], cwd: string): { ok: boolean; stdout: string } => {
   const res = spawnSync(binary(), args, {
     cwd,
     encoding: "utf8",
@@ -57,8 +71,14 @@ const run = (args: string[], cwd: string): string => {
     maxBuffer: 128 * 1024 * 1024,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  if (res.error || res.status !== 0) return "";
-  return res.stdout ?? "";
+  if (res.error || res.signal) return { ok: false, stdout: "" };
+  if (res.status !== 0) {
+    // grep convention: `ast-grep run` exits 1 silently on zero matches, so a
+    // bare non-zero status is not a failure. Only a verbose one is.
+    if ((res.stderr ?? "").trim()) return { ok: false, stdout: "" };
+    return { ok: true, stdout: "" };
+  }
+  return { ok: true, stdout: res.stdout ?? "" };
 };
 
 export const langOf = (file: string): string | undefined => {
@@ -112,7 +132,10 @@ export interface OutlineFile {
 export const outlineStructured = (files: string[], lang: string, cwd: string): OutlineFile[] | undefined => {
   const out: OutlineFile[] = [];
   for (let i = 0; i < files.length; i += CHUNK) {
-    const stdout = run(
+    // A subprocess failure here is NOT recorded: extractSymbols falls back to
+    // the text outline for old ast-grep versions, and that text run is what
+    // records a genuine failure (old versions must not read as failures).
+    const { stdout } = run(
       ["outline", "--json=compact", "--view=expanded", ...files.slice(i, i + CHUNK)],
       cwd,
     );
@@ -132,9 +155,14 @@ export const outlineStructured = (files: string[], lang: string, cwd: string): O
 export const outline = (files: string[], lang: string, cwd: string): string => {
   let out = "";
   for (let i = 0; i < files.length; i += CHUNK) {
-    out += run(["outline", ...files.slice(i, i + CHUNK)], cwd);
+    const chunk = files.slice(i, i + CHUNK);
+    const { ok, stdout } = run(["outline", ...chunk], cwd);
+    if (!ok) {
+      recordFailure("outline", chunk, lang);
+      continue;
+    }
+    out += stdout;
   }
-  void lang;
   return out;
 };
 
@@ -157,10 +185,15 @@ export const patternRun = (
 ): AgMatch[] => {
   const out: AgMatch[] = [];
   for (let i = 0; i < files.length; i += CHUNK) {
-    const stdout = run(
-      ["run", "--pattern", pattern, "--lang", lang, "--json=compact", ...files.slice(i, i + CHUNK)],
+    const chunk = files.slice(i, i + CHUNK);
+    const { ok, stdout } = run(
+      ["run", "--pattern", pattern, "--lang", lang, "--json=compact", ...chunk],
       cwd,
     );
+    if (!ok) {
+      recordFailure("run", chunk, lang);
+      continue;
+    }
     if (!stdout.trim()) continue;
     let parsed: RawMatch[];
     try {

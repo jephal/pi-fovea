@@ -21,6 +21,16 @@ pi-fovea hands the model a map of your repo on every prompt. The repo compiles o
 
 At agent start Fovea establishes or checks its semantic baseline, so out-of-band edits made while Pi was idle enter context before the first model call. After each assistant turn it re-syncs again. Detection does not trust tool events: edits made by Pi tools, fabric_exec, bash, subagents, or an editor land identically, while comment- and formatting-only drift stays silent. A meaningful post-turn change is delivered as a **steer**, and Fovea triggers the continuation itself if the agent would otherwise wait.
 
+## When not to reach for fovea
+
+A map costs more than the territory when the territory is small: on repos of a
+few dozen files, reading the files directly beats sketching them. Fovea pays
+for itself when the working set exceeds context — cross-language monorepos,
+unfamiliar long-lived codebases, routes woven through config and client code.
+It narrows **what** you read to the suggested windows; it does not replace
+reading them, the project's own format/lint/typecheck/test commands, or CI as
+the final verification layer.
+
 ## What the model gets
 
 | Command | Ask | Answer |
@@ -33,7 +43,7 @@ At agent start Fovea establishes or checks its semantic baseline, so out-of-band
 
 Focus normalizes camelCase and common inflections, so an approximate name such as `switchServer` can resolve `switchingServers`. If a query is still uncertain, Fovea returns nearby symbols with locations instead of a dead miss. Direct graph edges are labeled (caller, callee, route, shared literal, co-change), while unrelated same-file siblings remain collapsed.
 
-The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`, `grep({ pattern: "Controller.create" })`, and route paths can navigate the graph. Calls with text-search options and obvious regexes delegate to Pi's native grep unchanged; a graph miss also falls back to native text. Disable the toggle for a purely native slot. Changing it reloads extensions so Pi and pi-fabric capture the same behavior.
+The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`, `grep({ pattern: "Controller.create" })`, and route paths can navigate the graph. Calls with text-search options and obvious regexes delegate to Pi's native grep unchanged; a graph miss falls back to native text, and a graph error (for example a broken ast-grep) degrades the same way with a one-line note marking the result as native. Disable the toggle for a purely native slot. Changing it reloads extensions so Pi and pi-fabric capture the same behavior.
 
 ### pi-fabric
 
@@ -103,7 +113,7 @@ fovea status /path/to/repo
 
 Continuous sync is on by default. Before an agent starts, Fovea establishes its baseline or injects any out-of-band drift before the first model call. After every assistant turn it compares extracted symbols, calls, imports, literals, and anchors again. Content hashes keep the unchanged fast path cheap, while comment- and formatting-only edits do not wake the model.
 
-A meaningful change found before agent start is injected directly into that run. A post-turn route or dependency change is sent with `deliverAs: "steer"`; if the agent would otherwise settle, `triggerTurn` starts the continuation automatically. The compact update names directly changed files, route deltas, newly relevant files, and causal channels such as calls, imports, shared literals, tests, or co-change history. Clean turns remain silent unless `sync.ackClean` is enabled.
+A meaningful change found before agent start is injected directly into that run. A post-turn route or dependency change is sent with `deliverAs: "steer"`; if the agent would otherwise settle, `triggerTurn` starts the continuation automatically. The compact update names directly changed files, route deltas, newly relevant files, causal channels such as calls, imports, shared literals, tests, or co-change history, and a suggested next focus probe so the update continues graph navigation. Clean turns remain silent unless `sync.ackClean` is enabled.
 
 Runtime controls:
 

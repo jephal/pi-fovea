@@ -8,7 +8,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { basename, dirname, join as joinPath, posix } from "node:path";
 import { spawnSync } from "node:child_process";
-import { LANG_BY_EXT, isBinaryExt, isConfigFile, langOf } from "./astgrep.js";
+import { LANG_BY_EXT, drainExtractionFailures, isBinaryExt, isConfigFile, langOf } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
 import { buildJoinIndex } from "./join.js";
 import { extractAnchors, extractFileRoutes, loadRepoRules } from "./anchors.js";
@@ -30,7 +30,16 @@ export interface FileFacts {
   sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 7; // bump when extractor semantics change
+const CACHE_VERSION = 8; // bump when extractor semantics change
+
+// Honest coverage: what the extractor could NOT see. Tools and status render
+// this so a thin graph never reads as a small repo (files dropped silently).
+export interface ExtractionReport {
+  /** Files implicated in at least one failed ast-grep invocation (chunk-granular). */
+  failed: string[];
+  /** Files skipped because their content could not be read (permissions, race). */
+  unreadable: string[];
+}
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods"]);
 const MAX_FILES = 24000;
 // Generated dependency manifests are enormous and carry no first-class routes.
@@ -100,7 +109,7 @@ interface CacheFile { version: number; root: string; rulesSha: string; facts: Re
 export const cachePathFor = (root: string): string =>
   joinPath(tmpdir(), `pi-fovea-${createHash("sha1").update(root).digest("hex").slice(0, 16)}.json`);
 
-export const loadFacts = (root: string, files: string[]): Record<string, FileFacts> => {
+export const loadFacts = (root: string, files: string[]): { facts: Record<string, FileFacts>; report: ExtractionReport } => {
   const cacheFile = cachePathFor(root);
   let cached: CacheFile | undefined;
   try {
@@ -115,15 +124,18 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
   let implicitRules: SynthesizedRule[] = [];
   let rulesSha = baseRulesSha;
   if (cached && (cached.version !== CACHE_VERSION || cached.root !== root)) cached = undefined;
+  drainExtractionFailures(); // isolate this pass; a previous load's stale ledger must not spill over
   const facts: Record<string, FileFacts> = {};
   const dirty: string[] = [];
+  const unreadable: string[] = [];
   for (const rel of files) {
     const sha1 = sha1Of(root, rel);
     const hit = cached?.facts[rel];
     if (hit && hit.sha1 === sha1) {
       facts[rel] = hit;
     } else if (sha1.startsWith("!")) {
-      continue; // unreadable; skip
+      unreadable.push(rel); // content unreadable (permissions, race): count it, skip it
+      continue;
     } else {
       dirty.push(rel);
       facts[rel] = { sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] };
@@ -198,7 +210,10 @@ export const loadFacts = (root: string, files: string[]): Record<string, FileFac
   } catch {
     // Cache is an optimization; never fail the build over it.
   }
-  return facts;
+  // Chunk-granular by construction: one failed invocation implicates its whole
+  // chunk, so dedupe across extraction stages (symbols + imports + calls + ...).
+  const failed = [...new Set(drainExtractionFailures().flatMap((failure) => failure.files))].sort();
+  return { facts, report: { failed, unreadable: unreadable.sort() } };
 };
 
 // --- resolution ---------------------------------------------------------------

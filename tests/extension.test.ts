@@ -9,10 +9,13 @@ import { describe, expect, it, vi } from "vitest";
 import extension from "../src/index.js";
 import { resetSessions } from "../src/core/session.js";
 import { hasAstGrep } from "../src/core/astgrep.js";
+import { cachePathFor } from "../src/core/build.js";
+import { ensureState } from "../src/core/ops.js";
 import { DEFAULT_FOVEA_CONFIG } from "../src/core/config.js";
 import { resetSyncBaselines } from "../src/core/sync.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
+
 
 interface ToolDef {
   name: string;
@@ -60,6 +63,7 @@ const load = () => {
       messages.push({ message, options });
     },
     exec: async (command: string, args: string[]) => {
+      execCalls.push({ command, args });
       try {
         return { code: 0, stdout: execFileSync(command, args, { encoding: "utf8" }), stderr: "" };
       } catch (error) {
@@ -69,6 +73,7 @@ const load = () => {
     registerTool: (definition: ToolDef) => tools.set(definition.name, definition),
     registerCommand: (name: string, definition: CommandDef) => commands.set(name, definition),
   } as never);
+  const execCalls: Array<{ command: string; args: string[] }> = [];
   const emit = async (
     name: string,
     event: Record<string, unknown>,
@@ -78,8 +83,9 @@ const load = () => {
     for (const handler of handlers.get(name) ?? []) results.push(await handler(event, ctx));
     return results;
   };
-  return { tools, commands, messages, emit };
+  return { tools, commands, messages, emit, execCalls };
 };
+
 
 const enableGrep = async () => {
   const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-grep-"));
@@ -136,6 +142,48 @@ describe("extension entry", () => {
       expect(schema.required).toEqual(["pattern"]);
     } finally {
       rmSync(loaded.root, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades bare-query grep to native text with a note when the graph backend errors", async () => {
+    const loaded = await enableGrep();
+    // Real native grep answers the query; only the graph backend is broken.
+    writeFileSync(path.join(loaded.root, "probe.ts"), "export function WhateverSymbol() {}\n");
+    vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
+    try {
+      const grep = loaded.tools.get("grep")!;
+      const ctx = fakeCtx(loaded.root, true);
+      const result = await grep.execute(
+        "1",
+        { pattern: "WhateverSymbol" },
+        new AbortController().signal,
+        undefined,
+        ctx,
+      );
+      expect(result.details.backend).toBe("native");
+      expect(String(result.details.foveaError)).toContain("ast-grep");
+      expect(result.content[0]!.text).toContain("native text results");
+      expect(result.content.map((block) => block.text).join("\n")).toContain("export function WhateverSymbol");
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(loaded.root, { recursive: true, force: true });
+    }
+  });
+
+  it("hard-errors a missing ast-grep once, then answers soft so work can continue natively", async () => {
+    const { tools } = load();
+    vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
+    try {
+      const sketchTool = tools.get("fovea_sketch")!;
+      const ctx = fakeCtx(FIXTURE);
+      const signal = new AbortController().signal;
+      await expect(sketchTool.execute("1", {}, signal, undefined, ctx)).rejects.toThrow(/ast-grep/);
+      const again = await sketchTool.execute("2", {}, signal, undefined, ctx);
+      expect(again.content[0]!.text).toContain("fovea unavailable");
+      expect(again.content[0]!.text).toContain("native");
+      expect(again.details.unavailable).toBe("ast-grep");
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 });
@@ -326,5 +374,32 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     );
     expect(result.content[0]!.text).toContain("fovea impact");
     expect(result.content[0]!.text).toContain("web/api.ts");
+  });
+
+  it("pre-warms only when ast-grep and a populated fact cache are present", async () => {
+    const loaded = load();
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-"));
+    const statusProbe = () =>
+      loaded.execCalls.filter((c) => c.command === "git" && c.args.includes("status")).length;
+    try {
+      writeFileSync(path.join(root, "probe.ts"), "export const probe = 1;\n");
+      // No fact cache for this root yet: session start must not pay index cost.
+      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
+      expect(statusProbe()).toBe(0);
+      // Populate the on-disk cache: the gate now passes the binary + cache
+      // checks and reaches the git drift probe (which may itself decline
+      // outside a git repo — the wiring point is that git is consulted).
+      ensureState(root);
+      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
+      expect(statusProbe()).toBe(1);
+      // ast-grep missing: the gate short-circuits before any git probe.
+      vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
+      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
+      expect(statusProbe()).toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cachePathFor(root), { force: true });
+    }
   });
 });
