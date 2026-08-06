@@ -11,7 +11,7 @@
 // The first sync establishes the baseline. Baselines reset on /new, /fork,
 // and /fovea reset alongside focus sessions.
 
-import { ensureState, impact, isTestScope } from "./ops.js";
+import { ensureState, ensureStateBackground, getInflight, getState, impact, isTestScope } from "./ops.js";
 import type { RepoState } from "./ops.js";
 import { getSession } from "./session.js";
 
@@ -27,6 +27,20 @@ interface SyncBaseline {
 }
 
 const baselines = new Map<string, SyncBaseline>();
+const MAX_BASELINE_ROOTS = 2;
+const getBaseline = (root: string): SyncBaseline | undefined => {
+  const hit = baselines.get(root);
+  if (hit) {
+    baselines.delete(root);
+    baselines.set(root, hit);
+  }
+  return hit;
+};
+const setBaseline = (root: string, baseline: SyncBaseline): void => {
+  baselines.delete(root);
+  baselines.set(root, baseline);
+  while (baselines.size > MAX_BASELINE_ROOTS) baselines.delete(baselines.keys().next().value!);
+};
 
 export const resetSyncBaselines = (): void => baselines.clear();
 
@@ -70,14 +84,30 @@ const snapshot = (state: RepoState): SyncBaseline => ({
   semantics: new Map(Object.keys(state.facts).map((file) => [file, semanticFacts(state, file)])),
 });
 
-export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOutcome => {
-  const state = now ?? ensureState(root);
-  const prev = baselines.get(root);
+export const sync = async (
+  root: string,
+  params: SyncParams,
+  now?: RepoState,
+  opts?: { probe?: "cheap" | "full" },
+): Promise<SyncOutcome> => {
+  let state = now;
+  if (!state) {
+    // Cold roots build in the background; a first answer beats a full build.
+    // Hooks live on the TUI thread — the "indexing" outcome is how callers
+    // learn to stay quiet this turn and let the background build land.
+    const warm = getState(root);
+    if (!warm) {
+      if (!getInflight(root)) ensureStateBackground(root);
+      return { structural: false, red: false, tokens: 0, details: { indexing: true } };
+    }
+    state = await ensureState(root, { hints: params.files, force: opts?.probe !== "cheap" });
+  }
+  const prev = getBaseline(root);
   if (prev && prev.version === state.version) {
     return { structural: false, red: false, tokens: 0, details: { version: state.version } };
   }
   if (!prev) {
-    baselines.set(root, snapshot(state));
+    setBaseline(root, snapshot(state));
     return {
       structural: true, red: false, tokens: 0,
       details: { version: state.version, baseline: "established", anchors: state.graph.anchors.length },
@@ -117,7 +147,7 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
   let warmNew: string[] = [];
   let warmReasons: Record<string, string[]> = {};
   if (files.length) {
-    const result = impact(root, { files, includeUncommitted: false, budget: params.budget });
+    const result = await impact(root, { files, includeUncommitted: false, budget: params.budget });
     const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
     warmReasons = (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {};
     warmNow = new Set(warmedFiles.filter((file) => !disclosedFiles.has(file) && !files.includes(file)));
@@ -126,9 +156,14 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
       : [...warmNow].filter((file) => !prev.warmed!.has(file));
   }
 
-  baselines.set(root, { ...snapshot(state), warmed: warmNow });
+  setBaseline(root, { ...snapshot(state), warmed: warmNow });
 
-  const red = (added.length - newlyImplicit.length) + removed.length > 0 ||
+  // Extraction failures leave fact gaps that look like anchor *removals* —
+  // never escalate red on removals while degraded; the degraded note is
+  // already loud in details.
+  const degraded = state.extraction.failed.length > 0;
+  const red = (added.length - newlyImplicit.length) > 0 ||
+    (removed.length > 0 && !degraded) ||
     deleted.some((file) => !isTestScope(file)) ||
     warmNew.length >= Math.max(1, params.warmFileThreshold);
   if (!red) {
@@ -141,6 +176,7 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
         changedFiles: changed,
         semanticChangedFiles: files,
         deletedFiles: deleted,
+        ...(degraded ? { extractionDegraded: true } : {}),
       },
     };
   }
@@ -191,6 +227,7 @@ export const sync = (root: string, params: SyncParams, now?: RepoState): SyncOut
       warmNew: orderedWarm,
       warmReasons,
       deletedFiles: deleted,
+      ...(degraded ? { extractionDegraded: true } : {}),
     },
   };
 };

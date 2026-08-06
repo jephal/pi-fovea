@@ -21,8 +21,8 @@ const enclosing = (syms: SymbolRec[]) => (file: string, line: number): string | 
 };
 
 describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
-  it("extracts symbols across Go, TypeScript and Python via outline", () => {
-    const syms = extractSymbols(CODE, FIXTURE);
+  it("extracts symbols across Go, TypeScript and Python via outline", async () => {
+    const syms = await extractSymbols(CODE, FIXTURE);
     const byId = new Map(syms.map((s) => [`${s.name}@${s.file}`, s]));
     expect(byId.get("GetUserHandler@server/users.go")?.kind).toBe("function");
     expect(byId.get("GetUserHandler@server/users.go")?.sig).toContain("func GetUserHandler");
@@ -60,8 +60,8 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(byId.get("AirportsController.search@web/airports.controller.ts")?.lineApproximate).not.toBe(true);
   });
 
-  it("extracts imports across languages", () => {
-    const imps = extractImports(CODE, FIXTURE);
+  it("extracts imports across languages", async () => {
+    const imps = await extractImports(CODE, FIXTURE);
     const has = (file: string, spec: string) => imps.some((i) => i.file === file && i.spec === spec);
     expect(has("web/api.ts", "./types")).toBe(true);
     expect(has("web/api.test.ts", "./api")).toBe(true);
@@ -69,16 +69,16 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(has("worker/jobs.py", "os")).toBe(true);
   });
 
-  it("extracts call sites with callee names", () => {
-    const calls = extractCalls(CODE, FIXTURE);
+  it("extracts call sites with callee names", async () => {
+    const calls = await extractCalls(CODE, FIXTURE);
     const has = (file: string, callee: string) => calls.some((c) => c.file === file && c.callee === callee);
     expect(has("server/users.go", "LoadUser")).toBe(true);
     expect(has("server/users.go", "SaveUser")).toBe(true);
     expect(has("web/api.ts", "fetch")).toBe(true);
   });
 
-  it("extracts literals from code and config files", () => {
-    const lits = extractLiterals(ALL, FIXTURE);
+  it("extracts literals from code and config files", async () => {
+    const lits = await extractLiterals(ALL, FIXTURE);
     const texts = lits.map((l) => `${l.text}@${l.file}`);
     expect(texts).toContain("/api/users/${id}@web/api.ts");
     expect(texts).toContain("/api/users/:id@server/main.go");
@@ -87,9 +87,9 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(texts).toContain("DATABASE_URL@worker/jobs.py");
   });
 
-  it("discovers route anchors from the default pack and binds handlers", () => {
-    const syms = extractSymbols(CODE, FIXTURE);
-    const anchors = extractAnchors(CODE, FIXTURE, enclosing(syms));
+  it("discovers route anchors from the default pack and binds handlers", async () => {
+    const syms = await extractSymbols(CODE, FIXTURE);
+    const anchors = await extractAnchors(CODE, FIXTURE, enclosing(syms));
     const labels = anchors.map((a) => `${a.id} -> ${a.nodeId}`);
     expect(labels.some((l) => l.startsWith("GET /api/users/{*}"))).toBe(true);
     expect(labels.some((l) => l.startsWith("POST /api/users"))).toBe(true);
@@ -100,9 +100,9 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect(labels.some((l) => l.startsWith("GET /api/airports/{*}"))).toBe(true);
   });
 
-  it("covers ecosystem route shapes: mux/chi/Spring/Django/Rails/Phoenix/Ktor", () => {
-    const syms = extractSymbols(ECO, FIXTURE);
-    const ids = new Set(extractAnchors(ECO, FIXTURE, enclosing(syms)).map((a) => a.id));
+  it("covers ecosystem route shapes: mux/chi/Spring/Django/Rails/Phoenix/Ktor", async () => {
+    const syms = await extractSymbols(ECO, FIXTURE);
+    const ids = new Set((await extractAnchors(ECO, FIXTURE, enclosing(syms))).map((a) => a.id));
     // Go 1.22 ServeMux carries the verb inside the pattern string.
     expect(ids.has("GET /healthz")).toBe(true);
     expect(ids.has("POST /v2/shutdown")).toBe(true);
@@ -131,8 +131,8 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
     expect([...ids].some((id) => id.includes("legacy"))).toBe(false);
   });
 
-  it("derives anchors from file-convention routers (Next/SvelteKit/Nuxt)", () => {
-    const drafts = extractFileRoutes(FILE_ROUTES, FIXTURE);
+  it("derives anchors from file-convention routers (Next/SvelteKit/Nuxt)", async () => {
+    const drafts = await extractFileRoutes(FILE_ROUTES, FIXTURE);
     const byId = new Map(drafts.map((d) => [d.id, d]));
     expect(byId.get("GET /api/orders")?.kind).toBe("route");
     expect(byId.has("POST /api/orders")).toBe(true);

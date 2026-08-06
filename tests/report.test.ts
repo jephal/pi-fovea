@@ -4,7 +4,7 @@
 // but exits 1 for everything else, so ensureState proceeds into genuinely
 // broken extraction.
 
-import { chmodSync, cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -41,28 +41,72 @@ const fakeAstGrep = (): string => {
 
 afterEach(() => vi.unstubAllEnvs());
 
+describe("bounded discovery", () => {
+  it("treats nested Git repositories and worktrees as project boundaries", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fovea-umbrella-"));
+    try {
+      writeFileSync(join(root, "top.ts"), "export const top = 1;\n");
+      mkdirSync(join(root, "plain"));
+      writeFileSync(join(root, "plain", "seen.ts"), "export const seen = 1;\n");
+      mkdirSync(join(root, "repo", ".git"), { recursive: true });
+      writeFileSync(join(root, "repo", "hidden.ts"), "export const hidden = 1;\n");
+      mkdirSync(join(root, "worktree"));
+      writeFileSync(join(root, "worktree", ".git"), "gitdir: /tmp/elsewhere\n");
+      writeFileSync(join(root, "worktree", "hidden.ts"), "export const hidden = 2;\n");
+
+      expect(await listFiles(root)).toEqual(["plain/seen.ts", "top.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports and omits individual source files over the memory safety cap", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fovea-oversized-"));
+    try {
+      writeFileSync(join(root, "generated.ts"), "x".repeat(2 * 1024 * 1024 + 1));
+      const { store, report } = await loadFacts(root, await listFiles(root));
+      expect(report.oversized).toEqual(["generated.ts"]);
+      expect(store.facts.has("generated.ts")).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cachePathFor(root), { force: true });
+    }
+  });
+});
+
 describe("extraction failure reporting", () => {
-  it("names the implicated files when every ast-grep invocation fails", () => {
+  it("names the implicated files when every ast-grep invocation fails", async () => {
     const { root, cleanup } = copyFixture();
     try {
       vi.stubEnv("FOVEA_AST_GREP", fakeAstGrep());
-      const files = listFiles(root);
-      const { facts, report } = loadFacts(root, files);
+      const files = await listFiles(root);
+      const { store, report } = await loadFacts(root, files);
       expect(report.unreadable).toEqual([]);
       expect(report.failed.length).toBeGreaterThan(0);
       expect(report.failed).toContain("server/main.go");
-      expect(facts["server/main.go"]?.symbols).toEqual([]);
+      expect(store.facts.get("server/main.go")?.symbols).toEqual([]);
+
+      // A fact-free hash/stat marker preserves honest failure coverage without
+      // retrying unchanged broken extraction on every launch.
+      const unchanged = await loadFacts(root, files);
+      expect(unchanged.dirty).toEqual([]);
+      expect(unchanged.report.failed).toContain("server/main.go");
+
+      writeFileSync(join(root, "server/main.go"), "package server\nfunc Changed() {}\n");
+      const changed = await loadFacts(root, files);
+      expect(changed.dirty).toContain("server/main.go");
+      expect(changed.report.failed).toContain("server/main.go");
     } finally {
       cleanup();
     }
   });
 
-  it("sketch renders the failure banner and exposes the failure details", () => {
+  it("sketch renders the failure banner and exposes the failure details", async () => {
     const { root, cleanup } = copyFixture();
     try {
       vi.stubEnv("FOVEA_AST_GREP", fakeAstGrep());
       resetSessions();
-      const r = sketch(root, 900);
+      const r = await sketch(root, 900);
       expect(Number(r.details.extractionFailures)).toBeGreaterThan(0);
       expect((r.details.extractionFailedFiles as string[]).length).toBeGreaterThan(0);
       expect(r.text).toContain("failed extraction");
@@ -73,18 +117,18 @@ describe("extraction failure reporting", () => {
 });
 
 describe.skipIf(!hasAstGrep())("healthy extraction", () => {
-  it("reports zero failures and drains a previous run's ledger", () => {
+  it("reports zero failures and drains a previous run's ledger", async () => {
     const bad = copyFixture();
     const good = copyFixture();
     try {
       vi.stubEnv("FOVEA_AST_GREP", fakeAstGrep());
-      loadFacts(bad.root, listFiles(bad.root)); // poison the ledger, then drain
+      await loadFacts(bad.root, await listFiles(bad.root)); // poison the ledger, then drain
       vi.unstubAllEnvs();
-      const { report } = loadFacts(good.root, listFiles(good.root));
+      const { report } = await loadFacts(good.root, await listFiles(good.root));
       expect(report.failed).toEqual([]);
       expect(report.unreadable).toEqual([]);
       resetSessions();
-      const r = sketch(good.root, 900);
+      const r = await sketch(good.root, 900);
       expect(Number(r.details.extractionFailures)).toBe(0);
       expect(r.text).not.toContain("failed extraction");
     } finally {

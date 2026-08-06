@@ -4,11 +4,22 @@
 // time and returns the delta, impact seeds from changed files.
 
 import { createHash } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { posix } from "node:path";
-import { hasAstGrep } from "./astgrep.js";
-import { assembleGraph, listFiles, loadFacts, type ExtractionReport, type FileFacts } from "./build.js";
+import { hasAstGrepAsync } from "./astgrep.js";
+import {
+  assembleGraph,
+  clearPersistTimer,
+  filterSupported,
+  listFiles,
+  loadFacts,
+  refreshFacts,
+  type ExtractionReport,
+  type FactStore,
+  type FileFacts,
+} from "./build.js";
+import { gitProbe, prFiles, uncommittedFiles } from "./git.js";
+import { envInt, yieldToLoop } from "./asyncutil.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
 import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine, type RevealedNode } from "./render.js";
@@ -30,13 +41,78 @@ export interface RepoState {
   graph: Graph;
   csr: Csr;
   joinIndex: JoinIndex;
+  /** facts → FileFacts snapshot for this version; records are immutable per generation. */
   facts: Record<string, FileFacts>;
   /** What extraction dropped on the floor building this graph version. */
   extraction: ExtractionReport;
   adjacency: Map<number, Array<{ to: number; kind: string; w: number }>>;
+  /** The live mutation container; facts/meta records are replaced immutably on refresh. */
+  store: FactStore;
+  /** Authoritative file listing for this version. */
+  files: string[];
+  gitKind: "git" | "plain";
+  head: string | undefined;
+  probedAt: number;
+  walkedAt: number;
+  sweptAt: number;
 }
 
-const states = new Map<string, RepoState>();
+// State lifecycle: background builds, probe-gated refreshes, LRU eviction.
+// pi runs hooks on one JS thread, so ensureState must never block the first
+// resolvable answer behind a full rebuild.
+
+const states = new Map<string, RepoState>(); // insertion order doubles as LRU order
+const inflight = new Map<string, Promise<RepoState>>();
+// Each resident root holds a full fact store + graph; two warm roots is the
+// right default for mega-folder hopping (override with FOVEA_MAX_ROOTS).
+const MAX_ROOTS = envInt("FOVEA_MAX_ROOTS", 2, 1, 32);
+const WALK_GAP_MS = envInt("FOVEA_WALK_GAP_MS", 4000, 500, 300_000);
+const SWEEP_GAP_MS = envInt("FOVEA_SWEEP_GAP_MS", 20_000, 2000, 600_000);
+
+const touch = (root: string): RepoState | undefined => {
+  const st = states.get(root);
+  if (st) {
+    states.delete(root);
+    states.set(root, st);
+  }
+  return st;
+};
+
+const evictLru = (): void => {
+  while (states.size > MAX_ROOTS) {
+    const oldest = states.keys().next().value!;
+    states.delete(oldest);
+    inflight.delete(oldest);
+    clearPersistTimer(oldest);
+  }
+};
+
+/** Warm state if present (does not block). */
+export const getState = (root: string): RepoState | undefined => touch(root);
+
+/** Ongoing build/refresh for root, if any (does not block). */
+export const getInflight = (root: string): Promise<RepoState> | undefined => inflight.get(root);
+
+/** Drop resident state (tests); the on-disk fact cache survives. */
+export const evictState = (root: string): void => {
+  states.delete(root);
+  inflight.delete(root);
+  clearPersistTimer(root);
+};
+
+// All live fact passes serialize through one chain. Extraction-failure
+// attribution is a process-wide ledger (astgrep cannot see nested passes),
+// so overlapping passes would misblame files — and piled-up ast-grep spawns
+// would freeze the host anyway. The chain itself never rejects.
+let factChain: Promise<unknown> = Promise.resolve();
+const factPass = <T>(job: () => Promise<T>): Promise<T> => {
+  const run = factChain.then(job, job);
+  factChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+};
 
 const graphVersion = (facts: Record<string, FileFacts>): string =>
   createHash("sha1")
@@ -44,24 +120,24 @@ const graphVersion = (facts: Record<string, FileFacts>): string =>
     .digest("hex")
     .slice(0, 12);
 
-export const ensureState = (root: string): RepoState => {
-  if (!existsSync(root) || !statSync(root).isDirectory()) {
-    throw new Error(`fovea: root does not exist or is not a directory: ${root}`);
-  }
-  if (!hasAstGrep()) {
-    throw new Error(
-      "fovea: `ast-grep` binary not found on PATH (set FOVEA_AST_GREP to override). Install: https://ast-grep.github.io/",
-    );
-  }
-  const { fileRoutes } = loadRepoRules(root);
-  const routeRes = fileRoutes.map((r) => new RegExp(r.re));
-  const files = listFiles(root, routeRes);
-  const { facts, report: extraction } = loadFacts(root, files);
+const assembleState = async (
+  root: string,
+  files: string[],
+  store: FactStore,
+  extraction: ExtractionReport,
+  gitKind: "git" | "plain",
+  head: string | undefined,
+): Promise<RepoState> => {
+  // Snapshot the generation: refresh replaces fact records wholesale, so the
+  // Record view stays a stable witness for baselines (sync).
+  const facts: Record<string, FileFacts> = {};
+  for (const [k, v] of store.facts) facts[k] = v;
+  await yieldToLoop();
   const version = graphVersion(facts);
-  const cached = states.get(root);
-  if (cached && cached.version === version) return cached;
-  const graph = assembleGraph(root, files, facts);
+  const graph = await assembleGraph(root, files, store.facts);
+  await yieldToLoop();
   const csr = buildCsr(graph);
+  await yieldToLoop();
   const sites = Object.values(facts).flatMap((f) => f.literals);
   const joinIndex = buildJoinIndex(sites, (file, line) => {
     const arr = graph.byFile.get(file) ?? [];
@@ -72,14 +148,144 @@ export const ensureState = (root: string): RepoState => {
     }
     return best;
   });
+  await yieldToLoop();
   const adjacency = new Map<number, Array<{ to: number; kind: string; w: number }>>();
   for (const e of graph.edges) {
     (adjacency.get(e.a) ?? adjacency.set(e.a, []).get(e.a)!).push({ to: e.b, kind: e.kind, w: e.w });
     (adjacency.get(e.b) ?? adjacency.set(e.b, []).get(e.b)!).push({ to: e.a, kind: e.kind, w: e.w });
   }
-  const state: RepoState = { root, version, graph, csr, joinIndex, facts, extraction, adjacency };
-  states.set(root, state);
-  return state;
+  // impact's path-reason walk used to sort a fresh copy of this list per
+  // visited node; identical comparator, pre-sorted once here.
+  for (const list of adjacency.values()) {
+    list.sort((a, b) => Number(a.kind === "contains") - Number(b.kind === "contains") || b.w - a.w || a.to - b.to);
+  }
+  const stamp = Date.now();
+  return { root, version, graph, csr, joinIndex, facts, extraction, adjacency, store, files, gitKind, head, probedAt: stamp, walkedAt: stamp, sweptAt: stamp };
+};
+
+const buildState = async (root: string): Promise<RepoState> => {
+  if (!(await hasAstGrepAsync())) {
+    throw new Error(
+      "fovea: `ast-grep` binary not found on PATH (set FOVEA_AST_GREP to override). Install: https://ast-grep.github.io/",
+    );
+  }
+  const { fileRoutes } = await loadRepoRules(root);
+  const routeRes = fileRoutes.map((r) => new RegExp(r.re));
+  const probe = await gitProbe(root);
+  const gitKind: RepoState["gitKind"] = probe ? "git" : "plain";
+  const files = await listFiles(root, routeRes);
+  const { store, report } = await factPass(() => loadFacts(root, files));
+  return assembleState(root, files, store, report, gitKind, probe?.head);
+};
+
+const refreshState = async (state: RepoState, hints: string[] = [], force = false): Promise<RepoState> => {
+  const now = Date.now();
+  // No probe-short-circuit across turns: git porcelain is ~40ms behind the
+  // spawn gate and is the correctness oracle; plain roots gate on their own
+  // walk/sweep intervals below. In-flight dedupe already coalesces bursts.
+  const { fileRoutes } = await loadRepoRules(state.root);
+  const routeRes = fileRoutes.map((r) => new RegExp(r.re));
+  const store = state.store;
+  let files = state.files;
+  const changed: string[] = [];
+  const deleted: string[] = [];
+  const hinted = [...new Set([...filterSupported(hints, routeRes), ...hints.filter((h) => store.facts.has(h))])];
+  changed.push(...hinted);
+
+  if (state.gitKind === "git") {
+    const probe = await gitProbe(state.root);
+    if (probe) {
+      const headMoved = probe.head !== state.head;
+      state.head = probe.head;
+      // Untracked directories appear collapsed ("dir/") in porcelain; adds
+      // inside them only surface through a relist. Relist moments are rare.
+      const needsList = probe.relist || probe.changes.some((c) => c.path.endsWith("/"));
+      if (needsList) {
+        files = await listFiles(state.root, routeRes);
+        changed.push(...state.files);
+      } else {
+        // HEAD moved with a clean status means a checkout: worktree content
+        // re-materialized under fresh mtimes, so sweep everything once.
+        if (headMoved) changed.push(...state.files);
+        for (const c of probe.changes) {
+          const p = c.path;
+          if (!p || p.endsWith("/")) continue;
+          if (c.code.includes("D")) {
+            if (store.facts.has(p) || store.failedSha.has(p)) deleted.push(p);
+          } else if (store.facts.has(p) || filterSupported([p], routeRes).length) {
+            changed.push(p);
+          }
+        }
+      }
+    } else {
+      // .git vanished (moved/renamed out from under us): degrade to plain.
+      state.gitKind = "plain";
+    }
+  }
+  if (state.gitKind === "plain") {
+    const walkDue = now - state.walkedAt > WALK_GAP_MS;
+    if (force || walkDue || changed.length) {
+      files = await listFiles(state.root, routeRes);
+      state.walkedAt = now;
+      if (force || now - state.sweptAt > SWEEP_GAP_MS) {
+        state.sweptAt = now;
+        changed.push(...state.files);
+      }
+    }
+  }
+
+  if (!changed.length && !deleted.length && files === state.files) {
+    state.probedAt = Date.now();
+    return state;
+  }
+  const { report, stats } = await factPass(() =>
+    refreshFacts(state.root, store, files, [...new Set(changed)], [...new Set(deleted)]),
+  );
+  const noDelta =
+    !stats.reExtracted.length && !stats.deleted.length && !stats.added.length && files.length === state.files.length;
+  if (noDelta) {
+    state.probedAt = Date.now();
+    state.extraction = report; // reports are state-wide (taint/unreadable live in the store)
+    state.files = files;
+    return state;
+  }
+  const fresh = await assembleState(state.root, files, store, report, state.gitKind, state.head);
+  states.set(state.root, fresh);
+  state.probedAt = Date.now();
+  return fresh;
+};
+
+export const ensureState = (root: string, opts: { hints?: string[]; force?: boolean } = {}): Promise<RepoState> => {
+  const pending = inflight.get(root);
+  if (pending) return pending;
+  const warm = touch(root);
+  const p: Promise<RepoState> = warm
+    ? refreshState(warm, opts.hints, opts.force)
+    : (async () => {
+        const st = await stat(root).catch(() => undefined);
+        if (!st?.isDirectory()) throw new Error(`fovea: root does not exist or is not a directory: ${root}`);
+        const state = await buildState(root);
+        states.set(root, state);
+        evictLru();
+        return state;
+      })();
+  inflight.set(root, p);
+  p.then(
+    () => inflight.delete(root),
+    () => inflight.delete(root),
+  );
+  return p;
+};
+
+/**
+ * Fire-and-forget indexing. started=true when this call kicked a cold build;
+ * the completion is always awaitable via the returned promise.
+ */
+export const ensureStateBackground = (root: string): { started: boolean; promise: Promise<RepoState> } => {
+  if (states.has(root) || inflight.has(root)) {
+    return { started: false, promise: ensureState(root) };
+  }
+  return { started: true, promise: ensureState(root) };
 };
 
 // Honest coverage: surface dropped extractions instead of letting a thin
@@ -89,6 +295,7 @@ const extractionSuffix = (state: RepoState): string => {
   const parts: string[] = [];
   if (state.extraction.failed.length) parts.push(`!${state.extraction.failed.length} files failed extraction`);
   if (state.extraction.unreadable.length) parts.push(`!${state.extraction.unreadable.length} files unreadable`);
+  if (state.extraction.oversized.length) parts.push(`!${state.extraction.oversized.length} files over size cap`);
   return parts.length ? ` · ${parts.join(", ")}` : "";
 };
 
@@ -96,6 +303,7 @@ const extractionDetails = (state: RepoState): Record<string, unknown> => ({
   extractionFailures: state.extraction.failed.length,
   extractionFailedFiles: state.extraction.failed.slice(0, 20),
   extractionUnreadable: state.extraction.unreadable,
+  extractionOversized: state.extraction.oversized,
 });
 
 // Seed resolution.
@@ -330,8 +538,8 @@ export const isTestScope = (file: string): boolean =>
   isTestFile(file) || /(^|\/)(tests?|__tests__|fixtures?)(\/|$)/i.test(file);
 
 
-export const sketch = (root: string, budget?: number): OpResult => {
-  const state = ensureState(root);
+export const sketch = async (root: string, budget?: number): Promise<OpResult> => {
+  const state = await ensureState(root);
   const g = state.graph;
   const B = clampBudget(budget, 1400);
 
@@ -470,8 +678,8 @@ export const sketch = (root: string, budget?: number): OpResult => {
   };
 };
 
-export const focus = (root: string, query: string, budget?: number, options: FocusOptions = {}): OpResult => {
-  const state = ensureState(root);
+export const focus = async (root: string, query: string, budget?: number, options: FocusOptions = {}): Promise<OpResult> => {
+  const state = await ensureState(root);
   const g = state.graph;
   const session = getSession(root);
   const B = clampBudget(budget, 2000);
@@ -559,8 +767,8 @@ export const focus = (root: string, query: string, budget?: number, options: Foc
   };
 };
 
-export const dwell = (root: string, factor?: number, budget?: number): OpResult => {
-  const state = ensureState(root);
+export const dwell = async (root: string, factor?: number, budget?: number): Promise<OpResult> => {
+  const state = await ensureState(root);
   const g = state.graph;
   const session = getSession(root);
   const B = clampBudget(budget, 2000);
@@ -619,32 +827,13 @@ export interface ImpactArgs {
   budget?: number;
 }
 
-export const uncommittedFiles = (root: string): string[] => {
-  const res = spawnSync("git", ["-C", root, "status", "--porcelain", "-z"], { encoding: "utf8", timeout: 15_000 });
-  if (res.error || res.status !== 0 || !res.stdout) return [];
-  const out: string[] = [];
-  for (const entry of res.stdout.split("\0")) {
-    if (!entry) continue;
-    const path = entry.slice(3);
-    const arrow = path.indexOf(" -> ");
-    out.push(arrow >= 0 ? path.slice(arrow + 4) : path);
-  }
-  return out.filter(Boolean);
-};
-
-const prFiles = (root: string, base: string): string[] => {
-  const res = spawnSync("git", ["-C", root, "diff", "--name-only", `${base}...HEAD`], { encoding: "utf8", timeout: 15_000 });
-  if (res.error || res.status !== 0 || !res.stdout) return [];
-  return res.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-};
-
-export const impact = (root: string, args: ImpactArgs): OpResult => {
-  const state = ensureState(root);
+export const impact = async (root: string, args: ImpactArgs): Promise<OpResult> => {
+  const state = await ensureState(root);
   const g = state.graph;
   const B = clampBudget(args.budget, 2000);
   const files = new Set<string>(args.files ?? []);
-  if (args.base) for (const f of prFiles(root, args.base)) files.add(f);
-  if (args.includeUncommitted !== false && !args.base) for (const f of uncommittedFiles(root)) files.add(f);
+  if (args.base) for (const f of await prFiles(root, args.base)) files.add(f);
+  if (args.includeUncommitted !== false && !args.base) for (const f of await uncommittedFiles(root)) files.add(f);
 
   const seedSet = new Set<number>();
   for (const rel of files) {
@@ -721,9 +910,7 @@ export const impact = (root: string, args: ImpactArgs): OpResult => {
   const queue = seeds.map((node) => ({ node, reasons: [] as string[] }));
   for (let head = 0; head < queue.length; head++) {
     const current = queue[head]!;
-    const edges = [...(state.adjacency.get(current.node) ?? [])]
-      .sort((a, b) => Number(a.kind === "contains") - Number(b.kind === "contains") || b.w - a.w || a.to - b.to);
-    for (const edge of edges) {
+    for (const edge of state.adjacency.get(current.node) ?? []) {
       if (visited.has(edge.to)) continue;
       visited.add(edge.to);
       const reason = reasonFor(edge.kind as Graph["edges"][number]["kind"]);

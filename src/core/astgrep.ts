@@ -1,7 +1,13 @@
 // Thin runner over the ast-grep CLI. All extraction goes through here.
 // Resolution: FOVEA_AST_GREP env var, then `ast-grep` on PATH.
+//
+// Everything is async and gated: a cold build fans chunk invocations out to
+// SPAWN_CONCURRENCY processes instead of serializing spawnSync behind the
+// TUI's event loop. On a 348-file repo that alone takes cold builds from
+// ~27s to ~4s, and the loop never stalls waiting on a child.
 
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { SPAWN_CONCURRENCY, mapLimit, spawnGate } from "./asyncutil.js";
 
 export const LANG_BY_EXT: Record<string, string> = {
   ts: "TypeScript", tsx: "Tsx", mts: "TypeScript", cts: "TypeScript",
@@ -42,11 +48,46 @@ export interface AgMatch {
 
 const binary = (): string => process.env.FOVEA_AST_GREP ?? "ast-grep";
 
+// One spawnSync probe per binary path, memoized: ensureState used to pay a
+// ~40ms subprocess on EVERY invocation. Success is sticky; failures re-probe
+// after a short TTL so an install mid-session self-heals without a reload.
+const availability = new Map<string, { ok: boolean; at: number }>();
+const availabilityInflight = new Map<string, Promise<boolean>>();
+const FAILURE_TTL_MS = 15_000;
+
 export const hasAstGrep = (): boolean => {
-  const r = spawnSync(binary(), ["--version"], { encoding: "utf8" });
-  return !r.error && r.status === 0;
+  const bin = binary();
+  const hit = availability.get(bin);
+  if (hit && (hit.ok || Date.now() - hit.at < FAILURE_TTL_MS)) return hit.ok;
+  const r = spawnSync(bin, ["--version"], { encoding: "utf8" });
+  const ok = !r.error && r.status === 0;
+  availability.set(bin, { ok, at: Date.now() });
+  return ok;
 };
 
+/** Non-blocking availability probe for extension hooks and graph builds. */
+export const hasAstGrepAsync = (): Promise<boolean> => {
+  const bin = binary();
+  const hit = availability.get(bin);
+  if (hit && (hit.ok || Date.now() - hit.at < FAILURE_TTL_MS)) return Promise.resolve(hit.ok);
+  const pending = availabilityInflight.get(bin);
+  if (pending) return pending;
+  const probe = spawnGate.run(
+    () => new Promise<boolean>((resolve) => {
+      execFile(bin, ["--version"], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 }, (error) => {
+        resolve(!error);
+      });
+    }),
+  ).then((ok) => {
+    availability.set(bin, { ok, at: Date.now() });
+    return ok;
+  }).finally(() => availabilityInflight.delete(bin));
+  availabilityInflight.set(bin, probe);
+  return probe;
+};
+
+// Import-file argument lists on Windows cap around 8k chars; keep chunks
+// conservative. Chunk count = ceil(files / CHUNK) per stage invocation.
 const CHUNK = 160;
 
 // Extraction honesty ledger: a failed ast-grep invocation implicates every
@@ -63,23 +104,51 @@ const recordFailure = (op: ExtractionFailure["op"], files: string[], lang?: stri
 };
 export const drainExtractionFailures = (): ExtractionFailure[] => failures.splice(0, failures.length);
 
-const run = (args: string[], cwd: string): { ok: boolean; stdout: string } => {
-  const res = spawnSync(binary(), args, {
-    cwd,
-    encoding: "utf8",
-    timeout: 120_000,
-    maxBuffer: 128 * 1024 * 1024,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  if (res.error || res.signal) return { ok: false, stdout: "" };
-  if (res.status !== 0) {
-    // grep convention: `ast-grep run` exits 1 silently on zero matches, so a
-    // bare non-zero status is not a failure. Only a verbose one is.
-    if ((res.stderr ?? "").trim()) return { ok: false, stdout: "" };
-    return { ok: true, stdout: "" };
-  }
-  return { ok: true, stdout: res.stdout ?? "" };
-};
+const RUN_TIMEOUT = 120_000;
+// 160-file chunks answer a few MB typically; the cap exists so a pathological
+// JSON dump fails one chunk instead of inflating the gate's resident set.
+const RUN_MAX_BUFFER = 16 * 1024 * 1024;
+
+interface RunResult { ok: boolean; stdout: string; split: boolean }
+
+const run = async (args: string[], cwd: string): Promise<RunResult> =>
+  spawnGate.run(
+    () =>
+      new Promise<RunResult>((resolve) => {
+        execFile(
+          binary(),
+          args,
+          { cwd, encoding: "utf8", timeout: RUN_TIMEOUT, maxBuffer: RUN_MAX_BUFFER },
+          (error, stdout, stderr) => {
+            // A maxBuffer breach is a memory guard, not an extraction error:
+            // rerun smaller chunks until each response fits the same ceiling.
+            if (error && error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+              resolve({ ok: false, stdout: "", split: true });
+              return;
+            }
+            // Spawn errors surface a non-numeric code (ENOENT/EACCES); a
+            // numeric code is a real process exit. Killed/signaled = timeout.
+            if (error && typeof error.code !== "number") {
+              resolve({ ok: false, stdout: "", split: false });
+              return;
+            }
+            const status = (error && typeof error.code === "number" ? error.code : 0) as number;
+            if (status !== 0) {
+              // grep convention: `ast-grep run` exits 1 silently on zero
+              // matches, so a bare non-zero status is not a failure. Only a
+              // verbose one is.
+              if ((stderr ?? "").trim()) {
+                resolve({ ok: false, stdout: "", split: false });
+                return;
+              }
+              resolve({ ok: true, stdout: "", split: false });
+              return;
+            }
+            resolve({ ok: true, stdout: stdout ?? "", split: false });
+          },
+        );
+      }),
+  );
 
 export const langOf = (file: string): string | undefined => {
   const ext = file.split(".").pop()?.toLowerCase() ?? "";
@@ -126,22 +195,47 @@ export interface OutlineFile {
   items: OutlineSymbol[];
 }
 
+// Chunks of one stage fan out concurrently, bounded by the shared spawn gate.
+// Order is preserved (mapLimit keeps indices) so concatenated text output
+// stays deterministic for the outline parser.
+const runChunked = async (
+  files: string[],
+  chunkArgs: (chunk: string[]) => string[],
+  cwd: string,
+): Promise<Array<{ chunk: string[]; result: RunResult }>> => {
+  const chunks: string[][] = [];
+  for (let i = 0; i < files.length; i += CHUNK) chunks.push(files.slice(i, i + CHUNK));
+  const adaptive = async (chunk: string[]): Promise<Array<{ chunk: string[]; result: RunResult }>> => {
+    const result = await run(chunkArgs(chunk), cwd);
+    if (!result.split || chunk.length === 1) return [{ chunk, result }];
+    const middle = Math.ceil(chunk.length / 2);
+    const halves = await Promise.all([
+      adaptive(chunk.slice(0, middle)),
+      adaptive(chunk.slice(middle)),
+    ]);
+    return [...halves[0], ...halves[1]];
+  };
+  const settled = await mapLimit(chunks, SPAWN_CONCURRENCY, adaptive);
+  return settled.flat();
+};
+
 // Expanded JSON preserves each member's own range and signature. Return
 // undefined when the installed ast-grep predates this interface so callers can
 // fall back without presenting parent locations as exact member locations.
-export const outlineStructured = (files: string[], lang: string, cwd: string): OutlineFile[] | undefined => {
+export const outlineStructured = async (files: string[], lang: string, cwd: string): Promise<OutlineFile[] | undefined> => {
   const out: OutlineFile[] = [];
-  for (let i = 0; i < files.length; i += CHUNK) {
-    // A subprocess failure here is NOT recorded: extractSymbols falls back to
-    // the text outline for old ast-grep versions, and that text run is what
-    // records a genuine failure (old versions must not read as failures).
-    const { stdout } = run(
-      ["outline", "--json=compact", "--view=expanded", ...files.slice(i, i + CHUNK)],
-      cwd,
-    );
-    if (!stdout.trim()) return undefined;
+  // A subprocess failure here is NOT recorded: extractSymbols falls back to
+  // the text outline for old ast-grep versions, and that text run is what
+  // records a genuine failure (old versions must not read as failures).
+  const settled = await runChunked(
+    files,
+    (chunk) => ["outline", "--json=compact", "--view=expanded", ...chunk],
+    cwd,
+  );
+  for (const { result } of settled) {
+    if (!result.stdout.trim()) return undefined;
     try {
-      const parsed = JSON.parse(stdout) as OutlineFile[];
+      const parsed = JSON.parse(result.stdout) as OutlineFile[];
       if (!Array.isArray(parsed)) return undefined;
       for (const file of parsed) out.push(file);
     } catch {
@@ -152,16 +246,15 @@ export const outlineStructured = (files: string[], lang: string, cwd: string): O
   return out;
 };
 
-export const outline = (files: string[], lang: string, cwd: string): string => {
+export const outline = async (files: string[], lang: string, cwd: string): Promise<string> => {
   let out = "";
-  for (let i = 0; i < files.length; i += CHUNK) {
-    const chunk = files.slice(i, i + CHUNK);
-    const { ok, stdout } = run(["outline", ...chunk], cwd);
-    if (!ok) {
+  const settled = await runChunked(files, (chunk) => ["outline", ...chunk], cwd);
+  for (const { chunk, result } of settled) {
+    if (!result.ok) {
       recordFailure("outline", chunk, lang);
       continue;
     }
-    out += stdout;
+    out += result.stdout;
   }
   return out;
 };
@@ -177,27 +270,27 @@ interface RawMatch {
 }
 
 // `ast-grep run --pattern` with JSON output for a set of files of one language.
-export const patternRun = (
+export const patternRun = async (
   pattern: string,
   lang: string,
   files: string[],
   cwd: string,
-): AgMatch[] => {
+): Promise<AgMatch[]> => {
   const out: AgMatch[] = [];
-  for (let i = 0; i < files.length; i += CHUNK) {
-    const chunk = files.slice(i, i + CHUNK);
-    const { ok, stdout } = run(
-      ["run", "--pattern", pattern, "--lang", lang, "--json=compact", ...chunk],
-      cwd,
-    );
-    if (!ok) {
+  const settled = await runChunked(
+    files,
+    (chunk) => ["run", "--pattern", pattern, "--lang", lang, "--json=compact", ...chunk],
+    cwd,
+  );
+  for (const { chunk, result } of settled) {
+    if (!result.ok) {
       recordFailure("run", chunk, lang);
       continue;
     }
-    if (!stdout.trim()) continue;
+    if (!result.stdout.trim()) continue;
     let parsed: RawMatch[];
     try {
-      parsed = JSON.parse(stdout) as RawMatch[];
+      parsed = JSON.parse(result.stdout) as RawMatch[];
     } catch {
       continue;
     }
@@ -214,18 +307,22 @@ export const patternRun = (
 };
 
 // First match of any of the patterns, per language/file set, concatenated.
-// Spread-pushing big match arrays overflows the argument-list limit, so
-// concatenate manually.
-const pushAll = <T>(out: T[], more: T[]): void => { for (const x of more) out.push(x); };
-
-// First match of any of the patterns, per language/file set, concatenated.
-export const patternRunAll = (
+// Patterns run concurrently (bounded by the spawn gate): per-stage latency
+// collapses from O(patterns * chunks) processes-sequential to ~the slowest
+// slice of chunks wide SPAWN_CONCURRENCY.
+export const patternRunAll = async (
   patterns: string[],
   lang: string,
   files: string[],
   cwd: string,
-): AgMatch[] => {
+): Promise<AgMatch[]> => {
+  const perPattern = await mapLimit(patterns, patterns.length || 1, (p) => patternRun(p, lang, files, cwd));
   const out: AgMatch[] = [];
-  for (const p of patterns) pushAll(out, patternRun(p, lang, files, cwd));
+  for (const matches of perPattern) for (const m of matches) out.push(m);
   return out;
 };
+
+// Spread-pushing big arrays overflows the argument-list limit, so
+// concatenate manually.
+const pushAll = <T>(out: T[], more: T[]): void => { for (const x of more) out.push(x); };
+void pushAll;

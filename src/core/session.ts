@@ -27,10 +27,15 @@ export const FOCUS_T0 = 2;
 export const TK_ORDER = 80; // covers dwell up to t ~ 33 with full accuracy
 
 const sessions = new Map<string, FoveaSession>();
+const MAX_SESSION_ROOTS = 2;
 
 export const getSession = (root: string): FoveaSession => {
   const hit = sessions.get(root);
-  if (hit) return hit;
+  if (hit) {
+    sessions.delete(root);
+    sessions.set(root, hit);
+    return hit;
+  }
   const s: FoveaSession = {
     root,
     t: FOCUS_T0,
@@ -43,19 +48,13 @@ export const getSession = (root: string): FoveaSession => {
     tkKey: "",
   };
   sessions.set(root, s);
+  while (sessions.size > MAX_SESSION_ROOTS) sessions.delete(sessions.keys().next().value!);
   return s;
 };
 
 // `/new` and friends: same repo, fresh eyes.
 export const resetSessions = (): void => {
-  for (const s of sessions.values()) {
-    s.t = FOCUS_T0;
-    s.seeds = [];
-    s.seedNote = "";
-    s.focusKey = "";
-    s.scope = {};
-    s.disclosed.clear();
-    s.tk = [];
-    s.tkKey = "";
-  }
+  // A fresh conversation cannot reuse disclosure or Chebyshev vectors; drop
+  // the entries outright so large Float64Array stacks become collectible.
+  sessions.clear();
 };

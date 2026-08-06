@@ -1,10 +1,10 @@
 // Per-file extraction: symbols (ast-grep outline), imports, calls, literals.
 // Pure functions of file content where possible; each stage is separately
 // cached by file content hash in build.ts, which is what makes re-indexing
-// incremental (dirty files only).
+// incremental (dirty files only). All subprocess work is async and gated
+// (see astgrep.ts); file content flows through the shared FileSource so a
+// bounded hash-time prefetches are reused; overflow files are read lazily.
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   groupByLang,
   isConfigFile,
@@ -14,6 +14,8 @@ import {
   type OutlineFile,
   type OutlineSymbol,
 } from "./astgrep.js";
+import { mapLimit } from "./asyncutil.js";
+import { makeFileSource, type FileSource } from "./source.js";
 import type {
   CallSite,
   ImportSite,
@@ -136,26 +138,15 @@ const identifierRe = (name: string): RegExp =>
   new RegExp(`(^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9_$]|$)`);
 
 const topLocation = (
-  file: string,
   item: OutlineSymbol,
-  cwd: string,
-  sourceCache: Map<string, string[]>,
+  sourceLines: readonly string[],
 ): { line: number; sig: string } => {
   let line = item.range.start.line + 1;
   let sig = cleanSig(item.signature || item.name);
   if (item.name && (!identifierRe(item.name).test(sig) || /^@/.test(sig))) {
-    let lines = sourceCache.get(file);
-    if (!lines) {
-      try {
-        lines = readFileSync(join(cwd, file), "utf8").split("\n");
-      } catch {
-        lines = [];
-      }
-      sourceCache.set(file, lines);
-    }
-    const end = Math.min(lines.length - 1, item.range.end?.line ?? item.range.start.line + 12);
+    const end = Math.min(sourceLines.length - 1, item.range.end?.line ?? item.range.start.line + 12);
     for (let i = item.range.start.line; i <= end; i++) {
-      const candidate = lines[i];
+      const candidate = sourceLines[i];
       if (candidate && identifierRe(item.name).test(candidate)) {
         line = i + 1;
         sig = cleanSig(candidate);
@@ -166,11 +157,20 @@ const topLocation = (
   return { line, sig };
 };
 
-const parseStructuredOutline = (files: OutlineFile[], cwd: string): SymbolRec[] => {
+const parseStructuredOutline = async (
+  files: OutlineFile[],
+  source: FileSource,
+): Promise<SymbolRec[]> => {
   const out: SymbolRec[] = [];
-  const sourceCache = new Map<string, string[]>();
+  // Read correction source one record at a time. Keeping lines for every
+  // decorated file duplicated a whole batch's source beside outline JSON.
   for (const record of files) {
     const file = record.path.replace(/^\.\//, "");
+    const needsCorrection = record.items.some((item) => {
+      const sig = cleanSig(item.signature || item.name);
+      return !!item.name && (!identifierRe(item.name).test(sig) || /^@/.test(sig));
+    });
+    const sourceLines = needsCorrection ? (await source.read(file))?.split("\n") ?? [] : [];
     const concreteParents = new Set(
       record.items.filter((item) => item.symbolType !== "object").map((item) => item.name),
     );
@@ -184,7 +184,7 @@ const parseStructuredOutline = (files: OutlineFile[], cwd: string): SymbolRec[] 
       // Rust impl/object outlines repeat the concrete type. Keep its members,
       // but do not emit a duplicate parent node when the struct is local.
       if (!(item.symbolType === "object" && concreteParents.has(item.name))) {
-        const location = topLocation(file, item, cwd, sourceCache);
+        const location = topLocation(item, sourceLines);
         out.push({ name, kind, file, line: location.line, sig: location.sig, lang: record.language });
       }
       for (const member of item.members ?? []) {
@@ -244,18 +244,20 @@ const parseOutlineText = (text: string, lang: string): SymbolRec[] => {
   return out;
 };
 
-export const extractSymbols = (files: string[], cwd: string): SymbolRec[] => {
+const defaultSource = (cwd: string): FileSource => makeFileSource(cwd);
+
+export const extractSymbols = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<SymbolRec[]> => {
   const out: SymbolRec[] = [];
   for (const [lang, langFiles] of groupByLang(files)) {
-    const structured = outlineStructured(langFiles, lang, cwd);
+    const structured = await outlineStructured(langFiles, lang, cwd);
     if (structured) {
-      const parsed = parseStructuredOutline(structured, cwd);
+      const parsed = await parseStructuredOutline(structured, source);
       if (parsed.length || structured.some((file) => file.items.length > 0)) {
         pushAll(out, parsed);
         continue;
       }
     }
-    const text = outline(langFiles, lang, cwd);
+    const text = await outline(langFiles, lang, cwd);
     if (!text.trim()) continue;
     pushAll(out, parseOutlineText(text, lang));
   }
@@ -285,10 +287,10 @@ const IMPORT_PATTERNS: Record<string, string[]> = {
 IMPORT_PATTERNS.JavaScript = IMPORT_PATTERNS.TypeScript!;
 IMPORT_PATTERNS.Tsx = IMPORT_PATTERNS.TypeScript!;
 
-export const extractImports = (files: string[], cwd: string): ImportSite[] => {
+export const extractImports = async (files: string[], cwd: string): Promise<ImportSite[]> => {
   const out: ImportSite[] = [];
-  for (const [lang, langFiles] of groupByLang(files)) {
-    const matches = patternRunAll(IMPORT_PATTERNS[lang] ?? [], lang, langFiles, cwd);
+  await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+    const matches = await patternRunAll(IMPORT_PATTERNS[lang] ?? [], lang, langFiles, cwd);
     for (const m of matches) {
       const spec = m.single.M;
       if (spec) {
@@ -302,7 +304,7 @@ export const extractImports = (files: string[], cwd: string): ImportSite[] => {
         }
       }
     }
-  }
+  }));
   return dedupe(out, (i) => `${i.file}|${i.spec}|${i.line}`);
 };
 
@@ -344,10 +346,10 @@ const isTestFile = (file: string): boolean =>
 
 export { isTestFile };
 
-export const extractCalls = (files: string[], cwd: string): CallSite[] => {
+export const extractCalls = async (files: string[], cwd: string): Promise<CallSite[]> => {
   const out: CallSite[] = [];
-  for (const [lang, langFiles] of groupByLang(files)) {
-    const matches = patternRunAll(CALL_PATTERNS, lang, langFiles, cwd);
+  await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+    const matches = await patternRunAll(CALL_PATTERNS, lang, langFiles, cwd);
     for (const m of matches) {
       const callee = m.single.M ?? m.single.F;
       if (!callee) continue;
@@ -355,7 +357,7 @@ export const extractCalls = (files: string[], cwd: string): CallSite[] => {
       if (CALL_WARDS.has(name.toLowerCase())) continue;
       out.push({ file: m.file, line: m.line, callee: name });
     }
-  }
+  }));
   return out.filter((c) => c.callee && c.callee.length > 1);
 };
 
@@ -379,16 +381,14 @@ export const ENV_TOKEN_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
 // path/env-shaped scalars so OpenAPI paths and k8s env keys still join.
 const CONFIG_BARE_RE = /(^|[:=\s])(\/[\w.~+\-{}*]+(?:\/[\w.~+\-{}*]+)+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)(?=$|[:=\s])/g;
 
-export const extractConfigLiterals = (files: string[], cwd: string): LiteralSite[] => {
-  const out: LiteralSite[] = [];
-  for (const f of files) {
-    if (!isConfigFile(f)) continue;
-    let text = "";
-    try {
-      text = readFileSync(join(cwd, f), "utf8");
-    } catch {
-      continue;
-    }
+const SOURCE_SCAN_CONCURRENCY = 8;
+
+export const extractConfigLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
+  const configs = files.filter(isConfigFile);
+  const perFile = await mapLimit(configs, SOURCE_SCAN_CONCURRENCY, async (f) => {
+    const local: LiteralSite[] = [];
+    const text = await source.read(f);
+    if (text === undefined) return local;
     const seenLine = new Set<string>();
     text.split("\n").forEach((lineText, i) => {
       QUOTED_RE.lastIndex = 0;
@@ -396,7 +396,7 @@ export const extractConfigLiterals = (files: string[], cwd: string): LiteralSite
         const t = q[1] ?? q[2];
         if (t && !seenLine.has(`${i}|${t}`)) {
           seenLine.add(`${i}|${t}`);
-          out.push({ file: f, line: i + 1, text: t });
+          local.push({ file: f, line: i + 1, text: t });
         }
       }
       CONFIG_BARE_RE.lastIndex = 0;
@@ -404,11 +404,14 @@ export const extractConfigLiterals = (files: string[], cwd: string): LiteralSite
         const t = b[2]!;
         if ((PATH_TOKEN_RE.test(t) || ENV_TOKEN_RE.test(t)) && !seenLine.has(`${i}|${t}`)) {
           seenLine.add(`${i}|${t}`);
-          out.push({ file: f, line: i + 1, text: t });
+          local.push({ file: f, line: i + 1, text: t });
         }
       }
     });
-  }
+    return local;
+  });
+  const out: LiteralSite[] = [];
+  for (const local of perFile) pushAll(out, local);
   return out;
 };
 
@@ -424,32 +427,31 @@ const stripQuotes = (text: string): string => {
   return "";
 };
 
-export const extractLiterals = (files: string[], cwd: string): LiteralSite[] => {
+export const extractLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
   const out: LiteralSite[] = [];
-  for (const [lang, langFiles] of groupByLang(files)) {
-    const matches = patternRunAll(STRING_PATTERNS[lang] ?? [], lang, langFiles, cwd);
+  await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
+    const matches = await patternRunAll(STRING_PATTERNS[lang] ?? [], lang, langFiles, cwd);
     for (const m of matches) {
       const t = stripQuotes(m.text);
       if (t) out.push({ file: m.file, line: m.line, text: t });
     }
-  }
-  pushAll(out, extractConfigLiterals(files, cwd));
-  for (const f of files) {
-    if (isConfigFile(f)) continue;
-    let src = "";
-    try {
-      src = readFileSync(join(cwd, f), "utf8");
-    } catch {
-      continue;
-    }
+  }));
+  pushAll(out, await extractConfigLiterals(files, cwd, source));
+  const codeFiles = files.filter((f) => !isConfigFile(f));
+  const templateSites = await mapLimit(codeFiles, SOURCE_SCAN_CONCURRENCY, async (f) => {
+    const local: LiteralSite[] = [];
+    const src = await source.read(f);
+    if (src === undefined) return local;
     src.split("\n").forEach((lineText, i) => {
       TEMPLATE_RE.lastIndex = 0;
       for (let m; (m = TEMPLATE_RE.exec(lineText)); ) {
         const t = m[1]!.trim();
-        if (t.length >= 2) out.push({ file: f, line: i + 1, text: t });
+        if (t.length >= 2) local.push({ file: f, line: i + 1, text: t });
       }
     });
-  }
+    return local;
+  });
+  for (const local of templateSites) pushAll(out, local);
   return dedupe(out, (l) => `${l.file}|${l.line}|${l.text}`);
 };
 

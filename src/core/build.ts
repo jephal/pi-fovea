@@ -2,17 +2,31 @@
 // on-disk cache (keyed by content sha1) makes re-indexing incremental: dirty
 // files re-run ast-grep, everything else is reused verbatim. This is the
 // green-node-reuse analogue of incremental parsing, one level up.
+//
+// Cache format v9 is JSONL (header line + one fact line per file), inspired by
+// pi-fast-resume's partial-parse trick: reading/writing streams line-wise so
+// 40MB of facts never monopolize the event loop. Per-file entries carry a
+// stat manifest {size, mtime}; unchanged stats skip the re-read+rehash that
+// used to run over every tracked file on every turn.
+//
+// Honesty rule: facts implicated in a FAILED ast-grep pass are tainted. They
+// serve the live session (a thin graph beats none) but are never persisted,
+// so one bad invocation can't poison warm starts forever.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { createReadStream } from "node:fs";
+import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { basename, dirname, join as joinPath, posix } from "node:path";
-import { spawnSync } from "node:child_process";
+import { IO_CONCURRENCY, envInt, forEachChunked, mapLimit, yieldToLoop } from "./asyncutil.js";
+import { gitOut } from "./git.js";
 import { LANG_BY_EXT, drainExtractionFailures, isBinaryExt, isConfigFile, langOf } from "./astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols, isTestFile } from "./extract.js";
 import { buildJoinIndex } from "./join.js";
 import { extractAnchors, extractFileRoutes, loadRepoRules } from "./anchors.js";
 import { aggregateFiles, harvestFile, promote, type FileSigs, type SynthesizedRule } from "./discover.js";
+import { makeFileSource } from "./source.js";
 import type { CallSite, Edge, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
 import { coChangePairs } from "./cochange.js";
@@ -30,7 +44,7 @@ export interface FileFacts {
   sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 8; // bump when extractor semantics change
+const CACHE_VERSION = 9; // bump when extractor semantics or the cache schema change
 
 // Honest coverage: what the extractor could NOT see. Tools and status render
 // this so a thin graph never reads as a small repo (files dropped silently).
@@ -39,9 +53,14 @@ export interface ExtractionReport {
   failed: string[];
   /** Files skipped because their content could not be read (permissions, race). */
   unreadable: string[];
+  /** Files deliberately omitted because one source exceeded the byte cap. */
+  oversized: string[];
 }
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods"]);
-const MAX_FILES = 24000;
+// File count is also a resident-graph budget, not just a discovery limit.
+// Override deliberately for giant monorepos; normal roots stay bounded.
+const MAX_FILES = envInt("FOVEA_MAX_FILES", 8000, 100, 100_000);
+const MAX_FILE_BYTES = envInt("FOVEA_MAX_FILE_BYTES", 1024 * 1024, 64 * 1024, 64 * 1024 * 1024);
 // Generated dependency manifests are enormous and carry no first-class routes.
 const LOCKFILE_NAMES = new Set([
   "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb",
@@ -62,161 +81,664 @@ const supported = (f: string, routeRes?: RegExp[]): boolean => {
   return routeRes?.some((re) => re.test(f)) ?? false;
 };
 
-export const listFiles = (root: string, routeRes?: RegExp[]): string[] => {
-  const res = spawnSync("git", ["-C", root, "ls-files", "-co", "--exclude-standard"], {
-    encoding: "utf8",
-    timeout: 30_000,
-    maxBuffer: 64 * 1024 * 1024,
-  });
+export const listFiles = async (root: string, routeRes?: RegExp[]): Promise<string[]> => {
+  const out = await gitOut(root, ["ls-files", "-co", "--exclude-standard"], { timeout: 30_000 });
   let files: string[] = [];
-  if (!res.error && res.status === 0 && res.stdout.trim()) {
-    files = res.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (out?.trim()) {
+    files = out.split("\n").map((s) => s.trim()).filter(Boolean);
   } else {
-    const walk = (dir: string, prefix: string): void => {
+    // A plain umbrella workspace must not recursively merge every child Git
+    // repository into one graph. Readdir the child once, see its .git marker,
+    // and treat it as a project boundary. Stop during traversal (not after)
+    // so memory and latency stay proportional to MAX_FILES.
+    const walk = async (dir: string, prefix: string): Promise<void> => {
+      if (files.length >= MAX_FILES) return;
       let entries;
       try {
-        entries = readdirSync(dir, { withFileTypes: true });
+        entries = await readdir(dir, { withFileTypes: true });
       } catch {
         return;
       }
+      if (prefix && entries.some((entry) => entry.name === ".git")) return;
+      entries.sort((a, b) => a.name.localeCompare(b.name));
       for (const e of entries) {
+        if (files.length >= MAX_FILES) break;
         const rel = prefix ? `${prefix}/${e.name}` : e.name;
         if (e.isDirectory()) {
-          if (!IGNORE_DIRS.has(e.name)) walk(joinPath(dir, e.name), rel);
+          if (!IGNORE_DIRS.has(e.name)) await walk(joinPath(dir, e.name), rel);
         } else if (e.isFile() && supported(rel, routeRes)) {
           files.push(rel);
         }
       }
     };
-    walk(root, "");
+    await walk(root, "");
   }
   files = files.filter((f) => supported(f, routeRes) && !isJunk(f));
   files.sort();
   return files.slice(0, MAX_FILES);
 };
 
-const sha1Of = (root: string, rel: string): string => {
+// --- stat manifest ------------------------------------------------------------
+
+export interface FileMeta { size: number; mtime: number }
+
+const statFile = async (root: string, rel: string): Promise<FileMeta | undefined> => {
   try {
-    const buf = readFileSync(joinPath(root, rel));
-    return createHash("sha1").update(buf).digest("hex");
+    const s = await stat(joinPath(root, rel));
+    if (!s.isFile()) return undefined;
+    return { size: s.size, mtime: s.mtimeMs };
   } catch {
-    return "!" + rel;
+    return undefined;
   }
 };
 
-interface CacheFile { version: number; root: string; rulesSha: string; facts: Record<string, FileFacts>; }
+export const statMany = async (root: string, files: readonly string[]): Promise<Map<string, FileMeta>> => {
+  const out = new Map<string, FileMeta>();
+  await mapLimit(files, IO_CONCURRENCY, async (rel) => {
+    const meta = await statFile(root, rel);
+    if (meta) out.set(rel, meta);
+  });
+  return out;
+};
+
+const metaEquals = (a: FileMeta | undefined, b: FileMeta | undefined): boolean =>
+  !!a && !!b && a.size === b.size && Math.abs(a.mtime - b.mtime) < 1e-6;
+
+const sha1Of = async (root: string, rel: string): Promise<{ sha1: string; text: string } | undefined> => {
+  try {
+    const buf = await readFile(joinPath(root, rel));
+    return { sha1: createHash("sha1").update(buf).digest("hex"), text: buf.toString("utf8") };
+  } catch {
+    return undefined;
+  }
+};
+
+// Hash passes touch every dirty file; holding every text until extraction
+// ends means a large root pins ALL of its source in memory at once (one
+// such probe OOM-killed the host). Keep a bounded prefetch window instead:
+// files past the budget are lazily re-read by FileSource where extraction
+// actually needs content, and spent texts drop with the pass.
+const TEXT_RETAIN_TOTAL = 16 * 1024 * 1024;
+const TEXT_RETAIN_FILE = 128 * 1024;
+const makeTextBudget = () => {
+  let used = 0;
+  return (rel: string, text: string, into: Map<string, string>): void => {
+    if (text.length > TEXT_RETAIN_FILE || used + text.length > TEXT_RETAIN_TOTAL) return;
+    into.set(rel, text);
+    used += text.length;
+  };
+};
+
+// --- persistent fact store -----------------------------------------------------
+
+/**
+ * In-memory facts for one root, plus the stat manifest that makes refresh a
+ * stat-only sweep for untouched files. Entries are immutable per file: a
+ * refresh replaces records wholesale, which keeps sync baselines holding
+ * stable references to the previous generation.
+ */
+export interface FactStore {
+  root: string;
+  facts: Map<string, FileFacts>;
+  meta: Map<string, FileMeta>;
+  /** Files whose latest extraction pass failed; only hash/stat markers persist. */
+  tainted: Set<string>;
+  /** Content hashes for honest, fact-free failure backoff. */
+  failedSha: Map<string, string>;
+  /** Files whose content could not be read at last pass. */
+  unreadable: Set<string>;
+  /** Files deliberately omitted because source size exceeded MAX_FILE_BYTES. */
+  oversized: Set<string>;
+  /** Rules pack hash the anchors were extracted with (defaults + repo + implicit). */
+  rulesSha: string;
+  savedAt: number;
+}
+
+export const newFactStore = (root: string): FactStore => ({
+  root,
+  facts: new Map(),
+  meta: new Map(),
+  tainted: new Set(),
+  failedSha: new Map(),
+  unreadable: new Set(),
+  oversized: new Set(),
+  rulesSha: "",
+  savedAt: 0,
+});
+
+interface CacheHeader { fovea: number; root: string; rulesSha: string }
+interface CacheLine {
+  file: string;
+  sha1: string;
+  size: number;
+  mtime: number;
+  facts?: Omit<FileFacts, "sha1">;
+  /** Marker only: no partial semantic facts cross the cache boundary. */
+  failed?: true;
+}
 
 export const cachePathFor = (root: string): string =>
   joinPath(tmpdir(), `pi-fovea-${createHash("sha1").update(root).digest("hex").slice(0, 16)}.json`);
 
-export const loadFacts = (root: string, files: string[]): { facts: Record<string, FileFacts>; report: ExtractionReport } => {
-  const cacheFile = cachePathFor(root);
-  let cached: CacheFile | undefined;
+const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
+  const stream = createReadStream(cachePathFor(root), { encoding: "utf8" });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  let store: FactStore | undefined;
+  let count = 0;
   try {
-    cached = JSON.parse(readFileSync(cacheFile, "utf8")) as CacheFile;
-  } catch {
-    cached = undefined;
-  }
-  const { pack: basePack, fileRoutes, sha: baseRulesSha } = loadRepoRules(root);
-  const anchorPack = [...basePack];
-  // Implicit rules promote AFTER the first fact pass: their evidence lives in
-  // freshly harvested sigs, so the pack can only be finalized once facts exist.
-  let implicitRules: SynthesizedRule[] = [];
-  let rulesSha = baseRulesSha;
-  if (cached && (cached.version !== CACHE_VERSION || cached.root !== root)) cached = undefined;
-  drainExtractionFailures(); // isolate this pass; a previous load's stale ledger must not spill over
-  const facts: Record<string, FileFacts> = {};
-  const dirty: string[] = [];
-  const unreadable: string[] = [];
-  for (const rel of files) {
-    const sha1 = sha1Of(root, rel);
-    const hit = cached?.facts[rel];
-    if (hit && hit.sha1 === sha1) {
-      facts[rel] = hit;
-    } else if (sha1.startsWith("!")) {
-      unreadable.push(rel); // content unreadable (permissions, race): count it, skip it
-      continue;
-    } else {
-      dirty.push(rel);
-      facts[rel] = { sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] };
-    }
-  }
-  if (dirty.length) {
-    const code = dirty.filter((f) => !isConfigFile(f));
-    // Per-file buckets for batched extractor output.
-    const putByFile = <T extends { file: string }>(arr: T[], sink: (f: FileFacts, v: T) => void): void => {
-      for (const v of arr) {
-        const f = facts[v.file];
-        if (f) sink(f, v);
+    for await (const line of lines) {
+      if (!store) {
+        let header: CacheHeader;
+        try {
+          header = JSON.parse(line) as CacheHeader;
+        } catch {
+          return undefined;
+        }
+        // v8 caches were one JSON document; a marker miss is a cold start.
+        if (header.fovea !== CACHE_VERSION || header.root !== root) return undefined;
+        store = newFactStore(root);
+        store.rulesSha = header.rulesSha;
+        continue;
       }
-    };
-    putByFile(extractSymbols(code, root), (f, v) => f.symbols.push(v));
-    putByFile(extractImports(code, root), (f, v) => f.imports.push(v));
-    putByFile(extractCalls(code, root), (f, v) => f.calls.push(v));
-    putByFile(extractLiterals(dirty, root), (f, v) => f.literals.push(v));
-    // Tier-3 harvest: regex histogram of call-shape signatures per file. Cheap
-    // (line scan, no ast-grep) and cached alongside the other facts.
+      if (!line) continue;
+      try {
+        const rec = JSON.parse(line) as CacheLine;
+        store.meta.set(rec.file, { size: rec.size, mtime: rec.mtime });
+        if (rec.failed) {
+          store.tainted.add(rec.file);
+          store.failedSha.set(rec.file, rec.sha1);
+        } else if (rec.facts) {
+          store.facts.set(rec.file, { sha1: rec.sha1, ...rec.facts });
+        }
+      } catch {
+        // Skip a torn line; that file re-extracts via stat/hash fallback.
+      }
+      if (++count % 2000 === 0) await yieldToLoop();
+    }
+    return store;
+  } catch {
+    return undefined;
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+};
+
+const persistDebounce = new Map<string, ReturnType<typeof setTimeout>>();
+
+export const persistFacts = async (store: FactStore): Promise<void> => {
+  const header = JSON.stringify({ fovea: CACHE_VERSION, root: store.root, rulesSha: store.rulesSha } satisfies CacheHeader);
+  const target = cachePathFor(store.root);
+  const tmpName = `${target}.tmp-${process.pid}`;
+  try {
+    await mkdir(dirname(target), { recursive: true });
+    const handle = await open(tmpName, "w");
+    try {
+      let batch = header + "\n";
+      let count = 0;
+      const files = new Set([...store.facts.keys(), ...store.failedSha.keys()]);
+      for (const file of files) {
+        const facts = store.facts.get(file);
+        const meta = store.meta.get(file);
+        if (!meta) continue;
+        let line: CacheLine | undefined;
+        if (store.tainted.has(file)) {
+          const sha1 = store.failedSha.get(file) ?? facts?.sha1;
+          if (sha1) line = { file, sha1, size: meta.size, mtime: meta.mtime, failed: true };
+        } else if (facts) {
+          const { sha1, ...rest } = facts;
+          line = { file, sha1, size: meta.size, mtime: meta.mtime, facts: rest };
+        }
+        if (!line) continue;
+        batch += JSON.stringify(line) + "\n";
+        if (batch.length >= 1024 * 1024) {
+          await handle.write(batch);
+          batch = "";
+          await yieldToLoop();
+        } else if (++count % 2000 === 0) {
+          await yieldToLoop();
+        }
+      }
+      if (batch) await handle.write(batch);
+    } finally {
+      await handle.close();
+    }
+    await rename(tmpName, target);
+    store.savedAt = Date.now();
+  } catch {
+    await rm(tmpName, { force: true }).catch(() => undefined);
+    // Cache is an optimization; never fail the build over it.
+  }
+};
+
+/** Debounced persistence: refreshes during active editing coalesce. */
+/** Drop any pending debounced persist (root eviction) without writing. */
+export const clearPersistTimer = (root: string): void => {
+  const timer = persistDebounce.get(root);
+  if (timer) clearTimeout(timer);
+  persistDebounce.delete(root);
+};
+
+/** Supported (code/config/route-convention) and non-junk filter shared by probes. */
+export const filterSupported = (files: readonly string[], routeRes?: RegExp[]): string[] =>
+  files.filter((f) => supported(f, routeRes) && !isJunk(f));
+
+export const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
+  if (persistDebounce.has(store.root)) return;
+  const wait = Math.max(0, store.savedAt + minGapMs - Date.now());
+  const timer = setTimeout(() => {
+    persistDebounce.delete(store.root);
+    void persistFacts(store);
+  }, wait);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  persistDebounce.set(store.root, timer);
+};
+
+// --- staged extraction -----------------------------------------------------------
+
+/**
+ * Run all extraction stages for a batch of files, replacing their records in
+ * the store. Stages are concurrent (they write disjoint fields); subprocess
+ * concurrency stays bounded by the spawn gate. Taint is tracked per file so
+ * failed passes never reach disk.
+ */
+const EXTRACTION_BATCH = 64;
+
+const extractInto = async (
+  root: string,
+  store: FactStore,
+  files: string[],
+  contents: Map<string, string>,
+  packRules: { pack: Awaited<ReturnType<typeof loadRepoRules>>["pack"]; fileRoutes: Awaited<ReturnType<typeof loadRepoRules>>["fileRoutes"] },
+): Promise<void> => {
+  if (!files.length) return;
+  const source = makeFileSource(root, contents);
+
+  const putByFile = <T extends { file: string }>(arr: T[], pick: (f: FileFacts) => T[]): void => {
+    for (const v of arr) {
+      const rec = store.facts.get(v.file);
+      if (rec) pick(rec).push(v);
+    }
+  };
+
+  for (let start = 0; start < files.length; start += EXTRACTION_BATCH) {
+    const batch = files.slice(start, start + EXTRACTION_BATCH);
+    const code = batch.filter((f) => !isConfigFile(f));
+    const [symbols, imports, calls, literals] = await Promise.all([
+      extractSymbols(code, root, source),
+      extractImports(code, root),
+      extractCalls(code, root),
+      extractLiterals(batch, root, source),
+    ]);
+
+    // Replace records immutably: a baseline snapshot holding the previous
+    // object must keep seeing the previous generation. The caller seeded each
+    // dirty record with the content hash — carry it forward untouched.
+    for (const f of batch) {
+      const prev = store.facts.get(f);
+      store.facts.set(f, {
+        sha1: prev?.sha1 ?? "",
+        symbols: [],
+        imports: [],
+        calls: [],
+        literals: [],
+        anchors: [],
+      });
+    }
+    putByFile(symbols, (f) => f.symbols);
+    putByFile(imports, (f) => f.imports);
+    putByFile(calls, (f) => f.calls);
+    putByFile(literals, (f) => f.literals);
+
+    // Tier-3 harvest: regex histogram, cheap and CPU-only.
     for (const f of code) {
       const lang = langOf(f);
       if (!lang) continue;
-      let text = "";
-      try { text = readFileSync(joinPath(root, f), "utf8"); } catch { continue; }
+      const text = contents.get(f) ?? (await source.read(f));
+      if (text === undefined) continue;
       const sigs = harvestFile(lang, text);
-      if (Object.keys(sigs).length) facts[f]!.sigs = sigs;
+      if (Object.keys(sigs).length) store.facts.get(f)!.sigs = sigs;
     }
+
+    await runAnchorPass(root, store, batch, packRules, source);
+    await yieldToLoop();
   }
-  // Tier-3: promote harvested signatures into implicit rules BEFORE anchors
-  // run, and fold their ids into the rules hash so a promotion change rebuilds
-  // anchors exactly like a rules.json edit would.
-  implicitRules = promote(aggregateFiles(Object.fromEntries(Object.entries(facts).map(([k, v]) => [k, v.sigs]))), anchorPack);
-  if (implicitRules.length) {
-    anchorPack.push(...implicitRules);
-    rulesSha = createHash("sha1").update(baseRulesSha).update(JSON.stringify(implicitRules.map((r) => r.id).sort())).digest("hex");
-  }
-  const rulesChangedFinal = cached !== undefined && cached.rulesSha !== rulesSha;
-  // Anchors need enclosing-symbol resolution. Symbols, imports, calls and
-  // literals are rules-independent — when only the rule pack changed, re-run
-  // anchor extraction over every code file against cached symbols and keep
-  // every other fact (green-node reuse one level up).
-  const anchorTargets = rulesChangedFinal
-    ? files.filter((f) => !isConfigFile(f))
-    : dirty.filter((f) => !isConfigFile(f));
-  if (anchorTargets.length) {
-    const putByFile = <T extends { file: string }>(arr: T[], sink: (f: FileFacts, v: T) => void): void => {
-      for (const v of arr) {
-        const f = facts[v.file];
-        if (f) sink(f, v);
-      }
-    };
+};
+
+const runAnchorPass = async (
+  root: string,
+  store: FactStore,
+  files: string[],
+  packRules: { pack: Awaited<ReturnType<typeof loadRepoRules>>["pack"]; fileRoutes: Awaited<ReturnType<typeof loadRepoRules>>["fileRoutes"] },
+  source = makeFileSource(root),
+): Promise<void> => {
+  for (let start = 0; start < files.length; start += EXTRACTION_BATCH) {
+    const anchorFiles = files.slice(start, start + EXTRACTION_BATCH).filter((f) => !isConfigFile(f));
+    if (!anchorFiles.length) continue;
     const symsByFile = new Map<string, SymbolRec[]>();
-    for (const rel of anchorTargets) {
-      symsByFile.set(rel, facts[rel]?.symbols.length ? facts[rel]!.symbols : (cached?.facts[rel]?.symbols ?? []));
-      if (rulesChangedFinal) facts[rel] && (facts[rel]!.anchors = []);
-    }
+    for (const rel of anchorFiles) symsByFile.set(rel, store.facts.get(rel)?.symbols ?? []);
     const enclosingId = (file: string, line: number): string | undefined => {
       const syms = symsByFile.get(file) ?? [];
       let best: SymbolRec | undefined;
       for (const s of syms) if (s.line <= line && (!best || s.line > best.line)) best = s;
       return best ? `${best.name}@${best.file}` : `file:${file}`;
     };
-    putByFile(extractAnchors(anchorTargets, root, enclosingId, anchorPack), (f, v) => f.anchors.push(v));
-    // File-convention routes (Next/SvelteKit/Nuxt): the route path is derived
-    // from the file path; verbs come from exported handler names or suffix.
-    putByFile(extractFileRoutes(anchorTargets, root, fileRoutes), (f, v) => f.anchors.push(v));
+    const [anchors, fileRouteAnchors] = await Promise.all([
+      extractAnchors(anchorFiles, root, enclosingId, packRules.pack),
+      extractFileRoutes(anchorFiles, root, packRules.fileRoutes, source),
+    ]);
+    for (const f of anchorFiles) {
+      const prev = store.facts.get(f);
+      if (prev && prev.anchors.length) store.facts.set(f, { ...prev, anchors: [] });
+    }
+    for (const v of anchors) store.facts.get(v.file)?.anchors.push(v);
+    for (const v of fileRouteAnchors) store.facts.get(v.file)?.anchors.push(v);
+    await yieldToLoop();
   }
-  try {
-    mkdirSync(dirname(cacheFile), { recursive: true });
-    writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, root, rulesSha, facts } satisfies CacheFile));
-  } catch {
-    // Cache is an optimization; never fail the build over it.
-  }
-  // Chunk-granular by construction: one failed invocation implicates its whole
-  // chunk, so dedupe across extraction stages (symbols + imports + calls + ...).
-  const failed = [...new Set(drainExtractionFailures().flatMap((failure) => failure.files))].sort();
-  return { facts, report: { failed, unreadable: unreadable.sort() } };
 };
 
-// --- resolution ---------------------------------------------------------------
+/**
+ * Re-derive the implicit (tier-3 discovered) rule set for the current sigs
+ * and, when it (or the base pack) changed, re-run anchors over every code
+ * file — the same rules invalidation the monolithic build applied.
+ */
+const applyRulePack = async (
+  root: string,
+  store: FactStore,
+  files: string[],
+  extractedWithSha: string | undefined,
+): Promise<void> => {
+  const base = await loadRepoRules(root);
+  const sigsByFile: Record<string, FileSigs | undefined> = {};
+  for (const [f, rec] of store.facts) sigsByFile[f] = rec.sigs;
+  const implicitRules = promote(aggregateFiles(sigsByFile), base.pack);
+  const pack = implicitRules.length ? [...base.pack, ...implicitRules] : base.pack;
+  const rulesSha = implicitRules.length
+    ? createHash("sha1").update(base.sha).update(JSON.stringify(implicitRules.map((r) => r.id).sort())).digest("hex")
+    : base.sha;
+  // Anchors extract under the BASE pack during a fact pass because tier-3
+  // promotions depend on sigs harvested mid-pass. Stale against what they
+  // actually ran with (fresh builds included, where stored rulesSha is "").
+  const anchorsStale = rulesSha !== (extractedWithSha ?? store.rulesSha);
+  store.rulesSha = rulesSha;
+  if (anchorsStale) {
+    const codeFiles = files.filter((f) => !isConfigFile(f) && store.facts.has(f));
+    await runAnchorPass(root, store, codeFiles, { pack, fileRoutes: base.fileRoutes });
+  }
+};
+
+/** Drain the failure ledger into this store's taint set for the given batch. */
+const settleTaint = (store: FactStore, batch: ReadonlySet<string>): void => {
+  const failures = drainExtractionFailures();
+  const failed = new Set(failures.flatMap((f) => f.files));
+  for (const f of failed) {
+    if (!batch.has(f)) continue;
+    store.tainted.add(f);
+    const sha1 = store.facts.get(f)?.sha1;
+    if (sha1) store.failedSha.set(f, sha1);
+  }
+};
+
+// Additive-only contract: a fact pass drains the global ledger twice (stage
+// pass, then the anchor re-pass). Clearing batch taint belongs ONCE, before
+// re-extraction starts; a mid-pass clear would wipe earlier drains.
+const clearTaint = (store: FactStore, batch: Iterable<string>): void => {
+  for (const f of batch) {
+    store.tainted.delete(f);
+    store.failedSha.delete(f);
+  }
+};
+
+export interface FactsOutcome {
+  store: FactStore;
+  report: ExtractionReport;
+  /** Files whose facts were recomputed this pass. */
+  dirty: string[];
+}
+
+/**
+ * Full fact pass: reuse what the disk store + stat manifest prove unchanged,
+ * re-extract the rest. Cold caches pay one full read+hash per file; warm
+ * boots with an intact manifest never re-read unchanged content.
+ */
+export const loadFacts = async (root: string, files: string[]): Promise<FactsOutcome> => {
+  drainExtractionFailures();
+  const disk = await loadDiskStore(root);
+  const store = disk ?? newFactStore(root);
+  let cacheDirty = disk === undefined;
+  const fileSet = new Set(files);
+  const knownFiles = new Set([...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized]);
+  for (const f of knownFiles) {
+    if (!fileSet.has(f)) {
+      store.facts.delete(f);
+      store.meta.delete(f);
+      store.tainted.delete(f);
+      store.failedSha.delete(f);
+      store.unreadable.delete(f);
+      store.oversized.delete(f);
+      cacheDirty = true;
+    }
+  }
+
+  const stats = await statMany(root, files);
+  const needHashed: string[] = [];
+  const unreadable: string[] = [];
+  const oversized: string[] = [];
+  for (const rel of files) {
+    const meta = stats.get(rel);
+    if (!meta) {
+      unreadable.push(rel);
+      continue;
+    }
+    if (meta.size > MAX_FILE_BYTES) {
+      oversized.push(rel);
+      if (store.facts.delete(rel)) cacheDirty = true;
+      store.meta.set(rel, meta);
+      store.tainted.delete(rel);
+      store.failedSha.delete(rel);
+      store.unreadable.delete(rel);
+      continue;
+    }
+    store.oversized.delete(rel);
+    const cachedMeta = store.meta.get(rel);
+    if (store.failedSha.has(rel) && metaEquals(meta, cachedMeta)) {
+      store.meta.set(rel, meta);
+      continue; // unchanged known failure: report it, do not retry it
+    }
+    if (store.facts.has(rel) && metaEquals(meta, cachedMeta) && !store.tainted.has(rel)) {
+      store.meta.set(rel, meta);
+      continue; // manifest hit: no read, no hash
+    }
+    needHashed.push(rel);
+  }
+
+  const contents = new Map<string, string>();
+  const dirty: string[] = [];
+  const spend = makeTextBudget();
+  await mapLimit(needHashed, IO_CONCURRENCY, async (rel) => {
+    const got = await sha1Of(root, rel);
+    const meta = stats.get(rel)!;
+    if (!got) {
+      unreadable.push(rel);
+      return;
+    }
+    spend(rel, got.text, contents);
+    const failedSha = store.failedSha.get(rel);
+    if (failedSha === got.sha1) {
+      store.meta.set(rel, meta);
+      cacheDirty = true;
+      return;
+    }
+    const cached = store.facts.get(rel);
+    if (cached && cached.sha1 === got.sha1 && !store.tainted.has(rel)) {
+      // Content identical under a moved mtime (checkout, touch): reuse.
+      store.meta.set(rel, meta);
+      cacheDirty = true;
+      return;
+    }
+    dirty.push(rel);
+    cacheDirty = true;
+    store.meta.set(rel, meta);
+    store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+  });
+
+  const base = await loadRepoRules(root);
+  const rulesBefore = store.rulesSha;
+  clearTaint(store, dirty);
+  await extractInto(root, store, dirty, contents, { pack: base.pack, fileRoutes: base.fileRoutes });
+  settleTaint(store, new Set(files));
+  await applyRulePack(root, store, files, dirty.length ? base.sha : store.rulesSha);
+  // Anchor extraction failures implicate their files too (drained inside settleTaint
+  // ran before applyRulePack; capture anchor-stage failures as a second drain).
+  settleTaint(store, new Set(files));
+  if (store.rulesSha !== rulesBefore) cacheDirty = true;
+
+  for (const f of unreadable) {
+    store.unreadable.add(f);
+    if (store.facts.delete(f)) cacheDirty = true;
+    if (store.meta.delete(f)) cacheDirty = true;
+    store.oversized.delete(f);
+    store.failedSha.delete(f);
+  }
+  for (const f of oversized) store.oversized.add(f);
+  store.unreadable.forEach((f) => { if (!unreadable.includes(f) && files.includes(f)) store.unreadable.delete(f); });
+  store.oversized.forEach((f) => { if (!oversized.includes(f) && files.includes(f)) store.oversized.delete(f); });
+
+  if (cacheDirty) await persistFacts(store);
+  return {
+    store,
+    report: {
+      failed: [...store.tainted].sort(),
+      unreadable: [...new Set(unreadable)].sort(),
+      oversized: [...store.oversized].sort(),
+    },
+    dirty: dirty.sort(),
+  };
+};
+
+export interface RefreshStats {
+  /** Files whose semantic facts were rebuilt (content moved). */
+  reExtracted: string[];
+  /** Files that vanished since the last pass. */
+  deleted: string[];
+  /** Files whose facts now exist and did not before. */
+  added: string[];
+}
+
+/**
+ * Incremental refresh against the live store. `changed` is the union of the
+ * caller's drift knowledge (git probe, tool hints) — stat+hash arbitrates,
+ * so an optimistic hint set is cheap and an under-inclusive one is merely
+ * stale until the next full sweep.
+ */
+export const refreshFacts = async (
+  root: string,
+  store: FactStore,
+  files: string[],
+  changed: readonly string[],
+  deletedPaths: readonly string[] = [],
+): Promise<{ report: ExtractionReport; stats: RefreshStats }> => {
+  drainExtractionFailures();
+  const fileSet = new Set(files);
+  const deleted: string[] = [];
+  const removeFile = (known: string): void => {
+    store.facts.delete(known);
+    store.meta.delete(known);
+    store.tainted.delete(known);
+    store.failedSha.delete(known);
+    store.unreadable.delete(known);
+    store.oversized.delete(known);
+    deleted.push(known);
+  };
+  const knownFiles = new Set([...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized]);
+  for (const known of knownFiles) {
+    if (!fileSet.has(known)) removeFile(known);
+  }
+  // Callers with a deletion oracle (git status, listing diff) pass names
+  // explicitly so a vanished file is never mislabeled unreadable.
+  for (const gone of deletedPaths) {
+    if ((store.facts.has(gone) || store.failedSha.has(gone) || store.unreadable.has(gone) || store.oversized.has(gone)) && !deleted.includes(gone)) removeFile(gone);
+  }
+  const added = files.filter((f) => !store.facts.has(f));
+  const candidates = new Set<string>([...changed, ...added]);
+  for (const gone of deleted) candidates.delete(gone);
+  // Known failures pay one stat per refresh; only a content/stat change
+  // re-enters expensive ast-grep extraction.
+  for (const f of store.tainted) if (fileSet.has(f)) candidates.add(f);
+
+  const stats = await statMany(root, [...candidates]);
+  const contents = new Map<string, string>();
+  const spend = makeTextBudget();
+  const dirty: string[] = [];
+  const unreadable: string[] = [];
+  const oversized: string[] = [];
+  for (const rel of candidates) {
+    const meta = stats.get(rel);
+    if (!meta) {
+      // Still listed but unstatable: genuinely unreadable this pass.
+      unreadable.push(rel);
+      continue;
+    }
+    const cachedMeta = store.meta.get(rel);
+    if (store.failedSha.has(rel) && metaEquals(meta, cachedMeta)) continue;
+    store.meta.set(rel, meta);
+    if (meta.size > MAX_FILE_BYTES) {
+      oversized.push(rel);
+      store.facts.delete(rel);
+      store.tainted.delete(rel);
+      store.failedSha.delete(rel);
+      store.unreadable.delete(rel);
+      continue;
+    }
+    store.oversized.delete(rel);
+    const got = await sha1Of(root, rel);
+    if (!got) {
+      unreadable.push(rel);
+      continue;
+    }
+    store.unreadable.delete(rel);
+    spend(rel, got.text, contents);
+    if (store.failedSha.get(rel) === got.sha1) continue;
+    const prev = store.facts.get(rel);
+    if (prev && prev.sha1 === got.sha1 && !store.tainted.has(rel)) continue;
+    dirty.push(rel);
+    store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+  }
+
+  const base = await loadRepoRules(root);
+  clearTaint(store, dirty);
+  await extractInto(root, store, dirty, contents, { pack: base.pack, fileRoutes: base.fileRoutes });
+  settleTaint(store, candidates);
+  // Dirty files had anchors extracted under the base pack; clean files kept
+  // the stored pack's. Staleness is judged against whichever actually ran.
+  await applyRulePack(root, store, files, dirty.length ? base.sha : store.rulesSha);
+  settleTaint(store, candidates);
+
+  for (const f of unreadable) {
+    store.unreadable.add(f);
+    store.facts.delete(f);
+    store.meta.delete(f);
+    store.oversized.delete(f);
+    store.failedSha.delete(f);
+  }
+  for (const f of oversized) store.oversized.add(f);
+
+  persistFactsSoon(store);
+  return {
+    report: {
+      failed: [...store.tainted].sort(),
+      unreadable: [...store.unreadable].sort(),
+      oversized: [...store.oversized].sort(),
+    },
+    stats: {
+      reExtracted: dirty.sort(),
+      deleted: deleted.sort(),
+      added: added.filter((f) => !unreadable.includes(f) && !store.oversized.has(f) && !store.tainted.has(f)).sort(),
+    },
+  };
+};
+
+// --- import resolution indexes ------------------------------------------------
 
 const CODE_EXTS_BY_LANGFAMILY: Record<string, string[]> = {
   ts: [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
@@ -234,12 +756,66 @@ const langFamily = (file: string): string => {
   return ext;
 };
 
+/**
+ * Precomputed suffix indexes. The naive resolvers scanned the whole file set
+ * per import (O(imports × files)), which quadratic-blows on big trees; these
+ * maps make each lookup near-constant while preserving the exact match rules.
+ */
+export interface ImportIndex {
+  fileSet: Set<string>;
+  filesByDir: Map<string, string[]>;
+  /** Go: last-k-segment dir suffix (k <= 3) -> dirs, built for every source dir. */
+  goDirsBySuffix: Map<string, string[]>;
+  /** Rust: module basename -> files (`foo.rs`, `foo/mod.rs`). */
+  rsByBase: Map<string, string[]>;
+  /** TS bare specifiers: last path segment -> `x.ts` / `x/index.ts` files. */
+  tsByTailStem: Map<string, string[]>;
+}
+
+const pushIndex = (m: Map<string, string[]>, key: string, value: string): void => {
+  (m.get(key) ?? m.set(key, []).get(key)!).push(value);
+};
+
+export const buildImportIndex = (files: string[]): ImportIndex => {
+  const fileSet = new Set(files);
+  const filesByDir = new Map<string, string[]>();
+  const goDirsBySuffix = new Map<string, string[]>();
+  const rsByBase = new Map<string, string[]>();
+  const tsByTailStem = new Map<string, string[]>();
+  for (const f of files) {
+    const dir = posix.dirname(f);
+    pushIndex(filesByDir, dir, f);
+  }
+  for (const dir of filesByDir.keys()) {
+    const segs = dir.split("/").filter(Boolean);
+    for (let k = 1; k <= Math.min(3, segs.length); k++) {
+      pushIndex(goDirsBySuffix, segs.slice(-k).join("/"), dir);
+    }
+  }
+  for (const f of files) {
+    if (f.endsWith(".rs")) {
+      const base = basename(f, ".rs");
+      pushIndex(rsByBase, base, f);
+      if (base === "mod") {
+        const parentBase = basename(posix.dirname(f));
+        pushIndex(rsByBase, parentBase, f);
+      }
+    }
+    if (f.endsWith(".ts")) {
+      const base = basename(f, ".ts");
+      if (base === "index") pushIndex(tsByTailStem, basename(posix.dirname(f)), f);
+      else pushIndex(tsByTailStem, base, f);
+    }
+  }
+  return { fileSet, filesByDir, goDirsBySuffix, rsByBase, tsByTailStem };
+};
+
 export const resolveImportToFile = (
   spec: string,
   fromFile: string,
-  fileSet: Set<string>,
-  dirSet: Set<string>,
+  index: ImportIndex,
 ): string | undefined => {
+  const { fileSet } = index;
   const fam = langFamily(fromFile);
   if (spec.startsWith("./") || spec.startsWith("../")) {
     let base = posix.normalize(posix.join(posix.dirname(fromFile), spec));
@@ -262,10 +838,13 @@ export const resolveImportToFile = (
     const segs = spec.split("/").filter(Boolean);
     for (let k = 1; k <= Math.min(3, segs.length); k++) {
       const suffix = segs.slice(-k).join("/");
-      const matches = [...dirSet].filter((d) => d === suffix || d.endsWith(`/${suffix}`));
+      const matches = (index.goDirsBySuffix.get(suffix) ?? []).filter(
+        (d) => d === suffix || d.endsWith(`/${suffix}`),
+      );
       if (matches.length === 1) {
         const dir = matches[0]!;
-        for (const f of fileSet) if (posix.dirname(f) === dir) return f;
+        const inDir = index.filesByDir.get(dir) ?? [];
+        if (inDir.length) return inDir[0];
       }
     }
     return undefined;
@@ -274,12 +853,17 @@ export const resolveImportToFile = (
     const modPath = spec.replace(/^crate::|^self::/, "").replace(/::/g, "/");
     for (const cand of [`src/${modPath}.rs`, `${modPath}.rs`]) if (fileSet.has(cand)) return cand;
     const baseName = basename(modPath);
-    const hits = [...fileSet].filter((f) => f === `${baseName}.rs` || f.endsWith(`/${baseName}.rs`) || f.endsWith(`/${baseName}/mod.rs`));
+    const hits = (index.rsByBase.get(baseName) ?? []).filter(
+      (f) => f === `${baseName}.rs` || f.endsWith(`/${baseName}.rs`) || f.endsWith(`/${baseName}/mod.rs`),
+    );
     return hits.length === 1 ? hits[0] : undefined;
   }
   // ts bare specifier: node_modules or aliased; try a tail match.
   const tail = spec.split("/").filter(Boolean).join("/");
-  const hits = [...fileSet].filter((f) => f.endsWith(`/${tail}.ts`) || f.endsWith(`/${tail}/index.ts`));
+  const stem = tail.split("/").pop() ?? tail;
+  const hits = (index.tsByTailStem.get(stem) ?? []).filter(
+    (f) => f.endsWith(`/${tail}.ts`) || f.endsWith(`/${tail}/index.ts`),
+  );
   return hits.length === 1 ? hits[0] : undefined;
 };
 
@@ -294,8 +878,12 @@ const addNode = (nodes: NodeRec[], seen: Map<string, number>, rec: NodeRec): num
   return idx;
 };
 
-export const assembleGraph = (root: string, files: string[], facts: Record<string, FileFacts>): Graph => {
+export const assembleGraph = async (root: string, files: string[], factsMap: Map<string, FileFacts> | Record<string, FileFacts>): Promise<Graph> => {
   void root;
+  const facts = (file: string): FileFacts | undefined =>
+    factsMap instanceof Map ? factsMap.get(file) : factsMap[file];
+  const factValues = (): Iterable<FileFacts> =>
+    factsMap instanceof Map ? factsMap.values() : Object.values(factsMap);
   const nodes: NodeRec[] = [];
   const seen = new Map<string, number>();
   const edges: Edge[] = [];
@@ -319,9 +907,9 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
 
   // Symbol nodes + contains edges.
   const symIdxByFileLine = new Map<string, number>(); // `${file}:${line}` first symbol idx
-  for (const rel of files) {
-    const f = facts[rel];
-    if (!f) continue;
+  await forEachChunked(files, 512, (rel) => {
+    const f = facts(rel);
+    if (!f) return;
     for (const s of f.symbols) {
       const idx = addNode(nodes, seen, { id: `${s.name}@${s.file}`, ...s });
       (byFile.get(rel) ?? byFile.set(rel, []).get(rel)!).push(idx);
@@ -329,7 +917,7 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
       const key = `${rel}:${s.line}`;
       if (!symIdxByFileLine.has(key)) symIdxByFileLine.set(key, idx);
     }
-  }
+  });
 
   // Order each file's node list by line for enclosing-symbol queries.
   for (const [, arr] of byFile) arr.sort((x, y) => nodes[x]!.line - nodes[y]!.line);
@@ -359,16 +947,15 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
     });
   }
 
-  const fileSet = new Set(files);
-  const dirSet = new Set(files.map((f) => posix.dirname(f)));
+  const importIndex = buildImportIndex(files);
 
   // Import edges (file-level, low conductance backbone) + tests wiring.
   const importTargets = new Map<string, string[]>();
-  for (const rel of files) {
-    const f = facts[rel];
-    if (!f) continue;
+  await forEachChunked(files, 512, (rel) => {
+    const f = facts(rel);
+    if (!f) return;
     for (const imp of f.imports) {
-      const target = resolveImportToFile(imp.spec, rel, fileSet, dirSet);
+      const target = resolveImportToFile(imp.spec, rel, importIndex);
       if (!target || target === rel) continue;
       pushEdge(fileIdx.get(rel)!, fileIdx.get(target)!, "imports", 0.3);
       (importTargets.get(rel) ?? importTargets.set(rel, []).get(rel)!).push(target);
@@ -378,15 +965,15 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
         pushEdge(fileIdx.get(rel)!, fileIdx.get(t)!, "tests", 0.6);
       }
     }
-  }
+  });
 
   // Call edges: resolve callee by name, prefer same-file, then imported files,
   // then a globally unique definition. Conductance decays with definition
   // cardinality: a name defined twice is a pointer, a name defined 40 times
   // is ambient noise (the dynamic-language `str(`/`it(` hub failure mode).
-  for (const rel of files) {
-    const f = facts[rel];
-    if (!f) continue;
+  await forEachChunked(files, 256, (rel) => {
+    const f = facts(rel);
+    if (!f) return;
     const imported = new Set(importTargets.get(rel) ?? []);
     for (const call of f.calls) {
       const cands = byName.get(call.callee.toLowerCase()) ?? [];
@@ -399,7 +986,7 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
       const from = enclosingIdx(rel, call.line);
       for (const to of chosen) pushEdge(from, to, "invokes", w);
     }
-  }
+  });
 
   // Inherits edges from class signatures (TS/py style visible on the sig line).
   nodes.forEach((n, i) => {
@@ -417,7 +1004,7 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
 
   // Literal join edges (the cross-language bridge).
   const allSites: LiteralSite[] = [];
-  for (const rel of files) for (const l of facts[rel]?.literals ?? []) allSites.push(l);
+  for (const f of factValues()) allSites.push(...f.literals);
   const joinIdx = buildJoinIndex(allSites, (file, line) => enclosingIdx(file, line));
   for (const je of joinIdx.edges) pushEdge(je.a, je.b, "join", je.w);
 
@@ -425,7 +1012,11 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
   // and every client call of "POST /auth/login" are occurrences of the same
   // feature; the anchor hub is where they meet. Site conductance decays with
   // sqrt(count) so a route consumed everywhere doesn't become a gravity well.
-  const drafts = files.flatMap((rel) => facts[rel]?.anchors ?? []);
+  const drafts: AnchorDraft[] = [];
+  for (const rel of files) {
+    const f = facts(rel);
+    if (f) drafts.push(...f.anchors);
+  }
   const draftsByLabel = new Map<string, AnchorDraft[]>();
   for (const a of drafts) {
     (draftsByLabel.get(a.id) ?? draftsByLabel.set(a.id, []).get(a.id)!).push(a);
@@ -460,7 +1051,8 @@ export const assembleGraph = (root: string, files: string[], facts: Record<strin
   // Co-change conductance from git history (bounded, HEAD-keyed, separately
   // cached). Files that commute together belong together even without a
   // static edge; reviewer-relevant warmth flows here.
-  for (const [fa, fb, w] of coChangePairs(root, files)) {
+  await yieldToLoop();
+  for (const [fa, fb, w] of await coChangePairs(root, files)) {
     const ia = fileIdx.get(fa);
     const ib = fileIdx.get(fb);
     if (ia !== undefined && ib !== undefined) pushEdge(ia, ib, "cochange", w);

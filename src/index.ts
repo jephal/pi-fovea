@@ -3,13 +3,12 @@
 // per-conversation); the on-disk content-hash cache makes graph rebuilds
 // incremental across sessions.
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createGrepTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { defaultAgentDir, loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
-import { cachePathFor } from "./core/build.js";
-import { dwell, ensureState, focus, impact, sketch } from "./core/ops.js";
+import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
 import { resetSyncBaselines, sync } from "./core/sync.js";
 import { openFoveaSettings } from "./ui/settings.js";
@@ -122,7 +121,7 @@ export default function fovea(pi: ExtensionAPI) {
         const budget = configFor(root, ctx.isProjectTrusted()).tools.defaultBudget;
         const query = params.pattern.trim() || params.pattern;
         try {
-          const result = focus(root, query, budget, { fresh: true });
+          const result = await focus(root, query, budget, { fresh: true });
           if (Number(result.details.seeds ?? 0) === 0) {
             const native = createGrepTool(root);
             return native.execute(id, params, signal, onUpdate);
@@ -153,18 +152,29 @@ export default function fovea(pi: ExtensionAPI) {
       resetSyncBaselines();
     }
     if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.replaceGrep) registerGrepOverride();
-    // Pre-warm: when the on-disk fact cache exists and git reports little
-    // drift, rebuilding now is cheap, so the first prompt's turn-sync meets a
-    // warm graph instead of paying the index build inline. Cold caches or
-    // heavily drifted working trees skip — the first sync pays once, as before.
+    // Kick indexing in the background — the very first prompt must never
+    // wait on hashing/ast-grep. Slow cold builds surface a ready notice so
+    // the freeze feels like progress instead of a hang.
     try {
-      if (!hasAstGrep() || !existsSync(cachePathFor(ctx.cwd))) return;
-      const probe = await pi.exec("git", ["-C", ctx.cwd, "status", "--porcelain"], { timeout: 10_000 });
-      if (probe.code !== 0) return;
-      const drift = probe.stdout.split("\n").filter(Boolean).length;
-      if (drift <= 16) ensureState(ctx.cwd);
+      const kick = ensureStateBackground(ctx.cwd);
+      const t0 = Date.now();
+      // Always attach a rejection handler; headless sessions must not leak an
+      // unhandled rejection when ast-grep is unavailable.
+      void kick.promise.then(
+        (st) => {
+          const ms = Date.now() - t0;
+          if (kick.started && ctx.hasUI && ms > 4000) {
+            ctx.ui.notify(`Fovea index ready — ${st.graph.files.length} files (${(ms / 1000).toFixed(1)}s)`, "info");
+          }
+        },
+        (error) => {
+          if (kick.started && ctx.hasUI) {
+            ctx.ui.notify(`Fovea index failed: ${error instanceof Error ? error.message : error}`, "warning");
+          }
+        },
+      );
     } catch {
-      // Pre-warm is strictly best-effort; the first ensureState call retries inline.
+      // Pre-warm is strictly best-effort; the first tool call retries inline.
     }
   });
 
@@ -186,11 +196,12 @@ export default function fovea(pi: ExtensionAPI) {
     try {
       const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
       if (!cfg.sync.enabled) return;
-      const outcome = sync(ctx.cwd, {
-        files: [],
-        budget: cfg.sync.budget,
-        warmFileThreshold: cfg.sync.warmFileThreshold,
-      });
+      const outcome = await sync(
+        ctx.cwd,
+        { files: [], budget: cfg.sync.budget, warmFileThreshold: cfg.sync.warmFileThreshold },
+        undefined,
+        { probe: "cheap" },
+      );
       lastSyncError = undefined;
       if (outcome.red && outcome.text) {
         return {
@@ -220,11 +231,12 @@ export default function fovea(pi: ExtensionAPI) {
         .filter((p) => !p.startsWith("/"));
       turnFiles = [];
       if (!cfg.sync.enabled) return;
-      const outcome = sync(ctx.cwd, {
-        files: rels,
-        budget: cfg.sync.budget,
-        warmFileThreshold: cfg.sync.warmFileThreshold,
-      });
+      const outcome = await sync(
+        ctx.cwd,
+        { files: rels, budget: cfg.sync.budget, warmFileThreshold: cfg.sync.warmFileThreshold },
+        undefined,
+        { probe: "cheap" },
+      );
       lastSyncError = undefined;
       if (!outcome.structural) return;
       if (outcome.red && outcome.text) {
@@ -261,7 +273,7 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         if (signal?.aborted) throw new Error("Fovea sketch cancelled");
         onUpdate?.({ content: [text("Surveying production architecture…")], details: { phase: "sketch" } });
-        const r = sketch(root, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
+        const r = await sketch(root, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (error) {
         return rethrowOrDegrade(error);
@@ -293,7 +305,7 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         if (signal?.aborted) throw new Error("Fovea focus cancelled");
         onUpdate?.({ content: [text("Resolving focused repository context…")], details: { phase: "focus" } });
-        const r = focus(
+        const r = await focus(
           root,
           params.query,
           params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget,
@@ -328,7 +340,7 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         if (signal?.aborted) throw new Error("Fovea dwell cancelled");
         onUpdate?.({ content: [text("Widening the current graph context…")], details: { phase: "diffuse" } });
-        const r = dwell(root, params.factor, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
+        const r = await dwell(root, params.factor, params.maxTokens ?? configFor(root, ctx.isProjectTrusted()).tools.defaultBudget);
         return { content: [text(r.text)], details: r.details };
       } catch (error) {
         return rethrowOrDegrade(error);
@@ -356,7 +368,7 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         if (signal?.aborted) throw new Error("Fovea impact cancelled");
         onUpdate?.({ content: [text("Tracing likely change impact…")], details: { phase: "impact" } });
-        const r = impact(root, {
+        const r = await impact(root, {
           files: params.files,
           symbols: params.symbols,
           includeUncommitted: params.includeUncommitted,
@@ -401,7 +413,7 @@ export default function fovea(pi: ExtensionAPI) {
       }
       try {
         const [state, tracked, astGrep] = await Promise.all([
-          Promise.resolve(sketch(ctx.cwd, 256)),
+          sketch(ctx.cwd, 256),
           pi.exec("git", ["-C", ctx.cwd, "ls-files"], { timeout: 15_000 })
             .catch(() => ({ code: -1, stdout: "" })),
           pi.exec(process.env.FOVEA_AST_GREP ?? "ast-grep", ["--version"], { timeout: 15_000 })
@@ -413,12 +425,16 @@ export default function fovea(pi: ExtensionAPI) {
           : undefined;
         const coverage = trackedCount === undefined ? `${indexed} indexed files` : `${indexed}/${trackedCount} tracked files indexed`;
         const failedCount = Number(state.details.extractionFailures ?? 0);
+        const unreadableCount = Array.isArray(state.details.extractionUnreadable) ? state.details.extractionUnreadable.length : 0;
+        const oversizedCount = Array.isArray(state.details.extractionOversized) ? state.details.extractionOversized.length : 0;
         const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
         ctx.ui.notify(
           `pi-fovea ${PACKAGE_VERSION} · ${coverage} · ${state.details.nodes ?? 0} symbols · ` +
           `${state.details.productionAnchors ?? state.details.anchors ?? 0} production anchors` +
           `${Number(state.details.testAnchors ?? 0) ? ` (${state.details.testAnchors} test/fixture collapsed)` : ""}` +
-          `${failedCount ? ` · !${failedCount} files failed extraction` : ""} · ` +
+          `${failedCount ? ` · !${failedCount} files failed extraction` : ""}` +
+          `${unreadableCount ? ` · !${unreadableCount} files unreadable` : ""}` +
+          `${oversizedCount ? ` · !${oversizedCount} files over size cap` : ""} · ` +
           `sync ${cfg.sync.enabled ? "continuous" : "off"} · grep ${cfg.tools.replaceGrep ? "hybrid" : "native"} · ` +
           `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",

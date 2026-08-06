@@ -33,8 +33,8 @@ const sandbox = (src: string, name: string): string => {
 };
 
 // Mirror of src/index.ts turn_end with clean acknowledgements shown for the demo.
-const simulateTurnEnd = (root: string, touched: string[]): SyncOutcome => {
-  const outcome = sync(root, { files: touched, budget: 1024, warmFileThreshold: 2 });
+const simulateTurnEnd = async (root: string, touched: string[]): Promise<SyncOutcome> => {
+  const outcome = await sync(root, { files: touched, budget: 1024, warmFileThreshold: 2 });
   if (!outcome.structural) {
     console.log(`\x1b[32m(sync: unchanged — nothing emitted)\x1b[0m`);
   } else if (outcome.red && outcome.text) {
@@ -45,38 +45,38 @@ const simulateTurnEnd = (root: string, touched: string[]): SyncOutcome => {
   return outcome;
 };
 
-const newSessionAt = (root: string) => {
+const newSessionAt = async (root: string): Promise<void> => {
   resetSessions();
   resetSyncBaselines();
   turn("session start — first sync establishes baseline (no edits yet)");
-  const out = simulateTurnEnd(root, []);
+  const out = await simulateTurnEnd(root, []);
   console.log(`\x1b[32m   details: ${JSON.stringify(out.details)}\x1b[0m`);
 };
 
-const scenarioMochi = () => {
+const scenarioMochi = async (): Promise<void> => {
   const root = sandbox(join(SATELLITE, "mochi"), "mochi");
   banner("SCENARIO 1 · mochi (Go workflow engine) — same-cone edits stay silent");
-  newSessionAt(root);
+  await newSessionAt(root);
 
-  toolOut(focus(root, "RunModel", 700));
+  toolOut(await focus(root, "RunModel", 700));
 
   turn("model comments tools/db/default.go (inside the cone it just focused)");
   const db = join(root, "tools/db/default.go");
   writeFileSync(db, readFileSync(db, "utf8") + "\n// doc: table list is canonical here\n");
-  simulateTurnEnd(root, ["tools/db/default.go"]);
+  await simulateTurnEnd(root, ["tools/db/default.go"]);
 
   turn("model touches tools/db/mochi_store.go — still the same warm cone");
   const st = join(root, "tools/db/mochi_store.go");
   writeFileSync(st, readFileSync(st, "utf8") + "\n// doc: CreatedAt is UTC\n");
-  simulateTurnEnd(root, ["tools/db/mochi_store.go"]);
+  await simulateTurnEnd(root, ["tools/db/mochi_store.go"]);
 };
 
-const scenarioOpenmux = () => {
+const scenarioOpenmux = async (): Promise<void> => {
   const root = sandbox(join(SATELLITE, "openmux"), "openmux");
   banner("SCENARIO 2 · openmux (TS CLI) — blast radius beyond the cone escalates");
-  newSessionAt(root);
+  await newSessionAt(root);
 
-  toolOut(focus(root, "src/cli/help.ts", 700));
+  toolOut(await focus(root, "src/cli/help.ts", 700));
 
   turn("model renames an export in src/cli/parse.ts (imported widely, focused by none)");
   const p = join(root, "src/cli/parse.ts");
@@ -87,29 +87,29 @@ const scenarioOpenmux = () => {
     .replace(`export function ${fn}`, `export function ${fn}V2`)
     .replace(`export const ${fn} =`, `export const ${fn}V2 =`);
   writeFileSync(p, renamed);
-  simulateTurnEnd(root, ["src/cli/parse.ts"]);
+  await simulateTurnEnd(root, ["src/cli/parse.ts"]);
 };
 
-const scenarioQuickbeam = () => {
+const scenarioQuickbeam = async (): Promise<void> => {
   const root = sandbox(join(SATELLITE, "quickbeam-js"), "quickbeam-js");
   banner("SCENARIO 3 · quickbeam-js (JS supervisor lib) — internal edits, no churn");
-  newSessionAt(root);
+  await newSessionAt(root);
 
   const p = join(root, "src/pool.ts");
   if (!existsSync(p)) { console.log("(src/pool.ts missing — scenario skipped)"); return; }
   turn("model edits src/pool.ts internals twice");
   writeFileSync(p, readFileSync(p, "utf8") + "\n// note: children supervised under Pool\n");
-  simulateTurnEnd(root, ["src/pool.ts"]);
+  await simulateTurnEnd(root, ["src/pool.ts"]);
   writeFileSync(p, readFileSync(p, "utf8") + "// note: backpressure on checkout\n");
-  simulateTurnEnd(root, ["src/pool.ts"]);
+  await simulateTurnEnd(root, ["src/pool.ts"]);
 };
 
-const scenarioNOMAD = () => {
+const scenarioNOMAD = async (): Promise<void> => {
   const root = sandbox(join(SATELLITE, "NOMAD"), "NOMAD");
   banner("SCENARIO 4 · NOMAD (NestJS routes) — adding a route triggers a steer");
-  newSessionAt(root);
+  await newSessionAt(root);
 
-  toolOut(focus(root, "/api/airports", 800), 2000);
+  toolOut(await focus(root, "/api/airports", 800), 2000);
 
   turn("model adds @Get('health') to airports.controller.ts");
   const c = join(root, "server/src/nest/airports/airports.controller.ts");
@@ -118,20 +118,21 @@ const scenarioNOMAD = () => {
     "  @Get('search')",
     "  @Get('health')\n  health(): { ok: true } {\n    return { ok: true };\n  }\n\n  @Get('search')",
   ));
-  simulateTurnEnd(root, ["server/src/nest/airports/airports.controller.ts"]);
+  await simulateTurnEnd(root, ["server/src/nest/airports/airports.controller.ts"]);
 
   turn("model reverts it");
   writeFileSync(c, orig);
-  simulateTurnEnd(root, ["server/src/nest/airports/airports.controller.ts"]);
+  await simulateTurnEnd(root, ["server/src/nest/airports/airports.controller.ts"]);
 };
 
 rmSync(SIM, { recursive: true, force: true });
 const t0 = Date.now();
 try {
-  scenarioMochi();
-  scenarioQuickbeam();
-  scenarioOpenmux();
-  scenarioNOMAD();
+  // Scenarios share process-level caches; serialize explicitly.
+  await scenarioMochi();
+  await scenarioQuickbeam();
+  await scenarioOpenmux();
+  await scenarioNOMAD();
 } finally {
   console.log(`\n\x1b[2m(sandboxes kept at ${SIM} · ran in ${((Date.now() - t0) / 1000).toFixed(1)}s)\x1b[0m`);
 }

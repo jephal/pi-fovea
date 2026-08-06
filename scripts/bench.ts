@@ -26,18 +26,24 @@ if (!existsSync(root)) {
 // Cold build.
 try { unlinkSync(cachePathFor(root)); } catch {}
 let t0 = performance.now();
-let state = ensureState(root);
+let state = await ensureState(root);
 const coldMs = performance.now() - t0;
 
 // Warm build (cached facts).
 t0 = performance.now();
-state = ensureState(root);
+state = await ensureState(root);
 const warmMs = performance.now() - t0;
 
 const g = state.graph;
 console.log(`root: ${root}`);
 console.log(`graph: ${g.files.length} files, ${g.nodes.length} nodes, ${g.edges.length} edges, ${g.anchors.length} anchors`);
 console.log(`build: cold ${coldMs.toFixed(0)}ms, warm ${warmMs.toFixed(0)}ms`);
+
+// Steady-state probe (warm state): the path every hook takes per turn.
+t0 = performance.now();
+await ensureState(root);
+const probeMs = performance.now() - t0;
+console.log(`idle probe: ${probeMs.toFixed(1)}ms`);
 
 // Fixed query set: most-connected symbol names + all anchor paths.
 const conductance = state.csr.deg;
@@ -76,11 +82,11 @@ for (const B of budgets) {
   for (const q of queries) {
     resetSessions();
     const t1 = performance.now();
-    const r = focus(root, q, B);
+    const r = await focus(root, q, B);
     latTotal += performance.now() - t1;
     // Ideal set: the unbounded (32k-token) reveal of the same field.
     resetSessions();
-    const ideal = focus(root, q, 16000).text;
+    const ideal = (await focus(root, q, 16000)).text;
     const idealNames = new Set([...ideal.matchAll(/^\s*· (\S+) \(/gm)].map((m) => m[1]!)
       .concat([...ideal.matchAll(/^▲ \S+?:\d+\s+(.*)$/gm)].map((m) => m[2]!)));
     const gotText = r.text;

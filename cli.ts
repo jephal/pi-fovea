@@ -55,7 +55,7 @@ const rootAt = (i: number): string => {
 try {
   let out = "";
   if (cmd === "status") {
-    const s = sketch(rootAt(0), 256);
+    const s = await sketch(rootAt(0), 256);
     const testAnchors = Number(s.details.testAnchors ?? 0);
     const failed = Number(s.details.extractionFailures ?? 0);
     out = `${s.details.files} files, ${s.details.nodes} symbols, ${s.details.productionAnchors ?? s.details.anchors} production anchors` +
@@ -64,39 +64,39 @@ try {
   } else if (cmd === "sketch") {
     const root = rootAt(0);
     const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 1400;
-    out = sketch(root, B).text;
+    out = (await sketch(root, B)).text;
   } else if (cmd === "focus") {
     const root = rootAt(0);
     const q = pos[0] !== root ? pos[0] : pos[1];
     if (!q) { console.error("fovea focus <query>"); process.exit(2); }
     let bi = pos.indexOf(q) + 1;
-    out = focus(root, q, numAt(bi) ?? 2000).text;
+    out = (await focus(root, q, numAt(bi) ?? 2000)).text;
   } else if (cmd === "dwell") {
     const root = rootAt(0);
     const factor = numAt(pos[0] === root ? 1 : 0) ?? 2;
     const B = numAt(pos[0] === root ? 2 : 1) ?? 2000;
-    out = dwell(root, factor, B).text;
+    out = (await dwell(root, factor, B)).text;
   } else if (cmd === "impact") {
     const root = rootAt(0);
     const B = pos[0] === root ? numAt(1) : numAt(0);
-    out = impact(root, {
+    out = (await impact(root, {
       files: str("files")?.split(",").filter(Boolean),
       symbols: str("symbols")?.split(",").filter(Boolean),
       base: str("base"),
       includeUncommitted: !flags.has("no-uncommitted"),
       budget: B ?? 2000,
-    }).text;
+    })).text;
   } else if (cmd === "anchors") {
     const root = rootAt(0);
     const filter = pos.find((p) => p !== root);
-    const rows = ensureState(root).graph.anchors
+    const rows = (await ensureState(root)).graph.anchors
       .map((a) => `${a.implicit ? "△" : " "}\t${a.kind}\t${a.id}\t${a.file}:${a.line}`)
       .filter((r) => (!filter || r.includes(filter)) && (!flags.has("discovered") || r.startsWith("△")))
       .sort();
     out = rows.join("\n");
   } else if (cmd === "rules") {
     const root = rootAt(0);
-    const st = ensureState(root);
+    const st = await ensureState(root);
     const sigs = aggregateFiles(Object.fromEntries(Object.entries(st.facts).map(([k, v]) => [k, v.sigs])));
     const promoted = promote(sigs, DEFAULT_PACK);
     if (flags.has("adopt") && promoted.length) {

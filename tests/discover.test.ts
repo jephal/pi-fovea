@@ -9,7 +9,7 @@ import { resetSessions } from "../src/core/session.js";
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
 
 describe("harvest", () => {
-  it("extracts callee/shape/argIdx and scores path-ness", () => {
+  it("extracts callee/shape/argIdx and scores path-ness", async () => {
     const py = 'jobm.schedule("/ops/defrag", defrag)\nprint(jobm.note("no slash here"))\n';
     const sigs = harvestFile("Python", py);
     expect(sigs["Python|recv|schedule|0"]).toEqual([1, 1]);
@@ -17,12 +17,12 @@ describe("harvest", () => {
     expect(sigs["Python|recv|note|0"]).toEqual([1, 0]);
   });
 
-  it("tools with fewer than 4 sites or 2 files stay un-promoted", () => {
+  it("tools with fewer than 4 sites or 2 files stay un-promoted", async () => {
     const one = aggregateFiles({ "a.py": { "Python|recv|rare|0": [3, 3] } });
     expect(promote(one)).toEqual([]);
   });
 
-  it("junk with great frequency is rejected by precision", () => {
+  it("junk with great frequency is rejected by precision", async () => {
     const sigs = aggregateFiles({
       "a.kt": { "Kotlin|bare|assertEquals|0": [120, 30] },
       "b.kt": { "Kotlin|bare|assertEquals|0": [115, 31] },
@@ -40,7 +40,7 @@ describe("harvest", () => {
 });
 
 describe("synthesize", () => {
-  it("puts $P at the proven arg position and offers an arity tail variant", () => {
+  it("puts $P at the proven arg position and offers an arity tail variant", async () => {
     const s = aggregateFiles({
       "a.ts": { "TypeScript|recv|deliver|2": [6, 6] },
       "b.ts": { "TypeScript|recv|deliver|2": [4, 4] },
@@ -53,18 +53,18 @@ describe("synthesize", () => {
 });
 
 describe("integration on the mini repo", () => {
-  it("promotes the unknown jobm DSL surfaces as implicit half-weight hubs", () => {
+  it("promotes the unknown jobm DSL surfaces as implicit half-weight hubs", async () => {
     resetSessions();
-    const st = ensureState(FIXTURE);
+    const st = await ensureState(FIXTURE);
     const jobAnchor = st.graph.anchors.find((a) => a.id.includes("/ops/defrag"));
     expect(jobAnchor).toBeDefined();
     expect(jobAnchor!.implicit).toBe(true);
     expect(jobAnchor!.label.toLowerCase()).toContain("schedule");
   });
 
-  it("tier-1-pack anchors stay first-class when discovery fires too", () => {
+  it("tier-1-pack anchors stay first-class when discovery fires too", async () => {
     resetSessions();
-    const st = ensureState(FIXTURE);
+    const st = await ensureState(FIXTURE);
     const airports = st.graph.anchors.find((a) => a.id === "ANY /api/airports/{*}") ?? st.graph.anchors.find((a) => a.id === "GET /api/airports/{*}");
     expect(airports).toBeDefined();
     expect(airports!.implicit ?? false).toBe(false);

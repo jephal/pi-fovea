@@ -109,6 +109,22 @@ fovea status /path/to/repo
 
 `fovea` runs `cli.ts` via `tsx`. Install `tsx` globally, or use `pnpm fovea` from a checkout.
 
+## Large workspaces and startup
+
+Indexing is kicked into the background at `session_start`; submitting the first prompt never waits for ast-grep, hashing, or graph assembly. A cold sync hook reports indexing while the shared build continues, and later calls reuse it.
+
+A non-Git umbrella directory treats every nested `.git` directory or worktree marker as a project boundary, so a folder of clones is not merged into one graph. Cold work is additionally bounded by streamed JSONL cache I/O, 64-file extraction batches, adaptive ast-grep chunk splitting, a two-root resident LRU, and these environment overrides:
+
+| Variable | Default | Meaning |
+| --- | :---: | --- |
+| `FOVEA_MAX_FILES` | `8000` | maximum indexed files in one graph |
+| `FOVEA_MAX_FILE_BYTES` | `1048576` | maximum bytes extracted from one source file |
+| `FOVEA_MAX_ROOTS` | `2` | resident fact-store/graph roots |
+| `FOVEA_SPAWN_CONCURRENCY` | `3` | concurrent ast-grep/git child processes |
+| `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
+
+Files over the size cap and extraction failures remain visible in `/fovea status` and tool details instead of silently thinning the graph.
+
 ## Turn sync
 
 Continuous sync is on by default. Before an agent starts, Fovea establishes its baseline or injects any out-of-band drift before the first model call. After every assistant turn it compares extracted symbols, calls, imports, literals, and anchors again. Content hashes keep the unchanged fast path cheap, while comment- and formatting-only edits do not wake the model.
@@ -222,7 +238,7 @@ pnpm run check        # typecheck + full vitest suite
 pnpm run bench        # rate–distortion bench against ../pi-fabric
 ```
 
-pi loads the extension straight from `src/` via jiti; there is no build step. Per-repo caches live in `$TMPDIR` behind per-file content sha1 hashes, and only dirty files re-run ast-grep. Bump `CACHE_VERSION` in `src/core/build.ts` whenever extractor semantics change.
+pi loads the extension straight from `src/` via jiti; there is no build step. Per-repo JSONL caches live in `$TMPDIR` behind per-file content sha1 + stat manifests. Cache I/O is streamed, only dirty files re-run ast-grep, and unchanged extraction failures retain fact-free hash markers so they stay visible without being retried every launch. Bump `CACHE_VERSION` in `src/core/build.ts` whenever extractor semantics change.
 
 ## Acknowledgments
 

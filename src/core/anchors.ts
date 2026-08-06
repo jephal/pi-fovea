@@ -16,11 +16,12 @@
 // chi Mount); tRPC/GraphQL/gRPC have no path token to anchor at all.
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join as joinPath } from "node:path";
-import { groupByLang, patternRun, patternRunAll } from "./astgrep.js";
+import { groupByLang, patternRunAll } from "./astgrep.js";
 import { PATH_TOKEN_RE } from "./extract.js";
 import { classifyLiteral, normalizeLiteral } from "./join.js";
+import { readAll, type FileSource } from "./source.js";
 import type { Anchor } from "./types.js";
 
 export interface AnchorRule {
@@ -248,12 +249,12 @@ const joinRoute = (prefix: string, child: string): string => {
   return c ? `/${[p, c].filter(Boolean).join("/")}` : `/${p}`;
 };
 
-export const extractAnchors = (
+export const extractAnchors = async (
   files: string[],
   cwd: string,
   resolveEnclosing: (file: string, line: number) => string | undefined,
   pack: AnchorRule[] = DEFAULT_PACK,
-): AnchorDraft[] => {
+): Promise<AnchorDraft[]> => {
   const byLang = groupByLang(files);
   const out: AnchorDraft[] = [];
   for (const rule of pack) {
@@ -263,12 +264,12 @@ export const extractAnchors = (
       if (!langFiles?.length) continue;
       const prefixes = new Map<string, string>(); // file -> class-level path prefix
       if (rule.prefixPattern?.length) {
-        for (const pm of patternRunAll(rule.prefixPattern, lang, langFiles, cwd)) {
+        for (const pm of await patternRunAll(rule.prefixPattern, lang, langFiles, cwd)) {
           const p = pm.single.P?.trim();
           if (p !== undefined && !prefixes.has(pm.file)) prefixes.set(pm.file, unquote(p));
         }
       }
-      const matchSets = patternRunAll(rule.patterns ?? [rule.pattern!], lang, langFiles, cwd);
+      const matchSets = await patternRunAll(rule.patterns ?? [rule.pattern!], lang, langFiles, cwd);
       for (const m of matchSets) {
         const method = m.single.M;
         const pathLike = m.single.P;
@@ -360,9 +361,27 @@ const toFileRoutePath = (stem: string): string => {
   return "/" + segs.filter((s) => s !== "").join("/");
 };
 
-export const extractFileRoutes = (files: string[], root: string, rules: FileRouteRule[] = DEFAULT_FILE_ROUTES): AnchorDraft[] => {
+export const extractFileRoutes = async (
+  files: string[],
+  root: string,
+  rules: FileRouteRule[] = DEFAULT_FILE_ROUTES,
+  source?: FileSource,
+): Promise<AnchorDraft[]> => {
   const compiled = rules.map((r) => ({ rule: r, re: new RegExp(r.re) }));
   const out: AnchorDraft[] = [];
+  // Route files whose verbs come from exported handler names need one read;
+  // batch them through the shared provider ahead of the match loop.
+  const verbReaders: string[] = [];
+  for (const file of files) {
+    for (const { rule, re } of compiled) {
+      const match = re.exec(file);
+      if (match && rule.verbs === "exports") {
+        verbReaders.push(file);
+        break;
+      }
+    }
+  }
+  const texts = source ? await readAll(verbReaders, source) : new Map<string, string>();
   for (const file of files) {
     for (const { rule, re } of compiled) {
       const match = re.exec(file);
@@ -379,11 +398,13 @@ export const extractFileRoutes = (files: string[], root: string, rules: FileRout
       if (rule.verbs === "suffix") {
         if (suffixVerb) verbs.add(suffixVerb);
       } else {
-        let content = "";
-        try {
-          content = readFileSync(joinPath(root, file), "utf8");
-        } catch {
-          // unreadable: fall through with no verbs
+        let content = texts.get(file);
+        if (content === undefined) {
+          try {
+            content = (source ? await source.read(file) : await readFile(joinPath(root, file), "utf8")) ?? "";
+          } catch {
+            content = ""; // unreadable: fall through with no verbs
+          }
         }
         for (const vm of content.matchAll(EXPORTED_VERB_RE)) verbs.add(vm[1]!);
       }
@@ -427,10 +448,10 @@ const DEFAULTS_SHA = createHash("sha1")
   .digest("hex");
 
 // Repo-local overrides: .fovea/rules.json = { "rules": AnchorRule[], "fileRoutes": FileRouteRule[] }.
-export const loadRepoRules = (root: string): { pack: AnchorRule[]; fileRoutes: FileRouteRule[]; sha: string } => {
+export const loadRepoRules = async (root: string): Promise<{ pack: AnchorRule[]; fileRoutes: FileRouteRule[]; sha: string }> => {
   let raw = "";
   try {
-    raw = readFileSync(joinPath(root, ".fovea", "rules.json"), "utf8");
+    raw = await readFile(joinPath(root, ".fovea", "rules.json"), "utf8");
   } catch {
     return { pack: DEFAULT_PACK, fileRoutes: DEFAULT_FILE_ROUTES, sha: DEFAULTS_SHA };
   }

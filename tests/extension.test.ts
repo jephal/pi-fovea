@@ -1,7 +1,7 @@
 // The extension entry as pi sees it: register the graph tools, optionally
 // replace grep, and execute through Pi's TypeBox tool contract.
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,7 +10,7 @@ import extension from "../src/index.js";
 import { resetSessions } from "../src/core/session.js";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { cachePathFor } from "../src/core/build.js";
-import { ensureState } from "../src/core/ops.js";
+import { ensureState, evictState, getInflight, getState } from "../src/core/ops.js";
 import { DEFAULT_FOVEA_CONFIG } from "../src/core/config.js";
 import { resetSyncBaselines } from "../src/core/sync.js";
 
@@ -306,6 +306,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     const loaded = load();
     const ctx = fakeCtx(root);
     try {
+      await ensureState(root); // session_start pre-warm equivalent
       await loaded.emit("before_agent_start", { prompt: "first" }, ctx);
       const main = path.join(root, "server/main.go");
       writeFileSync(
@@ -338,6 +339,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     const loaded = load();
     const ctx = fakeCtx(root);
     try {
+      await ensureState(root); // session_start pre-warm equivalent
       await loaded.emit("before_agent_start", { prompt: "change the route" }, ctx); // establish pre-edit baseline
       await loaded.emit("turn_start", {}, ctx);
       const main = path.join(root, "server/main.go");
@@ -376,28 +378,39 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(result.content[0]!.text).toContain("web/api.ts");
   });
 
-  it("pre-warms only when ast-grep and a populated fact cache are present", async () => {
+  it("kicks a background index at session start without ever blocking the prompt", async () => {
     const loaded = load();
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-"));
-    const statusProbe = () =>
-      loaded.execCalls.filter((c) => c.command === "git" && c.args.includes("status")).length;
     try {
       writeFileSync(path.join(root, "probe.ts"), "export const probe = 1;\n");
-      // No fact cache for this root yet: session start must not pay index cost.
+      evictState(root);
+      // session_start returns promptly and the build runs out-of-band.
       await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
-      expect(statusProbe()).toBe(0);
-      // Populate the on-disk cache: the gate now passes the binary + cache
-      // checks and reaches the git drift probe (which may itself decline
-      // outside a git repo — the wiring point is that git is consulted).
-      ensureState(root);
-      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
-      expect(statusProbe()).toBe(1);
-      // ast-grep missing: the gate short-circuits before any git probe.
-      vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
-      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
-      expect(statusProbe()).toBe(1);
+      const pending = getInflight(root);
+      expect(pending).toBeDefined();
+      const state = await pending!;
+      expect(getState(root)?.version).toBe(state.version);
+      // The fact cache materializes for the next session's warm start.
+      expect(existsSync(cachePathFor(root))).toBe(true);
+      // ast-grep missing: the gate short-circuits before kicking anything.
+      const other = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-missing-"));
+      try {
+        vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
+        await loaded.emit("session_start", { reason: "new" }, fakeCtx(other, true));
+        // Availability is probed asynchronously too: session start still
+        // returns first, then the background build rejects without state.
+        const unavailable = getInflight(other);
+        expect(unavailable).toBeDefined();
+        await expect(unavailable).rejects.toThrow(/ast-grep/);
+        expect(getInflight(other)).toBeUndefined();
+        expect(getState(other)).toBeUndefined();
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(other, { recursive: true, force: true });
+      }
     } finally {
       vi.unstubAllEnvs();
+      evictState(root);
       rmSync(root, { recursive: true, force: true });
       rmSync(cachePathFor(root), { force: true });
     }

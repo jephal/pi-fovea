@@ -2,13 +2,14 @@
 // what *by construction*; the history graph says what *actually* moves
 // together — the signal impact needs when two files share no static edge but
 // always get edited in the same commits. Bounded by commit window and pair
-// caps; cached by HEAD sha + tracked-file hash.
+// caps; cached by HEAD sha + tracked-file hash. All git IO is async behind
+// the spawn gate.
 
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join as joinPath } from "node:path";
-import { spawnSync } from "node:child_process";
+import { gitHead, gitOut } from "./git.js";
 
 const LOG_COMMITS = 400;
 const MAX_FILES_PER_COMMIT = 24; // squashed monsters carry no pair signal
@@ -20,28 +21,20 @@ interface CacheShape { head: string; key: string; pairs: Array<[string, string, 
 const cachePath = (root: string): string =>
   joinPath(tmpdir(), `pi-fovea-cochange-${createHash("sha1").update(root).digest("hex").slice(0, 16)}.json`);
 
-const git = (root: string, args: string[]): string => {
-  const res = spawnSync("git", ["-C", root, ...args], {
-    encoding: "utf8", timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
-  });
-  if (res.error || res.status !== 0) return "";
-  return res.stdout ?? "";
-};
-
 // coChangePairs returns [fileA, fileB, conductance] pairs. `filesInGraph`
 // restricts to files we actually track, so vendored churn is excluded.
-export const coChangePairs = (root: string, filesInGraph: string[]): Array<[string, string, number]> => {
-  const head = git(root, ["rev-parse", "HEAD"]).trim();
+export const coChangePairs = async (root: string, filesInGraph: string[]): Promise<Array<[string, string, number]>> => {
+  const head = (await gitHead(root)) ?? "";
   if (!head) return []; // not a git repo
   const tracked = new Set(filesInGraph);
   const key = createHash("sha1").update([...tracked].sort().join("\n")).digest("hex").slice(0, 12);
   const cp = cachePath(root);
   try {
-    const cached = JSON.parse(readFileSync(cp, "utf8")) as CacheShape;
+    const cached = JSON.parse(await readFile(cp, "utf8")) as CacheShape;
     if (cached.head === head && cached.key === key) return cached.pairs;
   } catch { /* recompute */ }
 
-  const log = git(root, ["log", "--format=%x00", "--numstat", "-n", String(LOG_COMMITS), "--no-renames", "--diff-filter=AMR", "--", "."]);
+  const log = await gitOut(root, ["log", "--format=%x00", "--numstat", "-n", String(LOG_COMMITS), "--no-renames", "--diff-filter=AMR", "--", "."]) ?? "";
   // numstat lines: "<added>\t<deleted>\t<file>"; commits separated by NUL lines.
   const pairCount = new Map<string, number>();
   const soloCount = new Map<string, number>();
@@ -97,8 +90,8 @@ export const coChangePairs = (root: string, filesInGraph: string[]): Array<[stri
   const pairs = scored.filter((_, i) => keep.has(i));
 
   try {
-    mkdirSync(dirname(cp), { recursive: true });
-    writeFileSync(cp, JSON.stringify({ head, key, pairs } satisfies CacheShape));
+    await mkdir(dirname(cp), { recursive: true });
+    await writeFile(cp, JSON.stringify({ head, key, pairs } satisfies CacheShape));
   } catch { /* cache is an optimization */ }
   return pairs;
 };
