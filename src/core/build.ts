@@ -29,7 +29,6 @@ import { aggregateFiles, harvestFile, promote, type FileSigs } from "./discover.
 import { makeFileSource } from "./source.js";
 import type { CallSite, Edge, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
-import { coChangePairs } from "./cochange.js";
 
 export interface FileFacts {
   sha1: string;
@@ -1051,16 +1050,6 @@ export const assembleGraphWithIndex = async (
       const fw = 0.35 / Math.sqrt(filesOf.length);
       for (const f of filesOf) pushEdge(idx, fileIdx.get(f)!, "anchors", fw);
     }
-  }
-
-  // Co-change conductance from git history (bounded, HEAD-keyed, separately
-  // cached). Files that commute together belong together even without a
-  // static edge; reviewer-relevant warmth flows here.
-  await yieldToLoop();
-  for (const [fa, fb, w] of await coChangePairs(root, files)) {
-    const ia = fileIdx.get(fa);
-    const ib = fileIdx.get(fb);
-    if (ia !== undefined && ib !== undefined) pushEdge(ia, ib, "cochange", w);
   }
 
   return { graph: { nodes, edges, byName, byFile, anchors, files }, joinIndex: joinIdx };

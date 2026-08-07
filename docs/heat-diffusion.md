@@ -16,7 +16,6 @@ The repo compiles to one typed undirected graph $G = (V, E)$ with files, symbols
 | `anchors` anchor hub → handler | $c / \sqrt{S}$
 | `anchors` hub → member file | $0.35 / \sqrt{|F|}$ |
 | `join` literal bridge | see below |
-| `cochange` git commute | see below |
 
 Call edges are specificity-tiered so a call to a rare symbol beats one to a common symbol. Language builtins and log/test entry points are warded off: a `console.log` call connects nothing. The anchor hub weight decays with the number of sites $S$ bound to it, so a multi-site route does not become a gravity well. The file-member weight decays with $|F|$, the file count of the feature hood.
 
@@ -91,9 +90,20 @@ $$
 
 The denominator stops a popular literal from turning into an uncapped hub. Repetition inside one file also cannot inflate $\mathrm{df}$, or a lockfile would dominate every bridge.
 
-## Co-change
+## Co-change history is heat, not structure
 
-File-to-file conductance from recent git history adds a channel the parser never sees. Files $a$ and $b$ that commute together earn an edge weight from a Jaccard-tilted coincidence count, capped per file and cached by HEAD until the working tree drifts.
+Joint git history is the *software development over time* signal — the affinity diffusion cannot see by construction. Files $a$ and $b$ that keep moving together in the same commits carry a history bond the parser never encodes. Under the all-in heat model that bond is a **seeded field**, not a permanent graph edge:
+
+- `cochange.ts` mines the last 400 commits, records each pair's joint-commit count and the committer time of its **most recent** joint commit, and caches those raw facts by HEAD + tracked-file set. The static graph carries **no** co-change edge: focus and sketch read the operator and stay pure structure.
+- When `impact` seeds a change, it re-seeds the change site's history partners into the *same* diffusion at
+
+  $$w = w_0(\text{count}, \text{jaccard}) \cdot 2^{-\text{ageDays} / \tau}, \qquad \tau = 30 \text{ days}$$
+
+  where $w_0$ is the old Jaccard-tilted base conductance and age is wall-clock since the pair last co-committed ($\text{age} = \max(0, \text{now} - \text{lastTs})$).
+- Linearity is what makes this heat: seeding partner files at weight $w$ and diffusing once is exactly $e^{-tL}(s_{\text{change}} + w \, s_{\text{partner}})$. Fresh joint work is hot; a pair that last moved months ago contributes almost nothing; a session that goes idle cools the affinity like every other heat source. Even a cached hit cools, because recency is applied at **use** time, not baked into the cache.
+- Partner files surface with the `co-change history` reason, so turn-sync still weighs them at $c_f = 0.5$ — unchanged — and the session heat memory $\mu$ now governs how often that channel can refire.
+
+`FOVEA_COCHANGE_HALF_LIFE_DAYS` (default 30) sets the wall-clock half-life.
 
 ## Inferred regions (basins)
 

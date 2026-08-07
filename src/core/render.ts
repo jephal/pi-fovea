@@ -30,7 +30,6 @@ interface DirectRelation {
 
 const RELATION_PRIORITY: Record<EdgeKind, number> = {
   contains: 0,
-  cochange: 1,
   imports: 2,
   join: 3,
   anchors: 4,
@@ -47,7 +46,6 @@ const relationLabel = (edge: Edge, seedAtA: boolean, candidate: NodeRec): string
     case "inherits": return seedAtA ? "→ parent" : "← subclass";
     case "anchors": return seedAtA ? candidate.kind === "file" ? "→ feature file" : "→ handler" : "← route";
     case "join": return "↔ shared literal";
-    case "cochange": return "↔ co-change";
     case "contains": return seedAtA ? "◇ member" : "◇ file";
   }
 };

@@ -28,6 +28,7 @@ import { FOCUS_T0, getSession, TK_ORDER } from "./session.js";
 import { detectBasins } from "./basins.js";
 import { classifyLiteral, normalizeLiteral, type JoinIndex } from "./join.js";
 import { isTestFile } from "./extract.js";
+import { coChangeHistory, effectiveWeight, type CoChangeHistory } from "./cochange.js";
 import type { Graph, NodeKind, NodeRec } from "./types.js";
 
 export interface OpResult {
@@ -61,6 +62,10 @@ export interface RepoState {
    * porcelain-clean with unmoved HEAD would otherwise keep serving its dirty
    * facts until the next edit. */
   dirty: Set<string>;
+  /** Past joint-edit affinity (raw conductance + last joint commit). History
+   * is NOT structure: impact re-seeds these partners at recency-decayed
+   * strength whenever a change lands, so old co-work cools like any heat. */
+  history: CoChangeHistory;
 }
 
 // State lifecycle: background builds, probe-gated refreshes, LRU eviction.
@@ -154,8 +159,12 @@ const assembleState = async (
   for (const list of adjacency.values()) {
     list.sort((a, b) => Number(a.kind === "contains") - Number(b.kind === "contains") || b.w - a.w || a.to - b.to);
   }
+  // History memory rides alongside the graph, not in it. Impact re-seeds the
+  // partners of a change at recency-decayed strength; focus/sketch stay pure
+  // structure. Cached by HEAD + tracked set, so a rebuild is cheap.
+  const history = await coChangeHistory(root, files);
   const stamp = Date.now();
-  return { root, version, graph, csr, joinIndex, facts, extraction, adjacency, store, files, gitKind, head, dirty, probedAt: stamp, walkedAt: stamp, sweptAt: stamp };
+  return { root, version, graph, csr, joinIndex, facts, extraction, adjacency, store, files, gitKind, head, dirty, history, probedAt: stamp, walkedAt: stamp, sweptAt: stamp };
 };
 
 const buildState = async (root: string): Promise<RepoState> => {
@@ -545,6 +554,35 @@ const seedVector = (n: number, seeds: number[]): Float64Array => {
   return s;
 };
 
+/**
+ * Recency-decayed history heat for a changed-file set: past co-change
+ * partners of those files, each at min(baseW * 2^-ageDays/halfLife). Pure
+ * and linear — the caller adds the weights onto its seed vector, so the
+ * whole cascade stays one diffusion. Never returns a file that is itself
+ * being seeded, and old joints (age >> half-life) decay to ~0 and drop out.
+ */
+export const historySeedWeights = (
+  seedFiles: ReadonlySet<string>,
+  graph: Readonly<Graph>,
+  history: CoChangeHistory,
+  now: number,
+): Map<string, number> => {
+  const partners = new Map<string, number>();
+  const add = (file: string, w: number): void => {
+    if (seedFiles.has(file)) return;
+    partners.set(file, Math.max(partners.get(file) ?? 0, w));
+  };
+  for (const file of seedFiles) {
+    for (const p of history.get(file) ?? []) {
+      const ageDays = Math.max(0, (now - p.lastTs) / 86_400_000);
+      const w = effectiveWeight(p.w, ageDays);
+      if (w <= 1e-6) continue;
+      add(p.partner, w);
+    }
+  }
+  return partners;
+};
+
 const clampBudget = (b: number | undefined, dflt: number): number =>
   Math.max(256, Math.min(16000, b ?? dflt));
 
@@ -858,6 +896,10 @@ export interface ImpactArgs {
   budget?: number;
 }
 
+// Reason label for the history heat layer; must equal the sync CHANNEL_WEIGHT
+// key so the surprise gate weighs it the same as it ever weighed the edge.
+const COCHANGE_REASON = "co-change history";
+
 export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState): Promise<OpResult> => {
   const state = ensured ?? (await ensureState(root));
   const g = state.graph;
@@ -883,9 +925,23 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
   }
   const seeds = [...seedSet];
   const t = 4;
-  const field = heatField(chebyshevVectors(state.csr, seedVector(g.nodes.length, seeds), chooseOrder(t)), t, g.nodes.length);
-  const exclude = new Set(seeds.map((i) => g.nodes[i]!.id));
   const seedFiles = new Set(seeds.map((i) => g.nodes[i]!.file));
+  // History heat layer: past co-change re-seeds partner files into the SAME
+  // diffusion at recency-decayed strength instead of pinning a permanent
+  // structural edge. Linearity makes this exactly heat(seeds + partners·w):
+  // a change with recent history hot-reloads its old co-workers, an idle one
+  // adds nothing, and wall-clock decay cools the affinity like any heat.
+  const s = seedVector(g.nodes.length, seeds);
+  const historyFor = historySeedWeights(seedFiles, g, state.history, Date.now());
+  let historyPartners = 0;
+  for (const [file, w] of historyFor) {
+    const fileNode = (g.byFile.get(file) ?? []).find((i) => g.nodes[i]!.kind === "file");
+    if (fileNode === undefined) continue;
+    s[fileNode]! += w;
+    historyPartners++;
+  }
+  const field = heatField(chebyshevVectors(state.csr, s, chooseOrder(t)), t, g.nodes.length);
+  const exclude = new Set(seeds.map((i) => g.nodes[i]!.id));
 
   // Aggregate warmed mass per file (excluding the seeds themselves). Heat
   // retained by the seed files (seedMass) is the scale-free normalizer turn
@@ -921,7 +977,6 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
       case "inherits": return "inheritance";
       case "join": return "shared literal";
       case "anchors": return "shared route";
-      case "cochange": return "co-change history";
       case "contains": return undefined;
     }
   };
@@ -963,6 +1018,15 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
     }
   }
 
+  // History overlays are their own evidence: a file surfaced because it
+  // co-moved with the change in the past, so label it directly. The sync
+  // surprise gate weighs this channel at 0.5 — unchanged from the edge era.
+  for (const file of historyFor.keys()) {
+    if (!fileAgg.has(file) || seedFiles.has(file)) continue;
+    const merged = new Set<string>([COCHANGE_REASON, ...(reasonByFile.get(file) ?? [])]);
+    reasonByFile.set(file, merged);
+  }
+
   const fileEntries = [...fileAgg.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const fileGroups: GroupLine[] = [];
   for (const [file, mass] of fileEntries) {
@@ -990,6 +1054,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
     tokens: fit.tokens,
     details: {
       seeds: seeds.length,
+      historyPartners,
       warmed: groups.length,
       truncated: fit.truncated,
       ...extractionDetails(state),
