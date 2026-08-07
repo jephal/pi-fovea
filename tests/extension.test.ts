@@ -219,7 +219,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(message).toMatch(/pi-fovea \d+\.\d+\.\d+/);
     expect(message).toContain("tracked files indexed");
     expect(message).toContain("production anchors");
-    expect(message).toContain("sync continuous");
+    expect(message).toContain("sync enabled");
     expect(message).toContain("grep augment");
     expect(message).toContain("ast-grep");
   });
@@ -558,6 +558,66 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
         display: true,
       });
       expect(String(loaded.messages[0]!.message.content)).toContain("Steer: account for this update");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps hidden sync intelligence model-visible without rendering it", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-hidden-sync-"));
+    cpSync(FIXTURE, root, { recursive: true });
+    mkdirSync(path.join(root, ".pi"), { recursive: true });
+    writeFileSync(path.join(root, ".pi", "fovea.json"), JSON.stringify({ sync: { mode: "hidden" } }));
+    execSync("git init -qb main && git add -A", { cwd: root });
+    execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    resetSessions();
+    resetSyncBaselines();
+    const loaded = load();
+    const ctx = fakeCtx(root, true);
+    try {
+      await ensureState(root);
+      await loaded.emit("before_agent_start", { prompt: "change the route" }, ctx);
+      await loaded.emit("turn_start", {}, ctx);
+      const main = path.join(root, "server/main.go");
+      writeFileSync(
+        main,
+        readFileSync(main, "utf8").replace(
+          'r.POST("/api/users", server.CreateUserHandler)',
+          'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/hidden", server.GetUserHandler)',
+        ),
+      );
+      await loaded.emit("turn_end", {}, ctx);
+      expect(loaded.messages).toHaveLength(1);
+      expect(loaded.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+      expect(loaded.messages[0]!.message).toMatchObject({
+        customType: "pi-fovea-sync",
+        display: false,
+      });
+      expect(String(loaded.messages[0]!.message.content)).toContain("GET /api/users/{*}/hidden");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("disables sync work and delivery in disabled mode", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-disabled-sync-"));
+    mkdirSync(path.join(root, ".pi"), { recursive: true });
+    writeFileSync(path.join(root, ".pi", "fovea.json"), JSON.stringify({ sync: { mode: "disabled" } }));
+    const loaded = load();
+    const ctx = fakeCtx(root, true);
+    try {
+      const before = await loaded.emit("before_agent_start", { prompt: "do nothing" }, ctx);
+      await loaded.emit("turn_start", {}, ctx);
+      await loaded.emit(
+        "tool_execution_start",
+        { toolCallId: "t1", toolName: "edit", args: { path: path.join(root, "file.ts") } },
+        ctx,
+      );
+      await loaded.emit("tool_execution_end", { toolCallId: "t1", toolName: "edit" }, ctx);
+      await loaded.emit("turn_end", {}, ctx);
+      expect(before.filter((result) => result !== undefined)).toEqual([]);
+      expect(loaded.messages).toHaveLength(0);
+      expect(getState(root)).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

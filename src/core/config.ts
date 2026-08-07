@@ -8,9 +8,12 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 
+export const SYNC_MODES = ["enabled", "hidden", "disabled"] as const;
+export type SyncMode = (typeof SYNC_MODES)[number];
+
 interface FoveaSyncConfig {
-  /** turn_end feedback loop on/off (the default-on, opt-out knob). */
-  enabled: boolean;
+  /** Continuous sync delivery: visible, model-only, or fully disabled. */
+  mode: SyncMode;
   /** Token budget for proactive model steering context. */
   budget: number;
   /** Also send a tiny model-visible ack on clean turns (default false: silent green). */
@@ -47,7 +50,7 @@ export interface FoveaConfig {
 
 export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   sync: {
-    enabled: true,
+    mode: "enabled",
     budget: 512,
     ackClean: false,
     // Masses are heat units leaked outside the changed files (1 unit seeded
@@ -97,10 +100,8 @@ const clamp = (id: string, value: number): number => {
 const boolValue = (value: unknown, fallback: boolean): boolean =>
   typeof value === "boolean" ? value : fallback;
 
-const grepModeValue = (value: unknown, fallback: GrepMode): GrepMode =>
-  typeof value === "string" && (GREP_MODES as readonly string[]).includes(value)
-    ? (value as GrepMode)
-    : fallback;
+const enumValue = <T extends string>(value: unknown, values: readonly T[], fallback: T): T =>
+  typeof value === "string" && values.includes(value as T) ? value as T : fallback;
 
 const intValue = (id: string, value: unknown, fallback: number): number =>
   clamp(id, typeof value === "number" && Number.isFinite(value) ? value : fallback);
@@ -118,7 +119,12 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
   const tools = (typeof src.tools === "object" && src.tools !== null ? src.tools : {}) as Record<string, unknown>;
   return {
     sync: {
-      enabled: boolValue(sync.enabled, base.sync.enabled),
+      // Legacy `enabled` booleans map to visible/disabled. An explicit mode wins.
+      mode: enumValue(
+        sync.mode,
+        SYNC_MODES,
+        typeof sync.enabled === "boolean" ? (sync.enabled ? "enabled" : "disabled") : base.sync.mode,
+      ),
       budget: intValue("sync.budget", sync.budget, base.sync.budget),
       ackClean: boolValue(sync.ackClean, base.sync.ackClean),
       steerThreshold: floatValue("sync.steerThreshold", sync.steerThreshold, base.sync.steerThreshold),
@@ -128,8 +134,9 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
       defaultBudget: intValue("tools.defaultBudget", tools.defaultBudget, base.tools.defaultBudget),
       // Legacy `replaceGrep` (v0.10): true -> "replace", false -> "off". An
       // explicit `grepMode` always wins over the legacy key.
-      grepMode: grepModeValue(
+      grepMode: enumValue(
         tools.grepMode,
+        GREP_MODES,
         typeof tools.replaceGrep === "boolean" ? (tools.replaceGrep ? "replace" : "off") : base.tools.grepMode,
       ),
       grepAugmentBudget: intValue("tools.grepAugmentBudget", tools.grepAugmentBudget, base.tools.grepAugmentBudget),
@@ -155,7 +162,7 @@ export const loadFoveaConfig = (scopes: FoveaConfigScopes): FoveaConfig => {
   }
   // Environment override mirrors pi-fabric's PI_* precedence over stored values.
   const off = process.env.FOVEA_TURN_SYNC;
-  if (off === "off" || off === "0" || off === "false") config = { ...config, sync: { ...config.sync, enabled: false } };
+  if (off === "off" || off === "0" || off === "false") config = { ...config, sync: { ...config.sync, mode: "disabled" } };
   return config;
 };
 

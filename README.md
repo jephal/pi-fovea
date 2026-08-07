@@ -172,7 +172,7 @@ details.
 
 ## Turn sync
 
-Continuous sync is on by default. Before an agent starts, Fovea establishes its
+Continuous sync is enabled and visible by default. Before an agent starts, Fovea establishes its
 baseline or injects any outside drift ahead of the first model call. After
 every assistant turn it compares symbols, calls, imports, literals, and anchors
 again. Content hashes keep the unchanged fast path cheap. Edits that touch only
@@ -186,7 +186,9 @@ It lists the causal channels behind each link: calls, imports, shared literals,
 tests, or co-change history. By default it also embeds the refreshed focus
 context of the top drift target (push). With `sync.pushFocus` off, the update
 ends with a suggested focus probe for the next call (pull). Clean turns stay
-silent. Enable `sync.ackClean` if you want an ack for those.
+silent. Enable `sync.ackClean` if you want an ack for those. Set `sync.mode` to
+`"hidden"` to keep red sync context working behind the scenes without rendering it
+in the transcript, or to `"disabled"` to turn continuous sync off.
 
 Runtime controls:
 
@@ -195,7 +197,8 @@ Runtime controls:
 - `/fovea reload`: hot-reload extensions and activate newly installed source
 - `/fovea settings`: configure sync, budgets, and hybrid grep
 
-Turn sync off per repo or globally through settings, or with:
+Choose enabled, hidden, or disabled per repo or globally through settings. The
+environment override still turns sync off with:
 
 ```sh
 FOVEA_TURN_SYNC=off pi
@@ -209,7 +212,7 @@ with `fabric.json`.
 
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
-| `sync.enabled` | `true` | pre-agent and post-turn continuous sync |
+| `sync.mode` | `"enabled"` | `"enabled"` shows model-visible sync messages, `"hidden"` keeps them model-visible but out of the transcript, and `"disabled"` turns sync off. Legacy `sync.enabled` booleans still parse. |
 | `sync.budget` | `512` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |

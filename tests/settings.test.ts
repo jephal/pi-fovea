@@ -78,7 +78,7 @@ describe("Fovea settings", () => {
           component.handleInput("\x07");
           const list = component.settingsList as any;
           list.selectedIndex = list.items.findIndex(
-            (item: { id: string }) => item.id === "sync.enabled",
+            (item: { id: string }) => item.id === "sync.mode",
           );
           list.activateItem();
         },
@@ -90,7 +90,7 @@ describe("Fovea settings", () => {
       expect(result).toEqual({ grepRegistrationChanged: false });
       expect(requestRender).toHaveBeenCalledOnce();
       expect(JSON.parse(readFileSync(path.join(agentDir, "fovea.json"), "utf8"))).toMatchObject({
-        sync: { enabled: false },
+        sync: { mode: "hidden" },
       });
       expect(existsSync(path.join(cwd, ".pi", "fovea.json"))).toBe(false);
     } finally {
@@ -109,10 +109,10 @@ describe("FoveaSettingsComponent save scope", () => {
 
   const buildItems = (): SettingItem[] => [
     {
-      id: "sync.enabled",
+      id: "sync.mode",
       label: "Continuous sync",
-      currentValue: "true",
-      values: ["true", "false"],
+      currentValue: "enabled",
+      values: ["enabled", "hidden", "disabled"],
     },
     {
       id: "sync.budget",

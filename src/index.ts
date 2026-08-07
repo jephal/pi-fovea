@@ -68,6 +68,8 @@ const requestsNativeGrep = (params: {
     !ROUTE_PATH.test(params.pattern.trim()));
 
 const text = (s: string) => ({ type: "text" as const, text: s });
+const syncRuns = (config: FoveaConfig): boolean => config.sync.mode !== "disabled";
+const syncDisplays = (config: FoveaConfig): boolean => config.sync.mode === "enabled";
 
 const NODE_KINDS = new Set<NodeKind>([
   "function", "method", "class", "interface", "type", "field", "decl", "file", "anchor",
@@ -264,7 +266,7 @@ export default function fovea(pi: ExtensionAPI) {
     const rels = turnFiles
       .map((p) => (p.startsWith(root + "/") ? p.slice(root.length + 1) : p))
       .filter((p) => !p.startsWith("/"));
-    if (!rels.length || !cfg.sync.enabled) return;
+    if (!rels.length || !syncRuns(cfg)) return;
     const files = [...rels];
     const existing = warmTimers.get(root);
     if (existing) clearTimeout(existing);
@@ -299,7 +301,7 @@ export default function fovea(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => {
     try {
       const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
-      if (!cfg.sync.enabled) return;
+      if (!syncRuns(cfg)) return;
       const outcome = await sync(
         ctx.cwd,
         { files: [], budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus },
@@ -315,7 +317,7 @@ export default function fovea(pi: ExtensionAPI) {
           message: {
             customType: "pi-fovea-sync",
             content: outcome.text,
-            display: true,
+            display: syncDisplays(cfg),
             details: outcome.details,
           },
         };
@@ -337,7 +339,7 @@ export default function fovea(pi: ExtensionAPI) {
         .map((p) => (p.startsWith(ctx.cwd + "/") ? p.slice(ctx.cwd.length + 1) : p))
         .filter((p) => !p.startsWith("/"));
       turnFiles = [];
-      if (!cfg.sync.enabled) return;
+      if (!syncRuns(cfg)) return;
       const outcome = await sync(
         ctx.cwd,
         { files: rels, budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus },
@@ -352,7 +354,7 @@ export default function fovea(pi: ExtensionAPI) {
         pi.sendMessage({
           customType: "pi-fovea-sync",
           content: outcome.text,
-          display: true,
+          display: syncDisplays(cfg),
           details: outcome.details,
         }, { deliverAs: "steer", triggerTurn: true });
       } else if (!outcome.details.baseline && cfg.sync.ackClean && ctx.hasUI) {
@@ -549,7 +551,7 @@ export default function fovea(pi: ExtensionAPI) {
           `${failedCount ? ` · !${failedCount} files failed extraction` : ""}` +
           `${unreadableCount ? ` · !${unreadableCount} files unreadable` : ""}` +
           `${oversizedCount ? ` · !${oversizedCount} files over size cap` : ""} · ` +
-          `sync ${cfg.sync.enabled ? "continuous" : "off"} · grep ${cfg.tools.grepMode} · ` +
+          `sync ${cfg.sync.mode} · grep ${cfg.tools.grepMode} · ` +
           `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",
         );

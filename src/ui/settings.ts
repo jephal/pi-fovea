@@ -29,6 +29,7 @@ import {
 import {
   buildPartialFromId,
   loadFoveaConfig,
+  SYNC_MODES,
   saveFoveaConfig,
   type FoveaConfig,
   type FoveaConfigScope,
@@ -235,10 +236,10 @@ const buildItems = (
   theme: Theme,
   config: FoveaConfig,
 ): SettingItem[] => [
-  setting("sync.enabled", "Continuous sync", config.sync.enabled ? "true" : "false", {
+  setting("sync.mode", "Continuous sync", config.sync.mode, {
     description:
-      "Check semantic drift before agent start and after every turn; inject or steer before the model continues. FOVEA_TURN_SYNC=off overrides.",
-    values: BOOLEANS,
+      "enabled shows sync messages; hidden delivers them to the model without rendering them in the transcript; disabled turns sync off. FOVEA_TURN_SYNC=off overrides.",
+    values: SYNC_MODES,
   }),
   setting("sync.budget", "Sync budget", String(config.sync.budget), {
     description: "Max tokens for proactive repository steering sent to the model.",

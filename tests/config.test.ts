@@ -23,14 +23,32 @@ const setup = (stored: unknown) => {
   return { root, agentDir, cwd };
 };
 
-describe("fovea config grep integration", () => {
-  it("defaults every budget knob to 512", () => {
-    expect(DEFAULT_FOVEA_CONFIG.sync.budget).toBe(512);
+describe("fovea config", () => {
+  it("defaults sync to visible and every budget knob to 512", () => {
+    expect(DEFAULT_FOVEA_CONFIG.sync).toMatchObject({ mode: "enabled", budget: 512 });
     expect(DEFAULT_FOVEA_CONFIG.tools).toMatchObject({
       defaultBudget: 512,
       grepMode: "augment",
       grepAugmentBudget: 512,
     });
+  });
+
+  it("migrates legacy sync enabled booleans and prefers an explicit mode", () => {
+    for (const [enabled, mode] of [[true, "enabled"], [false, "disabled"]] as const) {
+      const { root, agentDir, cwd } = setup({ sync: { enabled } });
+      try {
+        expect(loadFoveaConfig({ cwd, agentDir, projectTrusted: false }).sync.mode).toBe(mode);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    const { root, agentDir, cwd } = setup({ sync: { enabled: false, mode: "hidden" } });
+    try {
+      expect(loadFoveaConfig({ cwd, agentDir, projectTrusted: false }).sync.mode).toBe("hidden");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("migrates legacy replaceGrep booleans to grep modes", () => {
@@ -54,12 +72,29 @@ describe("fovea config grep integration", () => {
   });
 
   it("rejects unknown modes and clamps the augment budget", () => {
-    const { root, agentDir, cwd } = setup({ tools: { grepMode: "overwrite", grepAugmentBudget: 99999 } });
+    const { root, agentDir, cwd } = setup({
+      sync: { mode: "invisible" },
+      tools: { grepMode: "overwrite", grepAugmentBudget: 99999 },
+    });
     try {
-      const tools = loadFoveaConfig({ cwd, agentDir, projectTrusted: false }).tools;
-      expect(tools.grepMode).toBe("augment");
-      expect(tools.grepAugmentBudget).toBe(8192);
+      const config = loadFoveaConfig({ cwd, agentDir, projectTrusted: false });
+      expect(config.sync.mode).toBe("enabled");
+      expect(config.tools.grepMode).toBe("augment");
+      expect(config.tools.grepAugmentBudget).toBe(8192);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lets FOVEA_TURN_SYNC=off override hidden mode", () => {
+    const { root, agentDir, cwd } = setup({ sync: { mode: "hidden" } });
+    const previous = process.env.FOVEA_TURN_SYNC;
+    process.env.FOVEA_TURN_SYNC = "off";
+    try {
+      expect(loadFoveaConfig({ cwd, agentDir, projectTrusted: false }).sync.mode).toBe("disabled");
+    } finally {
+      if (previous === undefined) delete process.env.FOVEA_TURN_SYNC;
+      else process.env.FOVEA_TURN_SYNC = previous;
       rmSync(root, { recursive: true, force: true });
     }
   });
