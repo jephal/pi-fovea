@@ -208,7 +208,10 @@ FOVEA_TURN_SYNC=off pi
 
 Global settings live in `~/.pi/agent/fovea.json`. A trusted repo-level override
 sits in `<repo>/.pi/fovea.json`. These are the same two scopes pi-fabric uses
-with `fabric.json`.
+with `fabric.json`. In `/fovea settings`, the configured external-editor key
+(`Ctrl+G` by default) switches both the displayed values and save destination
+between project overrides and global defaults. A project override can remain
+effective while its global default is being edited.
 
 | Key | Default | Meaning |
 | --- | :-----: | ------- |

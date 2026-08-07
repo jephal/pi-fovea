@@ -155,9 +155,12 @@ const readConfigFile = (file: string): Record<string, unknown> => {
   }
 };
 
-export const loadFoveaConfig = (scopes: FoveaConfigScopes): FoveaConfig => {
+const resolveFoveaConfig = (
+  scopes: FoveaConfigScopes,
+  includeProject: boolean,
+): FoveaConfig => {
   let config = applyPartial(DEFAULT_FOVEA_CONFIG, readConfigFile(globalFoveaConfigPath(scopes.agentDir)));
-  if (scopes.projectTrusted) {
+  if (includeProject) {
     config = applyPartial(config, readConfigFile(projectFoveaConfigPath(scopes.cwd)));
   }
   // Environment override mirrors pi-fabric's PI_* precedence over stored values.
@@ -165,6 +168,19 @@ export const loadFoveaConfig = (scopes: FoveaConfigScopes): FoveaConfig => {
   if (off === "off" || off === "0" || off === "false") config = { ...config, sync: { ...config.sync, mode: "disabled" } };
   return config;
 };
+
+export const loadFoveaConfigForScope = (
+  scopes: FoveaConfigScopes,
+  scope: FoveaConfigScope,
+): FoveaConfig => {
+  if (scope === "project" && !scopes.projectTrusted) {
+    throw new Error("Cannot load project Fovea configuration for an untrusted project");
+  }
+  return resolveFoveaConfig(scopes, scope === "project");
+};
+
+export const loadFoveaConfig = (scopes: FoveaConfigScopes): FoveaConfig =>
+  resolveFoveaConfig(scopes, scopes.projectTrusted);
 
 const mergeDeep = (existing: Record<string, unknown>, partial: Record<string, unknown>): Record<string, unknown> => {
   const out = { ...existing };

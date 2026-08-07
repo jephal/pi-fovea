@@ -45,6 +45,6 @@ The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON
 
 ## Settings
 
-Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`. `tools.grepMode` controls the grep integration: `"augment"` (default) keeps native grep semantics and appends a Fovea graph section to symbol-query results — including `pi.grep` calls inside fabric_exec — `"replace"` keeps the legacy bare-query takeover, `"off"` is native only.
+Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`; the external-editor key (`Ctrl+G` by default) switches the displayed and saved layer between global defaults and project overrides. `tools.grepMode` controls the grep integration: `"augment"` (default) keeps native grep semantics and appends a Fovea graph section to symbol-query results — including `pi.grep` calls inside fabric_exec — `"replace"` keeps the legacy bare-query takeover, `"off"` is native only.
 
 Budget overflow is not a dead end: any `… more results collapsed or outside budget` footer names a tmp artifact (`/tmp/pi-fovea-<op>-<hash>.txt`) holding the FULL list — read or grep that file for the remainder. Reach for `fovea_dwell` when you want a wider neighborhood, not just more of the same list.

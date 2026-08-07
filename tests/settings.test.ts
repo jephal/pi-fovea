@@ -99,6 +99,74 @@ describe("Fovea settings", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("keeps global edits visible when a project override remains effective", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-settings-shadowed-global-"));
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    const globalPath = path.join(agentDir, "fovea.json");
+    const projectPath = path.join(cwd, ".pi", "fovea.json");
+    const inheritedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const inheritedTurnSync = process.env.FOVEA_TURN_SYNC;
+    mkdirSync(path.dirname(globalPath), { recursive: true });
+    mkdirSync(path.dirname(projectPath), { recursive: true });
+    writeFileSync(globalPath, JSON.stringify({ tools: { grepMode: "augment" } }));
+    writeFileSync(projectPath, JSON.stringify({ tools: { grepMode: "off" } }));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    delete process.env.FOVEA_TURN_SYNC;
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    };
+    const requestRender = vi.fn();
+    let globalLines: string[] = [];
+    let projectLines: string[] = [];
+    const context = {
+      mode: "tui",
+      cwd,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: vi.fn(),
+        custom: async (factory: (...args: any[]) => any) => {
+          const component = factory({ requestRender }, theme, keybindings, () => {});
+          component.handleInput("\x07");
+          expect(component.render(120).join("\n")).toContain(
+            "project overrides may remain active here",
+          );
+
+          const globalList = component.settingsList as any;
+          globalList.selectedIndex = globalList.items.findIndex(
+            (item: { id: string }) => item.id === "tools.grepMode",
+          );
+          globalList.activateItem();
+          globalLines = component.render(120);
+
+          component.handleInput("\x07");
+          projectLines = component.render(120);
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    try {
+      const result = await openFoveaSettings(context);
+      expect(result).toEqual({ grepRegistrationChanged: false });
+      expect(globalLines.find((line) => line.includes("Grep integration"))).toContain("replace");
+      expect(projectLines.find((line) => line.includes("Grep integration"))).toContain("off");
+      expect(JSON.parse(readFileSync(globalPath, "utf8"))).toMatchObject({
+        tools: { grepMode: "replace" },
+      });
+      expect(JSON.parse(readFileSync(projectPath, "utf8"))).toMatchObject({
+        tools: { grepMode: "off" },
+      });
+      expect(requestRender).toHaveBeenCalledTimes(2);
+    } finally {
+      if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
+      if (inheritedTurnSync === undefined) delete process.env.FOVEA_TURN_SYNC;
+      else process.env.FOVEA_TURN_SYNC = inheritedTurnSync;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("FoveaSettingsComponent save scope", () => {
@@ -134,11 +202,11 @@ describe("FoveaSettingsComponent save scope", () => {
       onSaveScopeChange: (scope) => scopes.push(scope),
     });
 
-    expect(component.render(100).join("\n")).toContain("Save scope: Project (.pi/fovea.json)");
+    expect(component.render(100).join("\n")).toContain("Editing: Project overrides (.pi/fovea.json)");
 
     component.handleInput("\x07");
     expect(component.render(100).join("\n")).toContain(
-      "Save scope: Global (~/.pi/agent/fovea.json)",
+      "Editing: Global defaults (~/.pi/agent/fovea.json)",
     );
 
     const list = component.settingsList as any;
@@ -147,7 +215,7 @@ describe("FoveaSettingsComponent save scope", () => {
     component.handleInput("\x07");
 
     expect(list.submenuComponent).not.toBeNull();
-    expect(component.render(100).join("\n")).toContain("Save scope: Project (.pi/fovea.json)");
+    expect(component.render(100).join("\n")).toContain("Editing: Project overrides (.pi/fovea.json)");
     expect(scopes).toEqual(["global", "project"]);
   });
 
@@ -163,11 +231,9 @@ describe("FoveaSettingsComponent save scope", () => {
     component.handleInput("\x07");
 
     expect(component.render(100).join("\n")).toContain(
-      "Save scope: Global (~/.pi/agent/fovea.json)",
+      "Editing: Global defaults (~/.pi/agent/fovea.json)",
     );
-    expect(component.render(100).join("\n")).toContain(
-      "project scope unavailable for untrusted projects",
-    );
+    expect(component.render(100).join("\n")).toContain("project scope unavailable");
     expect(onSaveScopeChange).not.toHaveBeenCalled();
   });
 });

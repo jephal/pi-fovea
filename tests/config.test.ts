@@ -9,6 +9,8 @@ import {
   DEFAULT_FOVEA_CONFIG,
   globalFoveaConfigPath,
   loadFoveaConfig,
+  loadFoveaConfigForScope,
+  projectFoveaConfigPath,
 } from "../src/core/config.js";
 
 const setup = (stored: unknown) => {
@@ -31,6 +33,20 @@ describe("fovea config", () => {
       grepMode: "augment",
       grepAugmentBudget: 512,
     });
+  });
+
+  it("loads global defaults separately from trusted project overrides", () => {
+    const { root, agentDir, cwd } = setup({ tools: { grepMode: "augment" } });
+    const location = { cwd, agentDir, projectTrusted: true };
+    mkdirSync(path.dirname(projectFoveaConfigPath(cwd)), { recursive: true });
+    writeFileSync(projectFoveaConfigPath(cwd), JSON.stringify({ tools: { grepMode: "off" } }));
+    try {
+      expect(loadFoveaConfigForScope(location, "global").tools.grepMode).toBe("augment");
+      expect(loadFoveaConfigForScope(location, "project").tools.grepMode).toBe("off");
+      expect(loadFoveaConfig(location).tools.grepMode).toBe("off");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("migrates legacy sync enabled booleans and prefers an explicit mode", () => {

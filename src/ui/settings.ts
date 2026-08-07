@@ -3,7 +3,7 @@
 // SelectList submenus, dotted-id coercion) so both extensions feel like one
 // settings surface. Persistence: fovea.json under the pi agent dir, with a
 // project override beneath pi's configured project resource directory; the
-// external-editor keybinding toggles which scope the next change saves to.
+// external-editor keybinding switches the configuration layer being viewed and saved.
 
 import {
   CONFIG_DIR_NAME,
@@ -29,6 +29,7 @@ import {
 import {
   buildPartialFromId,
   loadFoveaConfig,
+  loadFoveaConfigForScope,
   SYNC_MODES,
   saveFoveaConfig,
   type FoveaConfig,
@@ -133,15 +134,20 @@ export interface FoveaSettingsComponentOptions {
   initialSaveScope?: FoveaConfigScope;
   projectScopeAvailable?: boolean;
   onSaveScopeChange?: (scope: FoveaConfigScope) => void;
+  itemsForSaveScope?: (scope: FoveaConfigScope) => SettingItem[];
 }
 
 export class FoveaSettingsComponent extends Container {
-  readonly settingsList: SettingsList;
+  settingsList: SettingsList;
   private readonly theme: Theme;
   private readonly keybindings: Pick<KeybindingsManager, "matches" | "getKeys"> | undefined;
   private readonly saveScopeText: Text;
+  private readonly settingsListContainer: Container;
   private readonly projectScopeAvailable: boolean;
+  private readonly onChange: (id: string, newValue: string) => void;
+  private readonly onCancel: () => void;
   private readonly onSaveScopeChange: (scope: FoveaConfigScope) => void;
+  private readonly itemsForSaveScope: ((scope: FoveaConfigScope) => SettingItem[]) | undefined;
   private saveScope: FoveaConfigScope;
 
   constructor(
@@ -158,16 +164,19 @@ export class FoveaSettingsComponent extends Container {
     this.saveScope = options.initialSaveScope === "global" || !this.projectScopeAvailable
       ? "global"
       : "project";
+    this.onChange = onChange;
+    this.onCancel = onCancel;
     this.onSaveScopeChange = options.onSaveScopeChange ?? (() => {});
+    this.itemsForSaveScope = options.itemsForSaveScope;
     this.addChild(new DynamicBorder((text) => theme.fg("border", text)));
     this.saveScopeText = new Text("", 1, 0);
     this.updateSaveScopeText();
     this.addChild(this.saveScopeText);
     this.addChild(new Spacer(1));
-    this.settingsList = new SettingsList(items, 10, settingsListTheme(theme), onChange, onCancel, {
-      enableSearch: true,
-    });
-    this.addChild(this.settingsList);
+    this.settingsListContainer = new Container();
+    this.settingsList = this.createSettingsList(items);
+    this.settingsListContainer.addChild(this.settingsList);
+    this.addChild(this.settingsListContainer);
     this.addChild(new DynamicBorder((text) => theme.fg("border", text)));
   }
 
@@ -177,6 +186,12 @@ export class FoveaSettingsComponent extends Container {
       this.saveScope = this.saveScope === "project" ? "global" : "project";
       this.updateSaveScopeText();
       this.onSaveScopeChange(this.saveScope);
+      const nextItems = this.itemsForSaveScope?.(this.saveScope);
+      if (nextItems) {
+        this.settingsListContainer.clear();
+        this.settingsList = this.createSettingsList(nextItems);
+        this.settingsListContainer.addChild(this.settingsList);
+      }
       return;
     }
     this.settingsList.handleInput(data);
@@ -187,17 +202,32 @@ export class FoveaSettingsComponent extends Container {
     this.updateSaveScopeText();
   }
 
+  private createSettingsList(items: SettingItem[]): SettingsList {
+    return new SettingsList(
+      items,
+      10,
+      settingsListTheme(this.theme),
+      this.onChange,
+      this.onCancel,
+      { enableSearch: true },
+    );
+  }
+
   private updateSaveScopeText(): void {
     const destination = this.saveScope === "project"
-      ? `Project (${CONFIG_DIR_NAME}/fovea.json)`
-      : `Global (~/${CONFIG_DIR_NAME}/agent/fovea.json)`;
+      ? `Project overrides (${CONFIG_DIR_NAME}/fovea.json)`
+      : `Global defaults (~/${CONFIG_DIR_NAME}/agent/fovea.json)`;
     const keys = this.keybindings?.getKeys("app.editor.external") ?? [];
     const shortcut = keys.map(formatKey).join("/");
-    const hint = this.projectScopeAvailable
-      ? shortcut ? ` · ${shortcut} toggles save scope` : " · scope toggle key unavailable"
-      : " · project scope unavailable for untrusted projects";
+    const hint = !this.projectScopeAvailable
+      ? " · project scope unavailable for untrusted projects"
+      : !shortcut
+        ? " · scope switch key unavailable"
+        : this.saveScope === "global"
+          ? ` · ${shortcut} switches scope · project overrides may remain active here`
+          : ` · ${shortcut} switches scope`;
     this.saveScopeText.setText(
-      this.theme.fg("muted", "Save scope: ") +
+      this.theme.fg("muted", "Editing: ") +
       this.theme.fg("accent", destination) +
       this.theme.fg("dim", hint),
     );
@@ -299,7 +329,7 @@ export const openFoveaSettings = async (
     projectTrusted: context.isProjectTrusted(),
   };
   let saveScope: FoveaConfigScope = scopes.projectTrusted ? "project" : "global";
-  let config = loadFoveaConfig(scopes);
+  let config = loadFoveaConfigForScope(scopes, saveScope);
   const initialGrepRegistration = config.tools.grepMode === "replace";
   let dirty = false;
 
@@ -313,16 +343,19 @@ export const openFoveaSettings = async (
       );
       return;
     }
-    config = applyPartialLocal(config, id, value);
+    config = loadFoveaConfigForScope(scopes, saveScope);
     dirty = true;
     deps.onConfigApplied?.();
   };
 
   await context.ui.custom<void>((tui, theme, keybindings, done) => {
-    const items = buildItems(theme, config);
+    const itemsForScope = (scope: FoveaConfigScope): SettingItem[] => {
+      config = loadFoveaConfigForScope(scopes, scope);
+      return buildItems(theme, config);
+    };
     return new FoveaSettingsComponent(
       theme,
-      items,
+      itemsForScope(saveScope),
       (id, newValue) => apply(id, coerceValue(id, newValue, config)),
       () => done(),
       {
@@ -333,27 +366,16 @@ export const openFoveaSettings = async (
           saveScope = scope;
           tui.requestRender();
         },
+        itemsForSaveScope: itemsForScope,
       },
     );
   });
 
   if (dirty) context.ui.notify("Fovea settings saved.", "info");
-  return { grepRegistrationChanged: (config.tools.grepMode === "replace") !== initialGrepRegistration };
-};
-
-// Local in-place merge so subsequent edits in the same overlay start from the
-// already-saved value (config is reloaded from disk on open).
-const applyPartialLocal = (config: FoveaConfig, id: string, value: unknown): FoveaConfig => {
-  const next: FoveaConfig = {
-    sync: { ...config.sync },
-    tools: { ...config.tools },
+  const effectiveConfig = loadFoveaConfig(scopes);
+  return {
+    grepRegistrationChanged:
+      (effectiveConfig.tools.grepMode === "replace") !== initialGrepRegistration,
   };
-  const segments = id.split(".");
-  let target: Record<string, unknown> = next as unknown as Record<string, unknown>;
-  for (let i = 0; i < segments.length - 1; i++) {
-    target = target[segments[i]!] as Record<string, unknown>;
-  }
-  target[segments[segments.length - 1]!] = value;
-  return next;
 };
 
