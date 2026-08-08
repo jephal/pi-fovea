@@ -99,7 +99,7 @@ Joint git history is the *software development over time* signal — the affinit
 
   $$w = w_0(\text{count}, \text{jaccard}) \cdot 2^{-\text{ageDays} / \tau}, \qquad \tau = 30 \text{ days}$$
 
-  where $w_0$ is the old Jaccard-tilted base conductance and age is wall-clock since the pair last co-committed ($\text{age} = \max(0, \text{now} - \text{lastTs})$).
+  where $w_0$ is the old Jaccard-tilted base conductance and age is wall-clock since the pair last co-committed, $(\text{age} = \max(0, \text{now} - \text{lastTs}))$.
 - Linearity is what makes this heat: seeding partner files at weight $w$ and diffusing once is exactly $e^{-tL}(s_{\text{change}} + w \, s_{\text{partner}})$. Fresh joint work is hot; a pair that last moved months ago contributes almost nothing; a session that goes idle cools the affinity like every other heat source. Even a cached hit cools, because recency is applied at **use** time, not baked into the cache.
 - Partner files surface with the `co-change history` reason, so turn-sync still weighs them at $c_f = 0.5$ — unchanged — and the session heat memory $\mu$ now governs how often that channel can refire.
 
