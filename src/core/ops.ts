@@ -19,7 +19,7 @@ import {
   type FactStore,
   type FileFacts,
 } from "./build.js";
-import { gitProbe, prFiles, uncommittedFiles } from "./git.js";
+import { gitProbe, gitReflogAction, prFiles, uncommittedFiles } from "./git.js";
 import { ROOT_CACHE_LIMIT, envInt, yieldToLoop } from "./asyncutil.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, chebyshevVectors, chooseOrder, heatField, type Csr } from "./heat.js";
@@ -62,6 +62,12 @@ export interface RepoState {
    * porcelain-clean with unmoved HEAD would otherwise keep serving its dirty
    * facts until the next edit. */
   dirty: Set<string>;
+  /** Set when this generation materialized from a `git checkout` (HEAD moved
+   * with reflog action "checkout:…"): sync re-baselines silently instead of
+   * cascading over the branch diff. Lives exactly one generation — the next
+   * fact-moving refresh builds a fresh state without it, so the quiet path
+   * cannot hide authored drift. */
+  checkout?: boolean;
   /** Past joint-edit affinity (raw conductance + last joint commit). History
    * is NOT structure: impact re-seeds these partners at recency-decayed
    * strength whenever a change lands, so old co-work cools like any heat. */
@@ -194,6 +200,12 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
   let files = state.files;
   const changed: string[] = [];
   const deleted: string[] = [];
+  // A checkout re-materializes the worktree from another ref; flag the
+  // rebuilt generation so sync re-baselines quietly. Only a HEAD move whose
+  // latest reflog action is "checkout:…" qualifies — pulls/rebases merge
+  // foreign work and keep the loud drift path, and reflog-less repos stay
+  // conservative (undefined -> false).
+  let checkout = false;
   const hinted = [...new Set([...filterSupported(hints, routeRes), ...hints.filter((h) => store.facts.has(h))])];
   changed.push(...hinted);
 
@@ -202,6 +214,9 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
     if (probe) {
       const headMoved = probe.head !== state.head;
       state.head = probe.head;
+      if (headMoved) {
+        checkout = (await gitReflogAction(state.root))?.startsWith("checkout:") ?? false;
+      }
       // Untracked directories appear collapsed ("dir/") in porcelain; adds
       // inside them only surface through a relist. Relist moments are rare.
       const needsList = probe.relist || probe.changes.some((c) => c.path.endsWith("/"));
@@ -274,6 +289,7 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
     return state;
   }
   const fresh = await assembleState(state.root, files, store, report, state.gitKind, state.head, state.dirty);
+  if (checkout) fresh.checkout = true;
   states.set(state.root, fresh);
   return fresh;
 };

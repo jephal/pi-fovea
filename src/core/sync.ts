@@ -163,6 +163,9 @@ export const warmSync = async (root: string, params: WarmParams, state?: RepoSta
     const cur = state ?? (await ensureState(root, { hints: params.files ?? [], force: false }));
     const prev = getBaseline(root);
     if (!prev || prev.version === cur.version) return;
+    // A checkout generation re-baselines silently in sync: no cascade to
+    // prepare, and precomputing one over the branch diff would be waste.
+    if (cur.checkout) return;
     const files = semanticDrift(cur, prev);
     if (!files.length) return;
     const key = filesKey(files);
@@ -291,6 +294,19 @@ export const sync = async (
     return {
       structural: true, red: false, tokens: 0,
       details: { version: state.version, baseline: "established", anchors: state.graph.anchors.length },
+    };
+  }
+
+  // Branch-switch re-baseline. A checkout moves HEAD and re-materializes the
+  // worktree without authored edits; cascading over the branch diff would
+  // fire a loud, useless steer on every switch, so the baseline just follows
+  // the ref (details.baseline keeps the hooks' ack-clean notify silent too).
+  // Heat memory belongs to the old ref's field and does not cross over.
+  if (state.checkout) {
+    setBaseline(root, await snapshot(state));
+    return {
+      structural: true, red: false, tokens: 0,
+      details: { version: state.version, checkout: true, baseline: "established", anchors: state.graph.anchors.length },
     };
   }
 

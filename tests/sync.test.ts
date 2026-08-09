@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
-import { ensureState } from "../src/core/ops.js";
+import { ensureState, getState } from "../src/core/ops.js";
 import type { RepoState } from "../src/core/ops.js";
 import { resetSyncBaselines, sync, warmSync } from "../src/core/sync.js";
 import { resetSessions } from "../src/core/session.js";
@@ -79,6 +79,49 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     execSync("git checkout -- server/main.go", { cwd: root });
   });
 
+
+  it("re-baselines quietly on a branch switch, then measures drift against the new ref", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    try {
+      // altrec carries one semantic commit ahead of main in server/users.go.
+      execSync("git checkout -qb altrec", { cwd: root });
+      const users = join(root, "server/users.go");
+      writeFileSync(users, readFileSync(users, "utf8").replace("return LoadUser(id)", "return SaveUser(id)"));
+      execSync('git add -A && git -c user.name=t -c user.email=t@t commit -qm alt', { cwd: root });
+      execSync("git checkout -q main", { cwd: root });
+
+      const baseline = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+      expect(baseline.details.baseline).toBe("established");
+
+      // The branch switch re-materializes the worktree: quiet re-baseline,
+      // no branch-diff cascade, no steer.
+      execSync("git checkout -q altrec", { cwd: root });
+      const switched = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+      expect(switched.structural).toBe(true);
+      expect(switched.red).toBe(false);
+      expect(switched.text).toBeUndefined();
+      expect(switched.details.checkout).toBe(true);
+      expect(switched.details.baseline).toBe("established");
+      expect(switched.details.semanticChangedFiles).toBeUndefined();
+
+      const again = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+      expect(again.structural).toBe(false);
+
+      // Drift after the switch measures against the new ref, not against
+      // main, and rebuilds a flagless generation: normal steering resumes.
+      writeFileSync(users, readFileSync(users, "utf8").replace("return SaveUser(id)", "return LoadUser(id)"));
+      const drift = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
+      expect(drift.red).toBe(true);
+      expect(drift.details.semanticChangedFiles).toEqual(["server/users.go"]);
+      expect(getState(root)?.checkout).toBeUndefined();
+    } finally {
+      execSync("git checkout -qf main", { cwd: root }); // -f: drop the drift edit
+      execSync("git branch -qD altrec", { cwd: root });
+      resetSyncBaselines();
+      await sync(root, { files: [], budget: 512, steerThreshold: 0.01 }); // leave state + baseline on main
+    }
+  });
 
   it("steers on the first semantic cascade with causal context", async () => {
     resetSyncBaselines();

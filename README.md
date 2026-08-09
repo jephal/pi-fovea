@@ -185,8 +185,10 @@ update names the changed files, the route deltas, and the newly relevant files.
 It lists the causal channels behind each link: calls, imports, shared literals,
 tests, or co-change history. By default it also embeds the refreshed focus
 context of the top drift target (push). With `sync.pushFocus` off, the update
-ends with a suggested focus probe for the next call (pull). Clean turns stay
-silent. Enable `sync.ackClean` if you want an ack for those. Set `sync.mode` to
+ends with a suggested focus probe for the next call (pull). Switching
+branches re-baselines silently instead of steering: a `git checkout`
+re-materializes the worktree, but the branch diff is not authored drift —
+commits, pulls, and rebases still report. Clean turns stay silent. Enable `sync.ackClean` if you want an ack for those. Set `sync.mode` to
 `"hidden"` to keep red sync context working behind the scenes without rendering it
 in the transcript, or to `"disabled"` to turn continuous sync off.
 

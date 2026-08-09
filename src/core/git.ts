@@ -41,6 +41,18 @@ export const gitHead = async (root: string): Promise<string | undefined> => {
   return head ? head : undefined;
 };
 
+/**
+ * Subject of the most recent HEAD reflog entry, e.g. "checkout: moving from
+ * main to feature". Tells branch switches (re-baseline quietly) apart from
+ * commits/pulls/rebases (foreign drift worth reporting). Undefined when the
+ * reflog is unavailable or disabled — callers fall back to the loud path.
+ */
+export const gitReflogAction = async (root: string): Promise<string | undefined> => {
+  const out = await gitOut(root, ["reflog", "-1", "--format=%gs"]);
+  const line = out?.trim();
+  return line ? line : undefined;
+};
+
 export interface WorktreeChange {
   /** X+Y status columns, e.g. " M", "??", "D ". */
   code: string;
