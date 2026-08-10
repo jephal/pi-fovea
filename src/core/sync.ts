@@ -44,7 +44,27 @@ interface SyncBaseline {
   pushed?: Set<string>;
 }
 
-const baselines = new Map<string, SyncBaseline>();
+// Hot-reload survival: `/fovea reload` re-evaluates this module in the same
+// process, so a plain module-level Map would drop every charged ledger and
+// the next drift would re-fire as a first disclosure. Park the baselines on
+// a registered global symbol; the store outlives the module instance. The
+// version stamp keeps shape changes safe: a mismatched slot degrades to a
+// cold store (today's reload behavior) instead of corrupting verdict math —
+// bump BASELINE_STATE_VERSION when SyncBaseline changes incompatibly.
+const BASELINE_STATE_VERSION = 1;
+const BASELINES_SLOT = Symbol.for("pi-fovea:sync-baselines");
+type BaselinesGlobal = typeof globalThis & {
+  [BASELINES_SLOT]?: { v: number; map: Map<string, SyncBaseline> };
+};
+export const syncBaselineStore = (): Map<string, SyncBaseline> => {
+  const g = globalThis as BaselinesGlobal;
+  const held = g[BASELINES_SLOT];
+  if (held && held.v === BASELINE_STATE_VERSION) return held.map;
+  const map = new Map<string, SyncBaseline>();
+  g[BASELINES_SLOT] = { v: BASELINE_STATE_VERSION, map };
+  return map;
+};
+const baselines = syncBaselineStore();
 const getBaseline = (root: string): SyncBaseline | undefined => {
   const hit = baselines.get(root);
   if (hit) {

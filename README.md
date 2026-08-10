@@ -209,7 +209,7 @@ Runtime controls:
 
 - `/fovea status`: loaded package and ast-grep versions, indexed coverage, anchor scopes, sync and grep modes
 - `/fovea reset`: clear focus disclosure and depth, then establish a fresh sync baseline
-- `/fovea reload`: hot-reload extensions and activate newly installed source
+- `/fovea reload`: hot-reload extensions and activate newly installed source; sync baselines (the verdict ledger) ride through on a global slot, so a reload no longer replays charged cascades as first disclosures
 - `/fovea settings`: configure sync, budgets, and hybrid grep
 
 Choose enabled, hidden, or disabled per repo or globally through settings. The

@@ -5,11 +5,11 @@ import { execSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { ensureState, getState } from "../src/core/ops.js";
 import type { RepoState } from "../src/core/ops.js";
-import { decayedMass, MEMORY_HALF_LIFE_HOURS, resetSyncBaselines, sync, warmSync } from "../src/core/sync.js";
+import { decayedMass, MEMORY_HALF_LIFE_HOURS, resetSyncBaselines, sync, syncBaselineStore, warmSync } from "../src/core/sync.js";
 import { resetSessions } from "../src/core/session.js";
 
 const SRC = new URL("./fixtures/mini", import.meta.url).pathname;
@@ -567,5 +567,36 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
     await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
+});
+
+describe("hot-reload handoff", () => {
+  it("baselines survive a module reload via the global store", async () => {
+    // Same-process reload (/fovea reload) re-evaluates the module; the
+    // verdict ledger must ride through on the global slot or the next drift
+    // re-fires as a first disclosure.
+    const viaStore = syncBaselineStore();
+    const probeRoot = "\u2206reload-probe";
+    const fake = { probe: true };
+    viaStore.set(probeRoot, fake as never);
+    vi.resetModules();
+    const fresh = await import("../src/core/sync.js");
+    expect(fresh.syncBaselineStore()).toBe(viaStore);
+    expect(fresh.syncBaselineStore().get(probeRoot)).toBe(fake);
+    viaStore.delete(probeRoot);
+  });
+
+  it("a mismatched shape version degrades to a cold store", () => {
+    const slot = Symbol.for("pi-fovea:sync-baselines");
+    const holder = globalThis as Record<symbol, unknown>;
+    const backup = holder[slot];
+    holder[slot] = { v: -1, map: new Map([["stale-root", { probe: true }]]) };
+    try {
+      const cold = syncBaselineStore();
+      expect(cold.has("stale-root")).toBe(false);
+      expect(syncBaselineStore()).toBe(cold);
+    } finally {
+      holder[slot] = backup ?? { v: 1, map: syncBaselineStore() };
+    }
   });
 });
