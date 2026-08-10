@@ -101,7 +101,7 @@ Joint git history is the *software development over time* signal — the affinit
 
   where $w_0$ is the old Jaccard-tilted base conductance and age is wall-clock since the pair last co-committed, $(\text{age} = \max(0, \text{now} - \text{lastTs}))$.
 - Linearity is what makes this heat: seeding partner files at weight $w$ and diffusing once is exactly $e^{-tL}(s_{\text{change}} + w \, s_{\text{partner}})$. Fresh joint work is hot; a pair that last moved months ago contributes almost nothing; a session that goes idle cools the affinity like every other heat source. Even a cached hit cools, because recency is applied at **use** time, not baked into the cache.
-- Partner files surface with the `co-change history` reason, so turn-sync still weighs them at $c_f = 0.5$ — unchanged — and the session heat memory $\mu$ now governs how often that channel can refire.
+- Partner files surface with the `co-change history` reason, so turn-sync still weighs them at $c_v = 0.5$ — unchanged — and the per-node sync ledger $\mu$ governs how often that channel can refire (see Turn sync below).
 
 `FOVEA_COCHANGE_HALF_LIFE_DAYS` (default 30) sets the wall-clock half-life.
 
@@ -145,29 +145,32 @@ versus $1/\sqrt{S}$ for declared routes, where $S$ is the number of sites bound 
 
 ## Turn sync: surfacing only surprise
 
-The same impact cascade that answers `fovea_impact` also drives turn sync, which runs before agent start and after every assistant turn and decides whether repository drift justifies spending model tokens (`src/core/sync.ts`). The gate used to count newly warmed files; it now measures how much of a cascade is *news*.
+The same impact cascade that answers `fovea_impact` also drives turn sync, which runs before agent start and after every assistant turn and decides whether repository drift justifies spending model tokens (`src/core/sync.ts`). The verdict is per graph node: every node $v$ warmed above $10^{-6}$ carries its field mass $m_v$ and the first-encounter channel reasons of its warm path (1-hop edge kinds, BFS paths for deeper nodes, a `co-change history` stamp for history-seeded clusters). Warmth aggregation by file only exists for display; the memory and surprise arithmetic run at node granularity.
 
-Each sync keeps a per-file heat memory $\mu$, the session's decayed union of every warmth payload already disclosed. For a warmed file $f$ with cascade mass $m_f$ (the per-file sums the impact renderer aggregates), the evidence channel enters as a prior $c_f$ on the strongest reason the graph recorded:
+Each sync keeps a ledger $\mu$ of charged node masses, keyed by stable node identity `kind|name@file` — hunk-level, so line moves are free and renames simply orphan entries. The evidence channel enters as a prior $c_v$, the strongest reason on that node's path:
 
-| Channel | $c_f$ |
+| Channel | $c_v$ |
 |---|:--:|
 | call / import / test / inheritance / shared route | $1$ |
 | co-change history | $0.5$ |
 | multi-hop graph path | $0.5$ |
 | shared literal | $0.35$ |
 
-Surprise is the channel-adjusted mass above what the session was already told:
+Surprise is the channel-adjusted mass above the ledger, summed over nodes and grouped back to files for the message:
 
 $$
-s_f = \max\!(0,\; c_f \, m_f - \mu_f), \qquad S = \textstyle\sum_f s_f
+s_v = \max\!(0,\; c_v \, m_v - \mu_v), \qquad S = \textstyle\sum_v s_v
 $$
 
-A sync goes red on structural events (route added or removed, production file deleted, all subject to the degraded-extraction distrust) or when warmth alone crosses the steer threshold, $S \ge \theta$ with $\theta = 0.15$ by default (`sync.steerThreshold`). Masses are dimensionless: seeding is one heat unit per changed file node, so $S$ reads as "units of evidence-weighted heat landing outside the change that were not already disclosed." Calibration on `tests/fixtures/mini`: a central semantic edit totals $\approx 0.077$ adjusted, one strong call/import neighbor on a 350-node repo $\approx 0.19$, a pair of weak literal/co-change warm-ups $\approx 0.01\!-\!0.03$.
+A sync goes red on structural events (route added or removed **with carrier-file drift evidence**, production file deleted, all subject to the degraded-extraction distrust) or when warmth alone crosses the steer threshold, $S \ge \theta$ with $\theta = 0.15$ by default (`sync.steerThreshold`). Masses are dimensionless: seeding is one heat unit per changed file node, so $S$ reads as "units of evidence-weighted heat landing outside the change that were not already disclosed." Calibration on `tests/fixtures/mini`: a central semantic edit totals $\approx 0.115$ node-adjusted, one strong call/import neighbor on a 350-node repo $\approx 0.19$, a pair of weak literal/co-change warm-ups $\approx 0.01\!-\!0.03$.
 
-Three dynamics fall out of $\mu$:
+Four dynamics fall out of $\mu$:
 
-- **Absorb on disclosure.** Any red sync charges $\mu_f \leftarrow \max(\mu_f, c_f m_f)$ for every warmed file, displayed or not. The disclosed cascade cannot immediately re-fire.
-- **Decay.** $\mu \leftarrow 0.7\,\mu$ per structural sync. Repeat warmth re-fires only once genuine re-heating exceeds what the session was told: novelty is a margin, not a seen-set bit. Editing $A$, then its neighbor $B$, then $A$ again no longer ping-pongs a steer per turn.
+- **Absorb on disclosure.** Any red sync charges $\mu_v \leftarrow \max(\mu_v, c_v m_v)$ for every warmed node, displayed or not. The disclosed cascade is then *structurally unable to re-fire*: re-editing the same spot re-seeds the same node keys, all charged, and in-session decay is negligible — flip-flopped work stays silent on every revisit indefinitely. The ping-pong dies by construct, not by rate limiting.
+- **Wall-clock decay.** Entries age as $\mu_v \leftarrow \mu_v \cdot 2^{-\Delta t / \tau_h}$ with $\tau_h = 48\,$h (`FOVEA_MEMORY_HALF_LIFE_HOURS`), not per sync count. A structurally re-heated neighborhood can earn a fresh verdict on a later day; renamed-symbol orphans cool out on the same schedule. The ledger is bounded (4096 nodes, weakest-mass eviction) and the impact payload tail-capped (2000 nodes).
+- **No blanket.** Charged keys suppress only themselves: a novel hunk in a charged cluster (a fresh literal, a stronger coupling) keeps its own surprise and can cross $\theta$ even while the rest stays damped. Quiet verdicts charge nothing, so a trickle of sub-threshold warmth cannot habituate the gate.
 - **Hysteresis.** A fire disarms the warmth latch; it re-arms only once $S \le \theta/2$. Cascades hovering near the threshold cannot oscillate.
 
-The rendered list is sorted by $s_f$ descending, test scopes last within a tie, so the top of the message is always the least-expected warmth. Route and deletion signals bypass the warmth gate entirely. A clean structural turn costs one fingerprint diff; a quiet turn costs the same, because the gate only evaluates when the version fingerprint moved.
+Anchor deltas obey carrier evidence: a route add/remove escalates and renders only when its carrier file drifted. Content-identical carriers keep content-identical anchors by construction, so carrier-less deltas are extraction artifacts (parallel-load sweeps, extractor-version re-derivation) and stay quiet — annotated as `suspectAnchors` in details — while the baseline adopts the new set immediately and the artifact self-heals. Deletions and route changes with real carrier drift bypass the warmth gate entirely.
+
+The rendered list is sorted by surprise descending, test scopes last within a tie, so the top of the message is always the least-expected warmth. A clean structural turn costs one fingerprint diff; a quiet turn costs the same, because the gate only evaluates when the version fingerprint moved. Switching branches re-baselines silently: a `git checkout` re-materializes the worktree without authored drift, so the baseline follows the ref and the ledger does not cross over.
