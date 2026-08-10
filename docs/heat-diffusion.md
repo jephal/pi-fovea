@@ -14,7 +14,7 @@ The repo compiles into one typed undirected graph $G = (V, E)$. Nodes are files,
 | `invokes` caller → callee | see below |
 | `imports` file → file | $0.3$ |
 | `anchors` anchor hub → handler | $c / \sqrt{S}$ |
-| `anchors` hub → member file | $0.35 / \sqrt{|F|}$ |
+| `anchors` hub → member file | $0.35 / \sqrt{\|F\|}$ |
 | `join` literal bridge | see below |
 
 Call edges are specificity-tiered, so a call to a rare symbol beats one to a common symbol. Builtins and log or test entry points are warded off. A `console.log` call connects nothing. The anchor hub weight decays with the number of sites $S$ bound to it, so a multi-site route never becomes a gravity well. File-member weights decay with $|F|$, the file count of the feature hood.
