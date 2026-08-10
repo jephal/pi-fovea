@@ -10,9 +10,9 @@ import type { LiteralSite } from "./types.js";
 
 export type LitClass = "path" | "env" | "word";
 
-export interface LitOccurrence { node: number; line: number; file: string; }
+interface LitOccurrence { node: number; line: number; file: string; }
 
-export interface JoinEdge { a: number; b: number; w: number; }
+interface JoinEdge { a: number; b: number; w: number; }
 
 const PLACEHOLDER_SEGMENT = /^(?::[^/]+|\{[^}/]*\}|\$\{[^}/]*\}|\$[A-Za-z_]\w*|<[^/>]+>|\*+)$/; // $x = Kotlin template shorthand
 const WORD_RE = /^[A-Za-z][\w$.\-]{6,63}$/;
@@ -107,10 +107,4 @@ export const buildJoinIndex = (
     edges.push({ a, b, w });
   }
   return { byKey, edges };
-};
-
-export const lookupJoin = (index: JoinIndex, raw: string): LitOccurrence[] => {
-  const cls = classifyLiteral(raw);
-  if (!cls) return [];
-  return index.byKey.get(normalizeLiteral(raw, cls))?.occ ?? [];
 };

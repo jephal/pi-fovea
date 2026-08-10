@@ -19,7 +19,7 @@
 
 import { classifyLiteral } from "./join.js";
 
-export type Shape = "recv" | "bare" | "dec";
+type Shape = "recv" | "bare" | "dec";
 
 // Compacted per-file histogram: sigKey -> [totalSites, pathSites]
 export type FileSigs = Record<string, [number, number]>;
@@ -109,9 +109,9 @@ export const aggregateFiles = (perFile: Record<string, FileSigs | undefined>): S
 /** Jeffreys-ish posterior: p̂ = (pathN + .5) / (n + 1). */
 export const posterior = (pathN: number, n: number): number => (pathN + 0.5) / (n + 1);
 
-export const MIN_SITES = 4;
-export const MIN_FILES = 2;
-export const MIN_POSTERIOR = 0.55;
+const MIN_SITES = 4;
+const MIN_FILES = 2;
+const MIN_POSTERIOR = 0.55;
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

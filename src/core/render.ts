@@ -9,10 +9,10 @@ import type { Edge, EdgeKind, Graph, NodeRec } from "./types.js";
 
 export const tokenEstimate = (text: string): number => Math.ceil(text.length / 4);
 
-export const HOT_TIER = 0.3;
-export const WARM_TIER = 0.02;
-export const HEAT_EPS = 1e-9;
-export const MAX_UNRELATED_WARM_PER_FILE = 4;
+const HOT_TIER = 0.3;
+const WARM_TIER = 0.02;
+const HEAT_EPS = 1e-9;
+const MAX_UNRELATED_WARM_PER_FILE = 4;
 
 export const formatNodeLocation = (node: NodeRec): string => {
   if (node.kind === "file" || node.line <= 0) return node.file;

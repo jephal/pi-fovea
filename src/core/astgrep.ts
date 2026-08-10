@@ -35,7 +35,7 @@ export const isBinaryExt = (file: string): boolean =>
   BINARY_EXTS.has(file.split(".").pop()?.toLowerCase() ?? "");
 
 // Non-code files: literals are regex-extracted so config/spec files can join.
-export const CONFIG_EXTS = new Set(["yaml", "yml", "json", "toml", "env", "tf", "hcl", "md"]);
+const CONFIG_EXTS = new Set(["yaml", "yml", "json", "toml", "env", "tf", "hcl", "md"]);
 
 export interface AgMatch {
   file: string;                    // as passed to ast-grep (repo-relative)
@@ -173,7 +173,7 @@ export const groupByLang = (files: string[]): Map<string, string[]> => {
 
 // `ast-grep outline` is the uniform symbol source across languages.
 // Expanded JSON is primary; the legacy text view remains as a compatibility fallback.
-export interface OutlineRange {
+interface OutlineRange {
   start: { line: number; column: number };
   end?: { line: number; column: number };
 }
@@ -268,7 +268,7 @@ interface RawMatch {
 }
 
 // `ast-grep run --pattern` with JSON output for a set of files of one language.
-export const patternRun = async (
+const patternRun = async (
   pattern: string,
   lang: string,
   files: string[],

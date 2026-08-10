@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYNC_MODES = ["enabled", "hidden", "disabled"] as const;
-export type SyncMode = (typeof SYNC_MODES)[number];
+type SyncMode = (typeof SYNC_MODES)[number];
 
 interface FoveaSyncConfig {
   /** Continuous sync delivery: visible, model-only, or fully disabled. */
@@ -27,8 +27,8 @@ interface FoveaSyncConfig {
   pushFocus: boolean;
 }
 
-export const GREP_MODES = ["off", "replace", "augment"] as const;
-export type GrepMode = (typeof GREP_MODES)[number];
+const GREP_MODES = ["off", "replace", "augment"] as const;
+type GrepMode = (typeof GREP_MODES)[number];
 
 interface FoveaToolsConfig {
   /** Budget applied when a fovea_* tool call omits maxTokens. */

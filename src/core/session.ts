@@ -6,7 +6,7 @@
 import { ROOT_CACHE_LIMIT } from "./asyncutil.js";
 import type { NodeKind } from "./types.js";
 
-export interface FocusScope {
+interface FocusScope {
   path?: string;
   language?: string;
   kind?: NodeKind;

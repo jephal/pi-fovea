@@ -53,7 +53,7 @@ export const gitReflogAction = async (root: string): Promise<string | undefined>
   return line ? line : undefined;
 };
 
-export interface WorktreeChange {
+interface WorktreeChange {
   /** X+Y status columns, e.g. " M", "??", "D ". */
   code: string;
   /** Path as reported by git, relative to root. */

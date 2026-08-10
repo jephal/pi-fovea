@@ -92,7 +92,7 @@ const cleanSig = (line: string): string => {
   return s;
 };
 
-export const deriveName = (sig: string, lang: string, parentHint?: string): NamedSig => {
+const deriveName = (sig: string, lang: string, parentHint?: string): NamedSig => {
   for (const r of SIG_RULES[lang] ?? []) {
     const m = r.re.exec(sig);
     if (!m) continue;
@@ -334,7 +334,7 @@ const CALL_PATTERNS = ["$O.$M($$$A)", "$F($$$A)"];
 // Language builtins and log/test-framework entry points resolve to mega-hubs
 // on real repos (python `str(`, jest `it(`, fmt.Sprintf, rust unwrap).
 // They carry no cross-file meaning; exclude them at extraction.
-export const CALL_WARDS = new Set([
+const CALL_WARDS = new Set([
   // generic member-call noise and loggers
   "log", "info", "warn", "debug", "trace", "close", "flush", "tostring", "valueof",
   "tolowercase", "touppercase", "printf", "sprintf", "fprintf", "errorf",
@@ -403,7 +403,7 @@ const CONFIG_BARE_RE = /(^|[:=\s])(\/[\w.~+\-{}*]+(?:\/[\w.~+\-{}*]+)+|[A-Z][A-Z
 
 const SOURCE_SCAN_CONCURRENCY = 8;
 
-export const extractConfigLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
+const extractConfigLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
   const configs = files.filter(isConfigFile);
   const perFile = await mapLimit(configs, SOURCE_SCAN_CONCURRENCY, async (f) => {
     const local: LiteralSite[] = [];

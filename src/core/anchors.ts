@@ -331,7 +331,7 @@ export interface FileRouteRule {
   kind?: string; // default "route"
 }
 
-export const DEFAULT_FILE_ROUTES: FileRouteRule[] = [
+const DEFAULT_FILE_ROUTES: FileRouteRule[] = [
   { id: "next-app-route", re: "(?:^|/)app/(.+)/route\\.(?:ts|tsx|js|jsx|mjs)$", verbs: "exports", kind: "route" },
   { id: "next-app-page", re: "(?:^|/)app/(?:(.+)/)?page\\.(?:tsx|jsx|mdx)$", verbs: "suffix", kind: "page" },
   { id: "next-pages-api", re: "(?:^|/)pages/api/(.+)\\.(?:ts|tsx|js|jsx)$", verbs: "suffix", pathPrefix: "/api", kind: "route" },
@@ -434,9 +434,6 @@ const dedupeAnchors = (out: AnchorDraft[]): AnchorDraft[] => {
     return true;
   });
 };
-
-// Re-export so callers can classify an anchor path like any literal.
-export const anchorClassify = classifyLiteral;
 
 // Hash of the built-in packs: code changes to the default pack invalidate
 // cached anchor facts even when a repo ships no rules.json of its own.

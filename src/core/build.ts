@@ -117,7 +117,7 @@ export const listFiles = async (root: string, routeRes?: RegExp[]): Promise<stri
   return files.slice(0, MAX_FILES);
 };
 
-export interface FileMeta { size: number; mtime: number }
+interface FileMeta { size: number; mtime: number }
 
 const statFile = async (root: string, rel: string): Promise<FileMeta | undefined> => {
   try {
@@ -129,7 +129,7 @@ const statFile = async (root: string, rel: string): Promise<FileMeta | undefined
   }
 };
 
-export const statMany = async (root: string, files: readonly string[]): Promise<Map<string, FileMeta>> => {
+const statMany = async (root: string, files: readonly string[]): Promise<Map<string, FileMeta>> => {
   const out = new Map<string, FileMeta>();
   await mapLimit(files, IO_CONCURRENCY, async (rel) => {
     const meta = await statFile(root, rel);
@@ -189,7 +189,7 @@ export interface FactStore {
   savedAt: number;
 }
 
-export const newFactStore = (root: string): FactStore => ({
+const newFactStore = (root: string): FactStore => ({
   root,
   facts: new Map(),
   meta: new Map(),
@@ -261,7 +261,7 @@ const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
 
 const persistDebounce = new Map<string, ReturnType<typeof setTimeout>>();
 
-export const persistFacts = async (store: FactStore): Promise<void> => {
+const persistFacts = async (store: FactStore): Promise<void> => {
   const header = JSON.stringify({ fovea: CACHE_VERSION, root: store.root, rulesSha: store.rulesSha } satisfies CacheHeader);
   const target = cachePathFor(store.root);
   const tmpName = `${target}.tmp-${process.pid}-${randomUUID()}`;
@@ -318,7 +318,7 @@ export const filterSupported = (files: readonly string[], routeRes?: RegExp[]): 
   files.filter((f) => supported(f, routeRes) && !isJunk(f));
 
 /** Debounced persistence: refreshes during active editing coalesce. */
-export const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
+const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
   if (persistDebounce.has(store.root)) return;
   const wait = Math.max(0, store.savedAt + minGapMs - Date.now());
   const timer = setTimeout(() => {
@@ -762,7 +762,7 @@ const langFamily = (file: string): string => {
  * per import (O(imports × files)), which quadratic-blows on big trees; these
  * maps make each lookup near-constant while preserving the exact match rules.
  */
-export interface ImportIndex {
+interface ImportIndex {
   fileSet: Set<string>;
   filesByDir: Map<string, string[]>;
   /** Go: last-k-segment dir suffix (k <= 3) -> dirs, built for every source dir. */
@@ -777,7 +777,7 @@ const pushIndex = (m: Map<string, string[]>, key: string, value: string): void =
   (m.get(key) ?? m.set(key, []).get(key)!).push(value);
 };
 
-export const buildImportIndex = (files: string[]): ImportIndex => {
+const buildImportIndex = (files: string[]): ImportIndex => {
   const fileSet = new Set(files);
   const filesByDir = new Map<string, string[]>();
   const goDirsBySuffix = new Map<string, string[]>();
@@ -811,7 +811,7 @@ export const buildImportIndex = (files: string[]): ImportIndex => {
   return { fileSet, filesByDir, goDirsBySuffix, rsByBase, tsByTailStem };
 };
 
-export const resolveImportToFile = (
+const resolveImportToFile = (
   spec: string,
   fromFile: string,
   index: ImportIndex,
@@ -1054,9 +1054,3 @@ export const assembleGraphWithIndex = async (
 
   return { graph: { nodes, edges, byName, byFile, anchors, files }, joinIndex: joinIdx };
 };
-
-export const assembleGraph = async (
-  root: string,
-  files: string[],
-  factsMap: Map<string, FileFacts> | Record<string, FileFacts>,
-): Promise<Graph> => (await assembleGraphWithIndex(root, files, factsMap)).graph;

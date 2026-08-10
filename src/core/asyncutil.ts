@@ -40,7 +40,7 @@ export const mapLimit = async <T, R>(
 };
 
 /** A semaphore all subprocess spawns share, so burst callers stay bounded. */
-export class Semaphore {
+class Semaphore {
   private active = 0;
   private readonly waiters: Array<() => void> = [];
   constructor(private readonly limit: number) {}

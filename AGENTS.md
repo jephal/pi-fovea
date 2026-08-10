@@ -6,7 +6,8 @@
 pnpm run check
 ```
 
-Runs typecheck + the full vitest suite. There is **no build step**: pi loads
+Runs typecheck + the full vitest suite + `lint:dead` (knip gate for unused
+files/exports, mirroring ../pi-fabric). There is **no build step**: pi loads
 the extension from `src/` via jiti, so a green check means the change is live.
 
 ## Cache invalidation
