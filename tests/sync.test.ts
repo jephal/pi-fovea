@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { ensureState, getState } from "../src/core/ops.js";
 import type { RepoState } from "../src/core/ops.js";
-import { resetSyncBaselines, sync, warmSync } from "../src/core/sync.js";
+import { decayedMass, MEMORY_HALF_LIFE_HOURS, resetSyncBaselines, sync, warmSync } from "../src/core/sync.js";
 import { resetSessions } from "../src/core/session.js";
 
 const SRC = new URL("./fixtures/mini", import.meta.url).pathname;
@@ -173,33 +173,76 @@ describe.skipIf(!hasAstGrep())("turn sync", () => {
     await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
   });
 
-  it("absorbed warmth and the hysteresis latch suppress the ping-pong repeat", async () => {
+  it("charged node memory kills the ping-pong by construct, on every flip", async () => {
     resetSyncBaselines();
     resetSessions();
     await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
     const users = join(root, "server/users.go");
     const src = readFileSync(users, "utf8");
-    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
-    // First contact: μ is empty, full surprise (~0.077) crosses 0.05.
+    const flip = (on: boolean) =>
+      writeFileSync(users, on
+        ? src.replace("return LoadUser(id)", "return SaveUser(id)")
+        : src);
+    // First contact: the ledger is empty, full surprise crosses 0.05 and the
+    // disclosure charges every warmed cascade node at its adjusted mass.
+    flip(true);
     const first = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.05 });
     expect(first.red).toBe(true);
     expect(Number(first.details.surprise)).toBeGreaterThan(0.05);
-    // Revert: the identical-shape cascade re-warms the same cluster, but the
-    // heat memory absorbed the first disclosure (μ = a, decayed to 0.7a), so
-    // surprise is only the ~30% regrowth margin and the latch is disarmed.
-    execSync("git checkout -- server/users.go", { cwd: root });
-    const reverted = await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
-    expect(reverted.red).toBe(false);
-    expect(Number(reverted.details.surprise)).toBeLessThan(0.05);
-    // Third flip of the same semantics: memory has decayed further (0.49a),
-    // surprise ~51% of the cascade — still under the threshold. The A→B→A
-    // steer loop dies by construction, not by rate limiting.
-    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
-    const third = await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
-    expect(third.red).toBe(false);
+    // Every later flip re-seeds the IDENTICAL cascade: the same node keys,
+    // now charged. Wall-clock decay at a 48h half-life is ~0 within a
+    // session, so each revisit's surprise is rounding noise — not a ~30%%
+    // regrowth margin that climbs back over the threshold after enough
+    // flips. Five poles, all silent, forever.
+    for (let pole = 0; pole < 5; pole++) {
+      flip(pole % 2 === 1);
+      const repeat = await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
+      expect(repeat.red).toBe(false);
+      expect(Number(repeat.details.surprise)).toBeLessThan(0.005);
+    }
     execSync("git checkout -- server/users.go", { cwd: root });
     resetSyncBaselines();
     await sync(root, { files: [], budget: 512, steerThreshold: 0.05 });
+  });
+
+  it("node memory damps charged nodes without blanketing fresh warmth", async () => {
+    resetSyncBaselines();
+    resetSessions();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    const users = join(root, "server/users.go");
+    const src = readFileSync(users, "utf8");
+    writeFileSync(users, src.replace("return LoadUser(id)", "return SaveUser(id)"));
+    const first = await sync(root, { files: ["server/users.go"], budget: 512, steerThreshold: 0.01 });
+    expect(first.red).toBe(true);
+    execSync("git checkout -- server/users.go", { cwd: root });
+    const quiet = await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+    expect(quiet.red).toBe(false);
+    expect(Number(quiet.details.surprise)).toBeLessThan(0.005);
+    // The users cascade charged the whole shared-literal cluster (config.go
+    // rides it). A config change re-seeds that charged mass AND adds a fresh
+    // literal node: the charged part stays damped (surprise is a fraction of
+    // the original disclosure), but the novelty still crosses a sensitive
+    // threshold. Cascade-shaped bookkeeping: suppression by charged key,
+    // never by file or by blanket.
+    const config = join(root, "server/config.go");
+    const cfgSrc = readFileSync(config, "utf8");
+    writeFileSync(config, cfgSrc.replace('os.Getenv("DATABASE_URL")', 'os.Getenv("DATABASE_URL") + "?pool=1"'));
+    const novel = await sync(root, { files: ["server/config.go"], budget: 512, steerThreshold: 0.01 });
+    expect(novel.red).toBe(true);
+    expect(Number(novel.details.surprise)).toBeGreaterThan(0.01);
+    expect(Number(novel.details.surprise)).toBeLessThan(Number(first.details.surprise));
+    execSync("git checkout -- server/config.go", { cwd: root });
+    resetSyncBaselines();
+    await sync(root, { files: [], budget: 512, steerThreshold: 0.01 });
+  });
+
+  it("wall-clock aging of the ledger follows the half-life exactly", () => {
+    const hlMs = MEMORY_HALF_LIFE_HOURS * 3600_000;
+    expect(decayedMass({ m: 1, t: 0 }, 0)).toBeCloseTo(1, 12);
+    expect(decayedMass({ m: 1, t: 0 }, hlMs)).toBeCloseTo(0.5, 6);
+    expect(decayedMass({ m: 1, t: 0 }, 2 * hlMs)).toBeCloseTo(0.25, 6);
+    // Clock skew or rewinds never amplify.
+    expect(decayedMass({ m: 1, t: 1000 }, 500)).toBeCloseTo(1, 12);
   });
 
   it("pull mode keeps the Next advisory instead of embedding focus", async () => {

@@ -985,6 +985,13 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
     top.push([v, i]);
   });
   const reasonByFile = new Map<string, Set<string>>();
+  // Per-NODE first-encounter reasons: the verdict memory is charged and aged
+  // per graph node, so the channel prior must be attached at the same
+  // granularity a node warms at, not smeared over its file.
+  const reasonByNode = new Map<number, string[]>();
+  const noteNode = (node: number, reasons: string[]): void => {
+    if (!reasonByNode.has(node) && reasons.length) reasonByNode.set(node, reasons);
+  };
   const reasonFor = (kind: Graph["edges"][number]["kind"]): string | undefined => {
     switch (kind) {
       case "invokes": return "call dependency";
@@ -1006,7 +1013,13 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
         ? aFile
         : undefined;
     const reason = reasonFor(edge.kind);
-    if (!target || !reason || !fileAgg.has(target)) continue;
+    if (!reason) continue;
+    // 1-hop: the non-seed endpoint inherits the channel directly.
+    const farNode = seedFiles.has(aFile) && !seedFiles.has(bFile) ? edge.b
+      : seedFiles.has(bFile) && !seedFiles.has(aFile) ? edge.a
+      : undefined;
+    if (farNode !== undefined) noteNode(farNode, [reason]);
+    if (!target || !fileAgg.has(target)) continue;
     const reasons = reasonByFile.get(target) ?? new Set<string>();
     reasons.add(reason);
     reasonByFile.set(target, reasons);
@@ -1026,6 +1039,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
       const reasons = reason && !current.reasons.includes(reason)
         ? [...current.reasons, reason]
         : current.reasons;
+      noteNode(edge.to, reasons);
       queue.push({ node: edge.to, reasons });
       const file = g.nodes[edge.to]!.file;
       if (fileAgg.has(file) && !seedFiles.has(file) && !reasonByFile.has(file) && reasons.length) {
@@ -1041,6 +1055,38 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
     if (!fileAgg.has(file) || seedFiles.has(file)) continue;
     const merged = new Set<string>([COCHANGE_REASON, ...(reasonByFile.get(file) ?? [])]);
     reasonByFile.set(file, merged);
+    // History-seeded mass enters through the partner's file node; its symbols
+    // warm through it, so stamp the whole file's warmed nodes as co-change.
+    for (const i of g.byFile.get(file) ?? []) {
+      const existing = reasonByNode.get(i) ?? [];
+      if (!existing.includes(COCHANGE_REASON)) reasonByNode.set(i, [COCHANGE_REASON, ...existing]);
+    }
+  }
+
+  // Verdict-grade warmth, keyed by stable node identity (kind|name@file) so
+  // turn-sync's heat memory can age per hunk rather than per file: a charged
+  // cascade node stays silent on revisits, while a novel hunk in a known file
+  // still fires. File nodes are coarse duplicates of their symbols (they warm
+  // whenever anything nearby does) and would re-smear memory file-wide, so
+  // they join display aggregation but never the memory ledger.
+  const warmedNodes: Record<string, { file: string; m: number; r: string[] }> = {};
+  {
+    // Tail cap: on monorepo-scale graphs a cascade can warm tens of thousands
+    // of nodes; the verdict head (and the memory ledger it feeds) only ever
+    // needs the dominant masses, and the pruned tail is per-node noise anyway.
+    const warmed: Array<[string, { file: string; m: number; r: string[] }]> = [];
+    g.nodes.forEach((n, i) => {
+      if (exclude.has(n.id) || seedFiles.has(n.file)) return;
+      const v = field[i]!;
+      if (v <= 1e-6) return;
+      warmed.push([`${n.kind}|${n.id}`, {
+        file: n.file,
+        m: Number(v.toFixed(6)),
+        r: reasonByNode.get(i) ?? [],
+      }]);
+    });
+    warmed.sort((a, b) => b[1].m - a[1].m);
+    for (const [k, v] of warmed.slice(0, 2000)) warmedNodes[k] = v;
   }
 
   const fileEntries = [...fileAgg.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
@@ -1091,6 +1137,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
         file,
         [...(reasonByFile.get(file) ?? new Set(["graph path"]))],
       ])),
+      warmedNodes,
     },
   };
 };

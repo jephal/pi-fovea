@@ -23,13 +23,21 @@ import { getSession } from "./session.js";
 
 interface SyncBaseline {
   version: string;
-  anchors: Set<string>;
+  /** anchor id -> carrier file. Anchor escalation requires carrier drift
+   * evidence: content-identical carriers keep content-identical anchors by
+   * construction, so a delta with an untouched carrier is an extraction
+   * artifact (parallel-load sweeps can drop a file's anchors transiently),
+   * not a route change. */
+  anchors: Map<string, string>;
   /** file -> content sha1 at baseline; used only for fast drift detection. */
   shas: Map<string, string>;
   /** file -> extracted semantic facts, excluding the content hash. */
   semantics: Map<string, string>;
-  /** file -> absorbed cascade mass (μ): the decayed union of all reported warmth. */
-  heat?: Map<string, number>;
+  /** graph node ("kind|name@file") -> charged cascade mass + charge time. The
+   * verdict memory lives at AST-hunk granularity so a disclosed cascade node
+   * cannot regenerate surprise on revisits (ping-pong dies by construct),
+   * while a novel hunk in an otherwise-known file still fires. */
+  heat?: Map<string, { m: number; t: number }>;
   /** Hysteresis latch: any red sync disarms warmth firing until total surprise drops back into the re-arm fraction. */
   warmthArmed?: boolean;
   /** Drift targets already push-embedded in this baseline chain (embed-once). */
@@ -108,9 +116,17 @@ const CHANNEL_WEIGHT: Record<string, number> = {
 };
 // Unlabeled multi-hop warmth.
 const CHANNEL_UNKNOWN = 0.5;
-// Heat memory decay per structural sync (μ ← 0.7μ): repeat warmth re-fires
-// only once it exceeds what the session was already told.
-const HEAT_DECAY = 0.7;
+// Heat memory decays by the wall clock, not by sync count: within a session
+// the half-life is effectively infinite, so a charged node stays silent no
+// matter how many times its cascade is re-seeded (the ping-pong constructor
+// dies here); across hours it finally cools, so a structurally re-heated
+// neighborhood can earn a fresh verdict on a later day.
+export const MEMORY_HALF_LIFE_HOURS = envInt("FOVEA_MEMORY_HALF_LIFE_HOURS", 48, 1, 8760);
+const HALF_LIFE_MS = MEMORY_HALF_LIFE_HOURS * 3600_000;
+export const decayedMass = (entry: { m: number; t: number }, nowMs: number): number =>
+  entry.m * Math.pow(0.5, Math.max(0, nowMs - entry.t) / HALF_LIFE_MS);
+// Ledger bound: prune cooled entries and cap size, evicting the weakest mass.
+const MEMORY_MAX_NODES = 4096;
 // Hysteresis re-arm band, as a fraction of the steer threshold.
 const REARM_FRACTION = 0.5;
 const round4 = (x: number): number => Math.round(x * 1e4) / 1e4;
@@ -135,9 +151,14 @@ interface WarmCompute {
   warmedFiles: string[];
   warmedMass: Record<string, number>;
   warmReasons: Record<string, string[]>;
+  warmedNodes: Record<string, { file: string; m: number; r: string[] }>;
 }
 
 const warmCache = new Map<string, WarmCompute>();
+
+/** Tests poll this to know a background warm actually landed (fixed sleeps
+ * race the debounce + impact compute under load). */
+export const warmCacheHas = (root: string): boolean => warmCache.has(root);
 
 const filesKey = (files: readonly string[]): string => [...new Set(files)].sort().join("\n");
 
@@ -182,6 +203,7 @@ export const warmSync = async (root: string, params: WarmParams, state?: RepoSta
       warmedFiles: (result.details.warmedFiles as string[] | undefined) ?? [],
       warmedMass: (result.details.warmedMass as Record<string, number> | undefined) ?? {},
       warmReasons: (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {},
+      warmedNodes: (result.details.warmedNodes as Record<string, { file: string; m: number; r: string[] }> | undefined) ?? {},
     });
     while (warmCache.size > ROOT_CACHE_LIMIT) warmCache.delete(warmCache.keys().next().value!);
   } catch {
@@ -236,8 +258,8 @@ const semanticFacts = (state: RepoState, file: string): string => {
 };
 
 const snapshot = async (state: RepoState): Promise<SyncBaseline> => {
-  const anchors = new Set<string>();
-  await forEachChunked(state.graph.anchors, 256, (anchor) => anchors.add(anchor.id));
+  const anchors = new Map<string, string>();
+  await forEachChunked(state.graph.anchors, 256, (anchor) => anchors.set(anchor.id, anchor.file));
   const shas = new Map<string, string>();
   const semantics = new Map<string, string>();
   await forEachChunked(Object.entries(state.facts), 256, ([file, facts]) => {
@@ -314,9 +336,10 @@ export const sync = async (
   // churn is reported but NEVER escalates alone — hypotheses with no first-class
   // backing don't get to wake the model with a red verdict.
   const current = new Map(state.graph.anchors.map((a) => [a.id, a.implicit === true]));
+  const currentCarrier = new Map(state.graph.anchors.map((a) => [a.id, a.file]));
   const currentIds = new Set(current.keys());
   const added = [...currentIds].filter((id) => !prev.anchors.has(id));
-  const removed = [...prev.anchors].filter((id) => !currentIds.has(id));
+  const removed = [...prev.anchors.keys()].filter((id) => !currentIds.has(id));
   const newlyImplicit = added.filter((id) => current.get(id));
 
   const session = getSession(root);
@@ -344,9 +367,8 @@ export const sync = async (
   );
   const files = [...new Set([...semanticChanged, ...hinted])];
 
-  let warmNow: Set<string> = new Set();
-  let warmMass: Record<string, number> = {};
   let warmReasons: Record<string, string[]> = {};
+  let warmNodes: Record<string, { file: string; m: number; r: string[] }> = {};
   let preparedBaseline: SyncBaseline | undefined;
   if (files.length) {
     // Edit-time `warmSync` may have precomputed the heavyweight ingredients —
@@ -361,11 +383,8 @@ export const sync = async (
     if (preparedHit) {
       warmCache.delete(root);
       preparedBaseline = prepared.snapshot;
-      warmMass = prepared.warmedMass;
       warmReasons = prepared.warmReasons;
-      warmNow = new Set(prepared.warmedFiles.filter(
-        (file) => !disclosedFiles.has(file) && !files.includes(file),
-      ));
+      warmNodes = prepared.warmedNodes;
     } else if (opts?.probe === "defer") {
       // No prepared verdict and real drift on the send path: never run the
       // impact cascade under the TUI's finger. Leave the baseline untouched
@@ -373,34 +392,41 @@ export const sync = async (
       return { structural: true, red: false, tokens: 0, details: { version: state.version, deferred: true } };
     } else {
       const result = await impact(root, { files, includeUncommitted: false, budget: params.budget });
-      const warmedFiles = (result.details.warmedFiles as string[] | undefined) ?? [];
-      warmMass = (result.details.warmedMass as Record<string, number> | undefined) ?? {};
       warmReasons = (result.details.warmedReasons as Record<string, string[]> | undefined) ?? {};
-      warmNow = new Set(warmedFiles.filter((file) => !disclosedFiles.has(file) && !files.includes(file)));
+      warmNodes = (result.details.warmedNodes as Record<string, { file: string; m: number; r: string[] }> | undefined) ?? {};
     }
   }
 
-  // Surprise gate. Warmth earns a steer only to the extent its channel-adjusted
-  // mass exceeds μ, the session's heat memory: the decayed union of every
-  // cascade already disclosed. Repeat warmth around ongoing work contributes
-  // nothing; genuinely hotter re-warming fires again. Novelty is continuous,
-  // not a one-sync set difference.
-  const channelMass = (file: string): number => {
+  // Surprise gate, per graph node. Warmth earns a steer only to the extent a
+  // node's channel-adjusted mass exceeds what the ledger already holds for it
+  // (wall-clock decayed). A re-seeded charged node contributes ~nothing — the
+  // ping-pong constructor dies here; a novel node in a familiar file still
+  // fires; and structurally re-heated neighborhoods re-fire once the ledger
+  // cools past the half-life. Novelty is continuous, not a set difference.
+  const nowMs = Date.now();
+  const nodeMass = (hit: { m: number; r: string[] }): number => {
     let prior = 0;
-    for (const reason of warmReasons[file] ?? []) prior = Math.max(prior, CHANNEL_WEIGHT[reason] ?? CHANNEL_UNKNOWN);
-    return (warmMass[file] ?? 0) * (prior || CHANNEL_UNKNOWN);
+    for (const reason of hit.r) prior = Math.max(prior, CHANNEL_WEIGHT[reason] ?? CHANNEL_UNKNOWN);
+    return hit.m * (prior || CHANNEL_UNKNOWN);
   };
-  const memory = new Map<string, number>();
-  for (const [file, mass] of prev.heat ?? []) {
-    const decayed = mass * HEAT_DECAY;
-    if (decayed > 1e-6) memory.set(file, decayed);
+  // Age the ledger forward. Entries whose cooled mass is noise are pruned;
+  // the bound evicts the weakest survivors, never the freshest charges.
+  const memory = new Map<string, { m: number; t: number }>();
+  for (const [key, entry] of prev.heat ?? []) {
+    const cooled = decayedMass(entry, nowMs);
+    if (cooled > 1e-9) memory.set(key, { m: cooled, t: nowMs });
   }
-  const surprise = new Map<string, number>();
+  if (memory.size > MEMORY_MAX_NODES) {
+    const ranked = [...memory.entries()].sort((a, b) => a[1].m - b[1].m);
+    for (const [key] of ranked.slice(0, memory.size - MEMORY_MAX_NODES)) memory.delete(key);
+  }
+  const surprise = new Map<string, number>(); // file -> Σ node surprise
   let surpriseTotal = 0;
-  for (const file of warmNow) {
-    const delta = channelMass(file) - (memory.get(file) ?? 0);
+  for (const [key, hit] of Object.entries(warmNodes)) {
+    if (disclosedFiles.has(hit.file) || files.includes(hit.file)) continue;
+    const delta = nodeMass(hit) - (memory.get(key)?.m ?? 0);
     if (delta > 1e-9) {
-      surprise.set(file, delta);
+      surprise.set(hit.file, (surprise.get(hit.file) ?? 0) + delta);
       surpriseTotal += delta;
     }
   }
@@ -408,10 +434,19 @@ export const sync = async (
   const pushed = new Set(prev.pushed ?? []);
   // Extraction failures leave fact gaps that look like anchor *removals* —
   // never escalate red on removals while degraded; the degraded note is
-  // already loud in details.
+  // already loud in details. Beyond degradation, an anchor delta whose
+  // carrier file shows no content/semantic drift is an extraction artifact
+  // even with a clean failure ledger: escalate and list only deltas whose
+  // carriers actually moved. The baseline adopts the full new set either
+  // way, so a transient artifact self-heals permanently (no echo loops).
   const degraded = state.extraction.failed.length > 0;
-  const structuralRed = (added.length - newlyImplicit.length) > 0 ||
-    (removed.length > 0 && !degraded) ||
+  const evidence = new Set([...changed, ...semanticChanged, ...deleted]);
+  const suspectRemoved = removed.filter((id) => !evidence.has(prev.anchors.get(id) ?? ""));
+  const suspectAdded = added.filter((id) => !evidence.has(currentCarrier.get(id) ?? ""));
+  const evidentialAdded = added.filter((id) => !suspectAdded.includes(id));
+  const evidentialRemoved = removed.filter((id) => !suspectRemoved.includes(id));
+  const structuralRed = (evidentialAdded.length - newlyImplicit.length) > 0 ||
+    (evidentialRemoved.length > 0 && !degraded) ||
     deleted.some((file) => !isTestScope(file));
   const prevArmed = prev.warmthArmed !== false;
   const warmthFire = prevArmed && surpriseTotal >= params.steerThreshold;
@@ -422,9 +457,10 @@ export const sync = async (
   // Absorb on disclosure: every warmed file the message covers charges the
   // memory at its current adjusted mass, displayed or not.
   if (red) {
-    for (const file of warmNow) {
-      const adjusted = channelMass(file);
-      if (adjusted > (memory.get(file) ?? 0)) memory.set(file, adjusted);
+    for (const [key, hit] of Object.entries(warmNodes)) {
+      if (disclosedFiles.has(hit.file) || files.includes(hit.file)) continue;
+      const adjusted = nodeMass(hit);
+      if (adjusted > (memory.get(key)?.m ?? 0)) memory.set(key, { m: adjusted, t: nowMs });
     }
   }
   const orderedWarm = [...surprise.entries()]
@@ -447,6 +483,9 @@ export const sync = async (
         changedFiles: changed,
         semanticChangedFiles: files,
         deletedFiles: deleted,
+        ...(suspectAdded.length || suspectRemoved.length
+          ? { suspectAnchors: { added: suspectAdded, removed: suspectRemoved } }
+          : {}),
         ...(degraded ? { extractionDegraded: true } : {}),
       },
     };
@@ -461,12 +500,12 @@ export const sync = async (
     "Repository structure changed.",
     `Changed: ${changedSummary}`,
   ];
-  for (const id of added.filter((anchor) => !newlyImplicit.includes(anchor)).slice(0, 6)) {
+  for (const id of evidentialAdded.filter((anchor) => !newlyImplicit.includes(anchor)).slice(0, 6)) {
     lines.push(`Route added: ${id}`);
   }
-  // Degraded removals are suspect (extraction gaps look like removals); the
-  // escalation gate already distrusts them, so the message does too.
-  if (!degraded) for (const id of removed.slice(0, 6)) lines.push(`Route removed: ${id}`);
+  // Degraded or carrier-less removals are suspect (extraction gaps look like
+  // removals); the escalation gate already distrusts them, the message does.
+  if (!degraded) for (const id of evidentialRemoved.slice(0, 6)) lines.push(`Route removed: ${id}`);
   if (orderedWarm.length) {
     lines.push("Newly relevant files:");
     for (const file of orderedWarm.slice(0, 8)) {
@@ -479,7 +518,7 @@ export const sync = async (
   // once per baseline chain. Route targets keep the advisory pending route
   // fuzzy-match quality, and the no-target case stays verdict-only. Pull
   // mode renders the advisory unconditionally.
-  const focusTarget = added.find((id) => !newlyImplicit.includes(id))?.replace(/^\w+\s+(?=\/)/, "")
+  const focusTarget = evidentialAdded.find((id) => !newlyImplicit.includes(id))?.replace(/^\w+\s+(?=\/)/, "")
     ?? files[0]
     ?? orderedWarm[0];
   const pushFocus = params.pushFocus !== false;

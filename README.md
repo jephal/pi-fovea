@@ -164,6 +164,7 @@ limits accept environment overrides:
 | `FOVEA_MAX_FILE_BYTES` | `1048576` | maximum bytes extracted from one source file |
 | `FOVEA_MAX_ROOTS` | `2` | resident graph, fact, session, sync, and root-metadata caches |
 | `FOVEA_SPAWN_CONCURRENCY` | `3` | concurrent ast-grep/git child processes |
+| `FOVEA_MEMORY_HALF_LIFE_HOURS` | `48` | wall-clock half-life of the per-node sync memory (charged cascade warmth) |
 | `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
 
 Files over the size cap keep their place in the model's view of the repo.
@@ -191,6 +192,18 @@ re-materializes the worktree, but the branch diff is not authored drift —
 commits, pulls, and rebases still report. Clean turns stay silent. Enable `sync.ackClean` if you want an ack for those. Set `sync.mode` to
 `"hidden"` to keep red sync context working behind the scenes without rendering it
 in the transcript, or to `"disabled"` to turn continuous sync off.
+
+Surprise is measured per graph node, not per file: a disclosed cascade
+charges the symbols, literals, and anchors it warmed, and a later verdict
+only counts mass exceeding that ledger. Re-editing the same spot re-seeds
+the same charged nodes and stays silent — flip-flopped work cannot wake the
+model twice, no matter how many times it flips within a session. A novel
+hunk still fires, damped only by the charged nodes it overlaps. The ledger
+cools by wall clock (48h half-life, `FOVEA_MEMORY_HALF_LIFE_HOURS`), so a
+structurally re-heated neighborhood can earn a fresh verdict on a later
+day. Anchor deltas follow the same evidence rule: a route add/remove
+escalates only when its carrier file drifted, which makes transient
+extraction artifacts quiet by construction.
 
 Runtime controls:
 
