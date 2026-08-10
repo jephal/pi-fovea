@@ -12,7 +12,7 @@ import { hasAstGrep } from "../src/core/astgrep.js";
 import { cachePathFor } from "../src/core/build.js";
 import { ensureState, evictState, getInflight, getState } from "../src/core/ops.js";
 import { DEFAULT_FOVEA_CONFIG } from "../src/core/config.js";
-import { resetSyncBaselines } from "../src/core/sync.js";
+import { resetSyncBaselines, warmCacheHas } from "../src/core/sync.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
 
@@ -483,7 +483,12 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
         ),
       );
       await loaded.emit("tool_execution_end", { toolCallId: "t1", toolName: "edit" }, ctx);
-      await new Promise((resolve) => setTimeout(resolve, 600)); // debounce warm lands
+      // Deterministic warm wait: fixed sleeps race the 250ms debounce plus
+      // the impact compute whenever the machine is loaded.
+      const deadline = Date.now() + 15_000;
+      while (!warmCacheHas(root) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       const results = await loaded.emit("before_agent_start", { prompt: "continue" }, ctx);
       const injected = results.find((result) => typeof result === "object" && result !== null) as {
         message: Record<string, unknown>;
