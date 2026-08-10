@@ -5,12 +5,12 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { focus, type OpResult } from "../src/core/ops";
 import { resetSyncBaselines, sync, type SyncOutcome } from "../src/core/sync";
 import { resetSessions } from "../src/core/session";
 
-const SATELLITE = "/Users/monotykamary/VCS/working-remote/open-source";
+const SATELLITE = process.env.PI_FOVEA_SATELLITE_DIR ?? join(homedir(), "VCS/working-remote/open-source");
 const SIM = join(tmpdir(), "pi-fovea-sim");
 
 const banner = (s: string) => console.log(`\n\x1b[1m== ${s} ==\x1b[0m`);
