@@ -17,6 +17,7 @@
 // aggregate across ALL files of the repo, so a dependency update or a style
 // drift can only flip a marginal signature when its repo-wide evidence moves.
 
+import { compileMethods } from "./anchors.js";
 import { classifyLiteral } from "./join.js";
 
 type Shape = "recv" | "bare" | "dec";
@@ -160,7 +161,7 @@ const shapeCompatPatterns: Record<Shape, RegExp> = {
 };
 
 const isCovered = (sig: SigStats, pack: Array<{ langs: string[]; methods: string; pattern?: string; patterns?: string[] }>): boolean => {
-  const mre = (methods: string, callee: string): boolean => new RegExp(methods.replace(/^\^\(\?i\)/, "^(?i:")).test(callee);
+  const mre = (methods: string, callee: string): boolean => compileMethods(methods).test(callee);
   return pack.some((r) => {
     if (!r.langs.includes(sig.lang)) return false;
     if (!mre(r.methods, sig.callee)) return false;

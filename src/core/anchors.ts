@@ -47,7 +47,18 @@ export interface AnchorRule {
   implicit?: boolean;
 }
 
-const HTTP_VERB_RE = /^(?i:get|post|put|delete|patch|head|options)$/;
+// Case-insensitive method alternations are written canonically as an inline
+// flag group, "^(?i:get|post)$" — an ES2025 RegExp modifier that engines
+// without the feature (Node < 23 / V8 < 12.5) cannot even parse. Rewrite it
+// to a plain non-capturing group with a trailing flag so every compile path
+// works on older engines (see issue #1).
+const INLINE_I_RE = /^\^\(\?i:([\s\S]*)\)\$$/;
+export const compileMethods = (methods: string): RegExp => {
+  const m = INLINE_I_RE.exec(methods);
+  return m ? new RegExp(`^(?:${m[1]})$`, "i") : new RegExp(methods);
+};
+
+const HTTP_VERB_RE = /^(?:get|post|put|delete|patch|head|options)$/i;
 
 // Verbs-in-path: Go 1.22 net/http ServeMux writes the verb inside the pattern.
 const VERB_IN_PATH = /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\/\S*)$/;
@@ -258,7 +269,7 @@ export const extractAnchors = async (
   const byLang = groupByLang(files);
   const out: AnchorDraft[] = [];
   for (const rule of pack) {
-    const methodRe = new RegExp(rule.methods);
+    const methodRe = compileMethods(rule.methods);
     for (const lang of rule.langs) {
       const langFiles = byLang.get(lang);
       if (!langFiles?.length) continue;

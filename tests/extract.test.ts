@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { extractCalls, extractImports, extractLiterals, extractSymbols } from "../src/core/extract.js";
-import { extractAnchors, extractFileRoutes } from "../src/core/anchors.js";
+import { compileMethods, extractAnchors, extractFileRoutes } from "../src/core/anchors.js";
 import type { SymbolRec } from "../src/core/types.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
@@ -170,6 +170,49 @@ describe.skipIf(!hasAstGrep())("extraction (ast-grep present)", () => {
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression (issue #1): pack `methods` strings canonically use "(?i:…)"
+// inline-flag groups — ES2025 RegExp modifiers that Node < 23 (V8 < 12.5)
+// cannot even parse. compileMethods rewrites them to a trailing flag.
+describe("compileMethods", () => {
+  it("rewrites inline (?i:…) groups as case-insensitive plain groups", () => {
+    const re = compileMethods("^(?i:get|post|put)$");
+    expect(re.flags).toContain("i");
+    expect(re.test("GET")).toBe(true);
+    expect(re.test("put")).toBe(true);
+    expect(re.test("getter")).toBe(false);
+  });
+
+  it("passes flag-free patterns through case-sensitively", () => {
+    const re = compileMethods("^(get|post)$");
+    expect(re.test("get")).toBe(true);
+    expect(re.test("GET")).toBe(false);
+  });
+});
+
+describe.skipIf(!hasAstGrep())("pre-modifier engine simulation", () => {
+  it("extracts pack anchors when RegExp rejects inline-flag groups", async () => {
+    const RealRegExp = globalThis.RegExp;
+    const INLINE_FLAG_GROUP = /\(\?[ims-]+:/;
+    class LegacyRegExp extends RealRegExp {
+      constructor(source: string | RegExp, flags?: string) {
+        if (typeof source === "string" && INLINE_FLAG_GROUP.test(source)) {
+          throw new SyntaxError(`Invalid regular expression: /${source}/: Invalid group`);
+        }
+        super(source, flags);
+      }
+    }
+    globalThis.RegExp = LegacyRegExp as unknown as typeof RegExp;
+    try {
+      const syms = await extractSymbols(CODE, FIXTURE);
+      const anchors = await extractAnchors(CODE, FIXTURE, enclosing(syms));
+      expect(anchors.some((a) => a.id.startsWith("GET /api/users/{*}"))).toBe(true);
+      expect(anchors.some((a) => a.id.startsWith("GET /api/airports/search"))).toBe(true);
+    } finally {
+      globalThis.RegExp = RealRegExp;
     }
   });
 });
