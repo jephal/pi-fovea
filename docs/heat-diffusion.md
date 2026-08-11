@@ -95,13 +95,7 @@ The denominator stops a popular literal from turning into an uncapped hub. Repet
 Joint git history carries the *software development over time* signal. The affinity diffusion cannot see that signal by construction. Files $a$ and $b$ that keep moving together in the same commits share a bond the parser never encodes. Under the all-in heat model that bond is a **seeded field**. It never becomes a permanent graph edge.
 
 - `cochange.ts` mines the last 400 commits and records each pair's joint-commit count plus the committer time of its **most recent** joint commit. Those raw facts get cached by HEAD and tracked-file set. The static graph carries **no** co-change edge, so focus and sketch read the operator and stay pure structure.
-- When `impact` seeds a change, it re-seeds the change site's history partners into the *same* diffusion at
-
-  $$
-  w = w_0(\text{count}, \text{jaccard}) \cdot 2^{-\text{ageDays} / \tau}, \qquad \tau = 30 \text{ days}
-  $$
-
-  where $w_0$ is the old Jaccard-tilted base conductance and age runs on wall clock since the pair last co-committed, $(\text{age} = \max(0, \text{now} - \text{lastTs}))$.
+- When `impact` seeds a change, it re-seeds the change site's history partners into the *same* diffusion at $w = w_0(\text{count}, \text{jaccard}) \cdot 2^{-\text{ageDays} / \tau}$ with a half-life of $\tau = 30 \text{ days}$, where $w_0$ is the old Jaccard-tilted base conductance and age runs on wall clock since the pair last co-committed, $(\text{age} = \max(0, \text{now} - \text{lastTs}))$.
 - Linearity is what makes this heat. Seeding partner files at weight $w$ and diffusing once gives $e^{-tL}(s_{\text{change}} + w \, s_{\text{partner}})$. Fresh joint work stays hot. A pair that last moved months ago contributes almost nothing, and an idle session cools the affinity like any other heat source. Even a cached hit cools, because recency applies at **use** time. Nothing about recency lives in the cache.
 - Partner files surface with the `co-change history` reason. Turn sync still weighs them at $c_v = 0.5$. The per-node sync ledger $\mu$ governs how often that channel can refire (see Turn sync below).
 
@@ -169,7 +163,7 @@ A sync goes red on structural events or when warmth alone crosses the steer thre
 Four dynamics fall out of $\mu$:
 
 - **Absorb on disclosure.** Any red sync charges $\mu_v \leftarrow \max(\mu_v, c_v m_v)$ for every warmed node, displayed or not. Re-editing the same spot re-seeds the same node keys, all charged, and in-session decay stays negligible. Flip-flopped work stays silent on every revisit, indefinitely. The disclosed cascade is *structurally unable to re-fire*.
-- **Wall-clock decay.** Entries age as $\mu_v \leftarrow \mu_v \cdot 2^{-\Delta t / \tau_h}$ with $\tau_h = 48\,$h (`FOVEA_MEMORY_HALF_LIFE_HOURS`). The decay ticks on wall clock, whatever the sync count. A structurally re-heated neighborhood can earn a fresh verdict on a later day. Renamed-symbol orphans cool out on the same schedule. The ledger is bounded at 4096 nodes with weakest-mass eviction, and the impact payload tail-caps at 2000 nodes.
+- **Wall-clock decay.** Entries age as $\mu_v \leftarrow \mu_v \cdot 2^{-\Delta t / \tau_h}$ with $\tau_h = 48\,\mathrm{h}$ (`FOVEA_MEMORY_HALF_LIFE_HOURS`). The decay ticks on wall clock, whatever the sync count. A structurally re-heated neighborhood can earn a fresh verdict on a later day. Renamed-symbol orphans cool out on the same schedule. The ledger is bounded at 4096 nodes with weakest-mass eviction, and the impact payload tail-caps at 2000 nodes.
 - **No blanket.** Charged keys suppress only themselves. A novel hunk in a charged cluster, say a fresh literal or a stronger coupling, keeps its own surprise and can cross $\theta$ even while the rest stays damped. Quiet verdicts charge nothing, so a trickle of sub-threshold warmth cannot habituate the gate.
 - **Hysteresis.** A fire disarms the warmth latch. It re-arms only once $S \le \theta/2$. Cascades hovering near the threshold cannot oscillate.
 
