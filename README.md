@@ -153,7 +153,16 @@ waits for ast-grep, hashing, or graph assembly. A cold sync hook reports the
 progress. Later calls reuse the same shared build.
 
 A non-Git umbrella directory treats each nested `.git` directory or worktree
-marker as a project boundary. A folder of clones becomes many separate graphs.
+marker as a closed project boundary — until you work in it. The first edit
+hint (or observed drift) inside a nested clone enrolls it into the umbrella
+graph from then on: progressive disclosure, one project at a time, persisted
+with the fact cache so restarts restore your working set. The same rule covers
+submodules and embedded checkouts in Git roots: their contents join the graph
+as `<submodule>/<path>` the first time something inside changes — porcelain
+reports inner drift collapsed to the boundary, which enrolls it automatically —
+and a removed project un-enrolls without leaving orphan facts. Every fovea_* tool still
+accepts a `root` for a full, immediate map of one project.
+`FOVEA_MAX_FILES` caps the merged listing either way.
 Cold runs stay bounded through streamed JSONL cache I/O, 64-file extraction
 batches, adaptive ast-grep chunk splitting, and a two-root resident LRU. The
 limits accept environment overrides:
@@ -166,6 +175,7 @@ limits accept environment overrides:
 | `FOVEA_SPAWN_CONCURRENCY` | `3` | concurrent ast-grep/git child processes |
 | `FOVEA_MEMORY_HALF_LIFE_HOURS` | `48` | wall-clock half-life of the per-node sync memory (charged cascade warmth) |
 | `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
+| `FOVEA_MAX_SUBMODULE_DEPTH` | `4` | recursion cap for nested submodules |
 
 Files over the size cap keep their place in the model's view of the repo.
 Failed extractions do the same. You find both in `/fovea status` and in tool

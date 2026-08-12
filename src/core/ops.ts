@@ -14,6 +14,7 @@ import {
   filterSupported,
   listFiles,
   loadFacts,
+  readEnrolledBoundaries,
   refreshFacts,
   type ExtractionReport,
   type FactStore,
@@ -183,7 +184,9 @@ const buildState = async (root: string): Promise<RepoState> => {
   const routeRes = fileRoutes.map((r) => new RegExp(r.re));
   const probe = await gitProbe(root);
   const gitKind: RepoState["gitKind"] = probe ? "git" : "plain";
-  const files = await listFiles(root, routeRes);
+  // Cold start: the fact cache header remembers which nested boundaries this
+  // root had enrolled, so a restart restores coverage without a fresh edit.
+  const files = await listFiles(root, routeRes, new Set(await readEnrolledBoundaries(root)));
   const { store, report } = await factPass(() => loadFacts(root, files));
   return assembleState(root, files, store, report, gitKind, probe?.head,
     new Set(probe ? probe.changes.map((c) => c.path).filter((p) => p && !p.endsWith("/")) : []));
@@ -209,6 +212,41 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
   const hinted = [...new Set([...filterSupported(hints, routeRes), ...hints.filter((h) => store.facts.has(h))])];
   changed.push(...hinted);
 
+  // Progressive disclosure: a nested repository stays outside this root's
+  // graph until work touches it. A hint landing across a .git marker enrolls
+  // the boundary — every marker on the path, so doubly-nested clones cross
+  // together — and a vanished marker un-enrolls, so a removed clone leaves
+  // no orphan facts behind.
+  let disclosureChanged = false;
+  for (const boundary of [...store.enrolled]) {
+    const exists = await stat(join(state.root, boundary, ".git")).then(() => true, () => false);
+    if (!exists) {
+      store.enrolled.delete(boundary);
+      disclosureChanged = true;
+    }
+  }
+  let known: Set<string> | undefined;
+  for (const h of hinted) {
+    let covered = false;
+    for (const b of store.enrolled) {
+      if (h.startsWith(b + "/")) { covered = true; break; }
+    }
+    if (!covered) {
+      known ??= new Set(state.files);
+      covered = known.has(h);
+    }
+    if (covered) continue;
+    let prefix = "";
+    for (const seg of h.split("/").slice(0, -1)) {
+      prefix = prefix ? `${prefix}/${seg}` : seg;
+      if (store.enrolled.has(prefix)) continue;
+      const boundary = await stat(join(state.root, prefix, ".git")).then(() => true, () => false);
+      if (!boundary) continue;
+      store.enrolled.add(prefix);
+      disclosureChanged = true;
+    }
+  }
+
   if (state.gitKind === "git") {
     const probe = await gitProbe(state.root);
     if (probe) {
@@ -219,9 +257,27 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
       }
       // Untracked directories appear collapsed ("dir/") in porcelain; adds
       // inside them only surface through a relist. Relist moments are rare.
-      const needsList = probe.relist || probe.changes.some((c) => c.path.endsWith("/"));
+      let needsList = probe.relist || disclosureChanged || probe.changes.some((c) => c.path.endsWith("/"));
+      if (probe.changes.length) {
+        // Porcelain collapses any drift inside a nested checkout (submodule
+        // or embedded repo: HEAD move, dirty content, untracked files) to
+        // one entry naming its gitlink. A directory change therefore _is_ an
+        // edit event: enroll the boundary and relist. Pushing its path into
+        // the file pipeline would fail stat and masquerade as unreadable.
+        const dirFlags = await Promise.all(
+          probe.changes.map((c) => !c.path.endsWith("/") && stat(join(state.root, c.path)).then((s) => s.isDirectory(), () => false)),
+        );
+        probe.changes.forEach((c, i) => {
+          if (!dirFlags[i]) return;
+          needsList = true;
+          if (!store.enrolled.has(c.path)) {
+            store.enrolled.add(c.path);
+            disclosureChanged = true;
+          }
+        });
+      }
       if (needsList) {
-        files = await listFiles(state.root, routeRes);
+        files = await listFiles(state.root, routeRes, store.enrolled);
         changed.push(...state.files);
       } else {
         // HEAD moved with a clean status means a checkout: worktree content
@@ -263,8 +319,8 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
   }
   if (state.gitKind === "plain") {
     const walkDue = now - state.walkedAt > WALK_GAP_MS;
-    if (force || walkDue || changed.length) {
-      files = await listFiles(state.root, routeRes);
+    if (force || walkDue || changed.length || disclosureChanged) {
+      files = await listFiles(state.root, routeRes, store.enrolled);
       state.walkedAt = now;
       if (force || now - state.sweptAt > SWEEP_GAP_MS) {
         state.sweptAt = now;

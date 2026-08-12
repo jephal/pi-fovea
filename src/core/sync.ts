@@ -13,7 +13,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { ROOT_CACHE_LIMIT, envInt, forEachChunked } from "./asyncutil.js";
 import { gitProbe } from "./git.js";
@@ -108,6 +108,10 @@ const gitDriftSince = async (root: string, shas: Map<string, string>): Promise<b
   for (const change of probe.changes) {
     const rel = change.path;
     if (rel.endsWith("/")) return true; // collapsed untracked dir: drift
+    // Porcelain collapses submodule drift to the gitlink path, which names a
+    // directory: content moved inside without a hash we can compare.
+    const st = await stat(join(root, rel)).catch(() => undefined);
+    if (st?.isDirectory()) return true;
     try {
       const buf = await readFile(join(root, rel));
       const sha = createHash("sha1").update(buf).digest("hex");

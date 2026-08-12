@@ -43,7 +43,7 @@ export interface FileFacts {
   sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 9; // bump when extractor semantics or the cache schema change
+const CACHE_VERSION = 10; // bump when extractor semantics or the cache schema change (v10: header gains enrolled boundaries)
 
 // Honest coverage: what the extractor could NOT see. Tools and status render
 // this so a thin graph never reads as a small repo (files dropped silently).
@@ -60,6 +60,8 @@ const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", 
 // Override deliberately for giant monorepos; normal roots stay bounded.
 const MAX_FILES = envInt("FOVEA_MAX_FILES", 8000, 100, 100_000);
 const MAX_FILE_BYTES = envInt("FOVEA_MAX_FILE_BYTES", 1024 * 1024, 64 * 1024, 64 * 1024 * 1024);
+// Recursion cap for nested submodules; real-world nesting is one or two deep.
+const MAX_SUBMODULE_DEPTH = envInt("FOVEA_MAX_SUBMODULE_DEPTH", 4, 1, 16);
 // Generated dependency manifests are enormous and carry no first-class routes.
 const LOCKFILE_NAMES = new Set([
   "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb",
@@ -80,16 +82,63 @@ const supported = (f: string, routeRes?: RegExp[]): boolean => {
   return routeRes?.some((re) => re.test(f)) ?? false;
 };
 
-export const listFiles = async (root: string, routeRes?: RegExp[]): Promise<string[]> => {
+const NO_BOUNDARIES: ReadonlySet<string> = new Set();
+
+/**
+ * `ls-files` never lists plain directories, so a directory entry in its
+ * output is a submodule gitlink: a nested-repository boundary. Progressive
+ * disclosure keeps boundaries closed until the root's FactStore enrolls them
+ * (first hint or collapsed drift inside); enrolled boundaries recurse into
+ * prefixed tracked + untracked paths, their own .gitignore still applying
+ * via --exclude-standard. Unpopulated checkouts yield no listing and drop
+ * out silently. The gitlink path itself never enters the result: it names a
+ * directory, not a file, and keeping it would poison the unreadable ledger
+ * on refresh (this also covers dotted submodule names).
+ */
+const expandSubmodules = async (
+  root: string,
+  prefix: string,
+  entries: string[],
+  enrolled: ReadonlySet<string>,
+  depth: number,
+): Promise<string[]> => {
+  const candidates = entries.filter((e) => !e.endsWith("/"));
+  const isDir = await mapLimit(
+    candidates,
+    IO_CONCURRENCY,
+    (e) => stat(joinPath(root, e)).then((s) => s.isDirectory(), () => false),
+  );
+  const gitlinks = new Set(candidates.filter((_, i) => isDir[i]));
+  const files = entries.filter((e) => !gitlinks.has(e)).map((e) => prefix + e);
+  if (depth <= 0 || !gitlinks.size) return files;
+  for (const link of gitlinks) {
+    const key = prefix + link;
+    if (!enrolled.has(key)) continue;
+    const inner = await gitOut(joinPath(root, link), ["ls-files", "-co", "--exclude-standard"], { timeout: 30_000 });
+    if (!inner?.trim()) continue;
+    files.push(...await expandSubmodules(
+      joinPath(root, link),
+      `${key}/`,
+      inner.split("\n").map((s) => s.trim()).filter(Boolean),
+      enrolled,
+      depth - 1,
+    ));
+  }
+  return files;
+};
+
+export const listFiles = async (root: string, routeRes?: RegExp[], enrolled: ReadonlySet<string> = NO_BOUNDARIES): Promise<string[]> => {
   const out = await gitOut(root, ["ls-files", "-co", "--exclude-standard"], { timeout: 30_000 });
   let files: string[] = [];
   if (out?.trim()) {
-    files = out.split("\n").map((s) => s.trim()).filter(Boolean);
+    const entries = out.split("\n").map((s) => s.trim()).filter(Boolean);
+    files = await expandSubmodules(root, "", entries, enrolled, MAX_SUBMODULE_DEPTH);
   } else {
-    // A plain umbrella workspace must not recursively merge every child Git
-    // repository into one graph. Readdir the child once, see its .git marker,
-    // and treat it as a project boundary. Stop during traversal (not after)
-    // so memory and latency stay proportional to MAX_FILES.
+    // A plain workspace holds nested repositories closed: .git markers
+    // (directories or worktree gitfiles) bound the walk until the FactStore
+    // enrolls that exact boundary, which the first edit inside does through
+    // refresh hints. Stop during traversal (not after) so memory and latency
+    // stay proportional to MAX_FILES.
     const walk = async (dir: string, prefix: string): Promise<void> => {
       if (files.length >= MAX_FILES) return;
       let entries;
@@ -98,7 +147,7 @@ export const listFiles = async (root: string, routeRes?: RegExp[]): Promise<stri
       } catch {
         return;
       }
-      if (prefix && entries.some((entry) => entry.name === ".git")) return;
+      if (prefix && !enrolled.has(prefix) && entries.some((entry) => entry.name === ".git")) return;
       entries.sort((a, b) => a.name.localeCompare(b.name));
       for (const e of entries) {
         if (files.length >= MAX_FILES) break;
@@ -186,6 +235,11 @@ export interface FactStore {
   oversized: Set<string>;
   /** Rules pack hash the anchors were extracted with (defaults + repo + implicit). */
   rulesSha: string;
+  /** Nested-repository boundaries this root has enrolled (progressive
+   * disclosure): relative prefixes whose `.git` marker the listing crosses.
+   * Grows on first observed work inside the project, prunes when the marker
+   * vanishes, and persists across restarts via the cache header. */
+  enrolled: Set<string>;
   savedAt: number;
 }
 
@@ -198,10 +252,11 @@ const newFactStore = (root: string): FactStore => ({
   unreadable: new Set(),
   oversized: new Set(),
   rulesSha: "",
+  enrolled: new Set(),
   savedAt: 0,
 });
 
-interface CacheHeader { fovea: number; root: string; rulesSha: string }
+interface CacheHeader { fovea: number; root: string; rulesSha: string; enrolled?: string[] }
 interface CacheLine {
   file: string;
   sha1: string;
@@ -233,6 +288,9 @@ const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
         if (header.fovea !== CACHE_VERSION || header.root !== root) return undefined;
         store = newFactStore(root);
         store.rulesSha = header.rulesSha;
+        if (Array.isArray(header.enrolled)) {
+          for (const b of header.enrolled) if (typeof b === "string") store.enrolled.add(b);
+        }
         continue;
       }
       if (!line) continue;
@@ -261,8 +319,13 @@ const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
 
 const persistDebounce = new Map<string, ReturnType<typeof setTimeout>>();
 
-const persistFacts = async (store: FactStore): Promise<void> => {
-  const header = JSON.stringify({ fovea: CACHE_VERSION, root: store.root, rulesSha: store.rulesSha } satisfies CacheHeader);
+export const persistFacts = async (store: FactStore): Promise<void> => {
+  const header = JSON.stringify({
+    fovea: CACHE_VERSION,
+    root: store.root,
+    rulesSha: store.rulesSha,
+    enrolled: [...store.enrolled].sort(),
+  } satisfies CacheHeader);
   const target = cachePathFor(store.root);
   const tmpName = `${target}.tmp-${process.pid}-${randomUUID()}`;
   try {
@@ -303,6 +366,29 @@ const persistFacts = async (store: FactStore): Promise<void> => {
   } catch {
     await rm(tmpName, { force: true }).catch(() => undefined);
     // Cache is an optimization; never fail the build over it.
+  }
+};
+
+/**
+ * Header-only cache peek: which nested-repository boundaries this root had
+ * enrolled when its facts were last persisted. Cold builds answer this before
+ * the first listing so a restart restores coverage without a fresh edit.
+ */
+export const readEnrolledBoundaries = async (root: string): Promise<string[]> => {
+  const stream = createReadStream(cachePathFor(root), { encoding: "utf8" });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      const header = JSON.parse(line) as CacheHeader;
+      if (header.fovea !== CACHE_VERSION || header.root !== root) return [];
+      return Array.isArray(header.enrolled) ? header.enrolled.filter((b): b is string => typeof b === "string") : [];
+    }
+    return [];
+  } catch {
+    return [];
+  } finally {
+    lines.close();
+    stream.destroy();
   }
 };
 
