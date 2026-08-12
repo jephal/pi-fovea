@@ -43,7 +43,7 @@ export interface FileFacts {
   sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 10; // bump when extractor semantics or the cache schema change (v10: header gains enrolled boundaries)
+const CACHE_VERSION = 11; // bump when extractor semantics or the cache schema change (v11: generated-source skip for minified bundles)
 
 // Honest coverage: what the extractor could NOT see. Tools and status render
 // this so a thin graph never reads as a small repo (files dropped silently).
@@ -54,6 +54,10 @@ export interface ExtractionReport {
   unreadable: string[];
   /** Files deliberately omitted because one source exceeded the byte cap. */
   oversized: string[];
+  /** Files skipped because they look machine-generated (minified bundles):
+   * ast-grep pattern matching over a single huge line emits gigabytes of
+   * matches and takes ~a minute per invocation. */
+  generated: string[];
 }
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods", ".cargo"]);
 // File count is also a resident-graph budget, not just a discovery limit.
@@ -80,6 +84,27 @@ const supported = (f: string, routeRes?: RegExp[]): boolean => {
   if (!isBinaryExt(f) && (ext in LANG_BY_EXT || isConfigFile(f))) return true;
   // File-convention routers use extensions with no ast-grep lang (.svelte, .mdx).
   return routeRes?.some((re) => re.test(f)) ?? false;
+};
+
+// Minified/generated bundles parse fine but blow up ast-grep pattern matching:
+// `$F($$$A)` over duckdb's 800 KB single-line worker emitted 7.5 GB of match
+// JSON and took ~46 s per invocation. Real source lines never run thousands
+// of chars, so a huge line (or a conventional generated name) marks the file
+// for fact-free skipping — same treatment as oversized, no extraction at all.
+const MINIFIED_LINE_CHARS = 4_000;
+const GENERATED_NAME_RE = /\.(?:min|bundle)\.(?:[cm]?js|[cm]?ts|jsx|tsx|mjs|cjs)$/i;
+
+export const isGeneratedSource = (rel: string, text: string): boolean => {
+  if (GENERATED_NAME_RE.test(rel)) return true;
+  if (text.length < MINIFIED_LINE_CHARS) return false;
+  for (let i = 0; i < text.length; ) {
+    const nl = text.indexOf("\n", i);
+    const end = nl === -1 ? text.length : nl;
+    if (end - i >= MINIFIED_LINE_CHARS) return true;
+    if (nl === -1) break;
+    i = nl + 1;
+  }
+  return false;
 };
 
 const NO_BOUNDARIES: ReadonlySet<string> = new Set();
@@ -233,6 +258,8 @@ export interface FactStore {
   unreadable: Set<string>;
   /** Files deliberately omitted because source size exceeded MAX_FILE_BYTES. */
   oversized: Set<string>;
+  /** Files skipped as machine-generated (minified) sources. */
+  generated: Set<string>;
   /** Rules pack hash the anchors were extracted with (defaults + repo + implicit). */
   rulesSha: string;
   /** Nested-repository boundaries this root has enrolled (progressive
@@ -251,6 +278,7 @@ const newFactStore = (root: string): FactStore => ({
   failedSha: new Map(),
   unreadable: new Set(),
   oversized: new Set(),
+  generated: new Set(),
   rulesSha: "",
   enrolled: new Set(),
   savedAt: 0,
@@ -265,6 +293,8 @@ interface CacheLine {
   facts?: Omit<FileFacts, "sha1">;
   /** Marker only: no partial semantic facts cross the cache boundary. */
   failed?: true;
+  /** Marker only: generated sources carry empty facts, never partial ones. */
+  generated?: true;
 }
 
 export const cachePathFor = (root: string): string =>
@@ -297,6 +327,7 @@ const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
       try {
         const rec = JSON.parse(line) as CacheLine;
         store.meta.set(rec.file, { size: rec.size, mtime: rec.mtime });
+        if (rec.generated) store.generated.add(rec.file);
         if (rec.failed) {
           store.tainted.add(rec.file);
           store.failedSha.set(rec.file, rec.sha1);
@@ -348,6 +379,7 @@ export const persistFacts = async (store: FactStore): Promise<void> => {
           line = { file, sha1, size: meta.size, mtime: meta.mtime, facts: rest };
         }
         if (!line) continue;
+        if (store.generated.has(file)) line.generated = true;
         batch += JSON.stringify(line) + "\n";
         if (batch.length >= 1024 * 1024) {
           await handle.write(batch);
@@ -547,10 +579,10 @@ const applyRulePack = async (
   const prevSha = store.rulesSha;
   store.rulesSha = rulesSha;
   if (rulesSha !== prevSha) {
-    const codeFiles = files.filter((f) => !isConfigFile(f) && store.facts.has(f));
+    const codeFiles = files.filter((f) => !isConfigFile(f) && !store.generated.has(f) && store.facts.has(f));
     await runAnchorPass(root, store, codeFiles, { pack, fileRoutes: base.fileRoutes });
   } else if (rulesSha !== base.sha && dirty.length) {
-    const dirtyCode = dirty.filter((f) => !isConfigFile(f) && store.facts.has(f));
+    const dirtyCode = dirty.filter((f) => !isConfigFile(f) && !store.generated.has(f) && store.facts.has(f));
     await runAnchorPass(root, store, dirtyCode, { pack, fileRoutes: base.fileRoutes });
   }
 };
@@ -604,6 +636,7 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
       store.failedSha.delete(f);
       store.unreadable.delete(f);
       store.oversized.delete(f);
+      store.generated.delete(f);
       cacheDirty = true;
     }
   }
@@ -625,6 +658,7 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
       store.tainted.delete(rel);
       store.failedSha.delete(rel);
       store.unreadable.delete(rel);
+      store.generated.delete(rel);
       continue;
     }
     store.oversized.delete(rel);
@@ -651,6 +685,16 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
       return;
     }
     spend(rel, got.text, contents);
+    if (isGeneratedSource(rel, got.text)) {
+      store.generated.add(rel);
+      store.tainted.delete(rel);
+      store.failedSha.delete(rel);
+      store.meta.set(rel, meta);
+      store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+      cacheDirty = true;
+      return;
+    }
+    store.generated.delete(rel);
     const failedSha = store.failedSha.get(rel);
     if (failedSha === got.sha1) {
       store.meta.set(rel, meta);
@@ -686,6 +730,7 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
     if (store.facts.delete(f)) cacheDirty = true;
     if (store.meta.delete(f)) cacheDirty = true;
     store.oversized.delete(f);
+    store.generated.delete(f);
     store.failedSha.delete(f);
   }
   for (const f of oversized) store.oversized.add(f);
@@ -699,6 +744,7 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
       failed: [...store.tainted].sort(),
       unreadable: [...new Set(unreadable)].sort(),
       oversized: [...store.oversized].sort(),
+      generated: [...store.generated].sort(),
     },
     dirty: dirty.sort(),
   };
@@ -736,6 +782,7 @@ export const refreshFacts = async (
     store.failedSha.delete(known);
     store.unreadable.delete(known);
     store.oversized.delete(known);
+    store.generated.delete(known);
     deleted.push(known);
   };
   const knownFiles = new Set([...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized]);
@@ -776,6 +823,7 @@ export const refreshFacts = async (
       store.tainted.delete(rel);
       store.failedSha.delete(rel);
       store.unreadable.delete(rel);
+      store.generated.delete(rel);
       continue;
     }
     store.oversized.delete(rel);
@@ -786,6 +834,14 @@ export const refreshFacts = async (
     }
     store.unreadable.delete(rel);
     spend(rel, got.text, contents);
+    if (isGeneratedSource(rel, got.text)) {
+      store.generated.add(rel);
+      store.tainted.delete(rel);
+      store.failedSha.delete(rel);
+      store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+      continue;
+    }
+    store.generated.delete(rel);
     if (store.failedSha.get(rel) === got.sha1) continue;
     const prev = store.facts.get(rel);
     if (prev && prev.sha1 === got.sha1 && !store.tainted.has(rel)) continue;
@@ -808,6 +864,7 @@ export const refreshFacts = async (
     store.facts.delete(f);
     store.meta.delete(f);
     store.oversized.delete(f);
+    store.generated.delete(f);
     store.failedSha.delete(f);
   }
   for (const f of oversized) store.oversized.add(f);
@@ -818,11 +875,12 @@ export const refreshFacts = async (
       failed: [...store.tainted].sort(),
       unreadable: [...store.unreadable].sort(),
       oversized: [...store.oversized].sort(),
+      generated: [...store.generated].sort(),
     },
     stats: {
       reExtracted: dirty.sort(),
       deleted: deleted.sort(),
-      added: added.filter((f) => !unreadable.includes(f) && !store.oversized.has(f) && !store.tainted.has(f)).sort(),
+      added: added.filter((f) => !unreadable.includes(f) && !store.oversized.has(f) && !store.generated.has(f) && !store.tainted.has(f)).sort(),
     },
   };
 };

@@ -60,11 +60,13 @@ try {
     const failed = Number(s.details.extractionFailures ?? 0);
     const unreadable = Array.isArray(s.details.extractionUnreadable) ? s.details.extractionUnreadable.length : 0;
     const oversized = Array.isArray(s.details.extractionOversized) ? s.details.extractionOversized.length : 0;
+    const generated = Array.isArray(s.details.extractionGenerated) ? s.details.extractionGenerated.length : 0;
     out = `${s.details.files} files, ${s.details.nodes} symbols, ${s.details.productionAnchors ?? s.details.anchors} production anchors` +
       (testAnchors ? `, ${testAnchors} test/fixture anchors collapsed` : "") +
       (failed ? `, !${failed} files failed extraction` : "") +
       (unreadable ? `, !${unreadable} files unreadable` : "") +
-      (oversized ? `, !${oversized} files over size cap` : "");
+      (oversized ? `, !${oversized} files over size cap` : "") +
+      (generated ? `, !${generated} generated files skipped` : "");
   } else if (cmd === "sketch") {
     const root = rootAt(0);
     const B = numAt(pos[0] === root && pos.length > 1 ? 1 : 0) ?? 512;

@@ -391,6 +391,7 @@ const extractionSuffix = (state: RepoState): string => {
   if (state.extraction.failed.length) parts.push(`!${state.extraction.failed.length} files failed extraction`);
   if (state.extraction.unreadable.length) parts.push(`!${state.extraction.unreadable.length} files unreadable`);
   if (state.extraction.oversized.length) parts.push(`!${state.extraction.oversized.length} files over size cap`);
+  if (state.extraction.generated.length) parts.push(`!${state.extraction.generated.length} generated files skipped`);
   return parts.length ? ` · ${parts.join(", ")}` : "";
 };
 
@@ -399,6 +400,7 @@ const extractionDetails = (state: RepoState): Record<string, unknown> => ({
   extractionFailedFiles: state.extraction.failed.slice(0, 20),
   extractionUnreadable: state.extraction.unreadable,
   extractionOversized: state.extraction.oversized,
+  extractionGenerated: state.extraction.generated,
 });
 
 // Seed resolution.

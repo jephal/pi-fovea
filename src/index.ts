@@ -543,6 +543,7 @@ export default function fovea(pi: ExtensionAPI) {
         const failedCount = Number(state.details.extractionFailures ?? 0);
         const unreadableCount = Array.isArray(state.details.extractionUnreadable) ? state.details.extractionUnreadable.length : 0;
         const oversizedCount = Array.isArray(state.details.extractionOversized) ? state.details.extractionOversized.length : 0;
+        const generatedCount = Array.isArray(state.details.extractionGenerated) ? state.details.extractionGenerated.length : 0;
         const cfg = configFor(ctx.cwd, ctx.isProjectTrusted());
         ctx.ui.notify(
           `pi-fovea ${PACKAGE_VERSION} · ${coverage} · ${state.details.nodes ?? 0} symbols · ` +
@@ -550,7 +551,8 @@ export default function fovea(pi: ExtensionAPI) {
           `${Number(state.details.testAnchors ?? 0) ? ` (${state.details.testAnchors} test/fixture collapsed)` : ""}` +
           `${failedCount ? ` · !${failedCount} files failed extraction` : ""}` +
           `${unreadableCount ? ` · !${unreadableCount} files unreadable` : ""}` +
-          `${oversizedCount ? ` · !${oversizedCount} files over size cap` : ""} · ` +
+          `${oversizedCount ? ` · !${oversizedCount} files over size cap` : ""}` +
+          `${generatedCount ? ` · !${generatedCount} generated files skipped` : ""} · ` +
           `sync ${cfg.sync.mode} · grep ${cfg.tools.grepMode} · ` +
           `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",
