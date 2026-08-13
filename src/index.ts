@@ -225,7 +225,7 @@ export default function fovea(pi: ExtensionAPI) {
           if (epoch !== lifecycleEpoch) return;
           const ms = Date.now() - t0;
           if (kick.started && ctx.hasUI && ms > 4000) {
-            ctx.ui.notify(`Index ready — ${st.graph.files.length} files (${(ms / 1000).toFixed(1)}s)`, "info");
+            ctx.ui.notify(`fovea: index ready — ${st.graph.files.length} files (${(ms / 1000).toFixed(1)}s)`, "info");
           }
           // Pre-establish the sync baseline in the background so the very
           // first prompt fast-paths instead of paying the snapshot on the
@@ -241,7 +241,7 @@ export default function fovea(pi: ExtensionAPI) {
         (error) => {
           if (epoch !== lifecycleEpoch) return;
           if (kick.started && ctx.hasUI) {
-            ctx.ui.notify(`Index failed: ${error instanceof Error ? error.message : error}`, "warning");
+            ctx.ui.notify(`fovea: index failed: ${error instanceof Error ? error.message : error}`, "warning");
           }
         },
       );
@@ -323,11 +323,11 @@ export default function fovea(pi: ExtensionAPI) {
         };
       }
       if (outcome.structural && !outcome.details.baseline && !outcome.details.deferred && cfg.sync.ackClean && ctx.hasUI) {
-        ctx.ui.notify("Checked repository changes; no new action is needed.", "info");
+        ctx.ui.notify("fovea: checked repository changes; no new action is needed.", "info");
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (ctx.hasUI && message !== lastSyncError) ctx.ui.notify(`Sync paused: ${message}`, "warning");
+      if (ctx.hasUI && message !== lastSyncError) ctx.ui.notify(`fovea: sync paused: ${message}`, "warning");
       lastSyncError = message;
     }
   });
@@ -358,13 +358,13 @@ export default function fovea(pi: ExtensionAPI) {
           details: outcome.details,
         }, { deliverAs: "steer", triggerTurn: true });
       } else if (!outcome.details.baseline && cfg.sync.ackClean && ctx.hasUI) {
-        ctx.ui.notify("Checked repository changes; no new action is needed.", "info");
+        ctx.ui.notify("fovea: checked repository changes; no new action is needed.", "info");
       }
     } catch (error) {
       // Turn-sync stays nonfatal, but a persistent index failure must not look
       // like a clean repository. Notify once until a successful sync clears it.
       const message = error instanceof Error ? error.message : String(error);
-      if (ctx.hasUI && message !== lastSyncError) ctx.ui.notify(`Sync paused: ${message}`, "warning");
+      if (ctx.hasUI && message !== lastSyncError) ctx.ui.notify(`fovea: sync paused: ${message}`, "warning");
       lastSyncError = message;
     }
   });
