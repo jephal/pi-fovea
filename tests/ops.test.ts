@@ -3,10 +3,34 @@
 
 import { describe, expect, it } from "vitest";
 import { hasAstGrep } from "../src/core/astgrep.js";
-import { dwell, ensureState, focus, impact, sketch } from "../src/core/ops.js";
+import { assembleGraphWithIndex as assembleGraphFromBuild } from "../src/core/build.js";
+import { assembleGraphWithIndex } from "../src/core/graph.js";
+import {
+  dwell,
+  ensureState,
+  ensureStateBackground,
+  evictState,
+  focus,
+  getInflight,
+  getState,
+  impact,
+  sketch,
+} from "../src/core/ops.js";
 import { resetSessions } from "../src/core/session.js";
+import * as state from "../src/core/state.js";
 
 const FIXTURE = new URL("./fixtures/mini", import.meta.url).pathname;
+
+describe("extracted module compatibility", () => {
+  it("re-exports graph assembly and state lifecycle without wrappers", () => {
+    expect(assembleGraphFromBuild).toBe(assembleGraphWithIndex);
+    expect(ensureState).toBe(state.ensureState);
+    expect(ensureStateBackground).toBe(state.ensureStateBackground);
+    expect(evictState).toBe(state.evictState);
+    expect(getInflight).toBe(state.getInflight);
+    expect(getState).toBe(state.getState);
+  });
+});
 
 describe.skipIf(!hasAstGrep())("fovea ops on the minimonorepo", () => {
   it("builds the graph with anchors and cross-language join edges", async () => {

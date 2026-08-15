@@ -17,8 +17,9 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { ROOT_CACHE_LIMIT, envInt, forEachChunked } from "./asyncutil.js";
 import { gitProbe } from "./git.js";
-import { ensureState, ensureStateBackground, focus, getInflight, getState, impact, isTestScope } from "./ops.js";
-import type { RepoState } from "./ops.js";
+import { focus, impact, isTestScope } from "./ops.js";
+import { ensureState, ensureStateBackground, getInflight, getState } from "./state.js";
+import type { RepoState } from "./state.js";
 import { getSession } from "./session.js";
 
 interface SyncBaseline {
