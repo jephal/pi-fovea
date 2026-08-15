@@ -41,9 +41,10 @@ interface CommandDef {
   handler: (args: string, ctx: ReturnType<typeof fakeCtx>) => Promise<void>;
 }
 
-const fakeCtx = (cwd: string, trusted = false) => ({
+const fakeCtx = (cwd: string, trusted = false, sessionId = "test-session") => ({
   cwd,
   hasUI: false,
+  sessionManager: { getSessionId: () => sessionId },
   isIdle: () => true,
   isProjectTrusted: () => trusted,
   reload: async () => {},
@@ -495,6 +496,10 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       };
       expect(injected.message).toMatchObject({ customType: "pi-fovea-sync", display: true });
       expect(String(injected.message.content)).toContain("GET /api/users/{*}/warmnext");
+      expect(String(injected.message.content)).toContain("Origin: current session.");
+      expect(injected.message.details).toMatchObject({
+        provenance: { kind: "current-session", files: { "server/main.go": "current-session" } },
+      });
       expect(loaded.messages).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -666,6 +671,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       expect(loaded.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
       expect(String(loaded.messages[0]!.message.content)).toContain("Steer: account for this update");
       expect(String(loaded.messages[0]!.message.content)).toContain("GET /api/users/{*}/warmed");
+      expect(String(loaded.messages[0]!.message.content)).toContain("Origin: current session.");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

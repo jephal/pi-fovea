@@ -1,0 +1,197 @@
+import { createHash, randomUUID } from "node:crypto";
+import { readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+
+const JOURNAL_VERSION = 1;
+const JOURNAL_TTL_MS = 7 * 24 * 3600_000;
+const JOURNAL_MAX_RECORDS = 256;
+
+interface MutationRecord {
+  file: string;
+  beforeSha?: string;
+  afterSha?: string;
+  owner: string;
+  toolCallId: string;
+  at: number;
+}
+
+interface MutationJournal {
+  version: number;
+  root: string;
+  owner: string;
+  records: MutationRecord[];
+}
+
+export interface MutationCapture {
+  root: string;
+  file: string;
+  absolutePath: string;
+  beforeSha?: string;
+}
+
+type ProvenanceKind = "current-session" | "other-session" | "mixed" | "unattributed";
+
+export interface SyncProvenance {
+  kind: ProvenanceKind;
+  files: Record<string, ProvenanceKind>;
+}
+
+const sha1 = (value: string): string => createHash("sha1").update(value).digest("hex");
+const ownerFor = (sessionId: string): string => sha1(sessionId).slice(0, 16);
+const rootKey = (root: string): string => sha1(resolve(root)).slice(0, 16);
+const prefixFor = (root: string): string => `pi-fovea-provenance-${rootKey(root)}-`;
+
+export const provenancePathFor = (root: string, sessionId: string): string =>
+  join(tmpdir(), `${prefixFor(root)}${ownerFor(sessionId)}.json`);
+
+const hashFile = async (path: string): Promise<string | undefined> => {
+  try {
+    return createHash("sha1").update(await readFile(path)).digest("hex");
+  } catch {
+    return undefined;
+  }
+};
+
+const repoPath = (root: string, path: string): { file: string; absolutePath: string } | undefined => {
+  const absolutePath = resolve(root, path);
+  const file = relative(resolve(root), absolutePath);
+  if (!file || file === ".." || file.startsWith(`..${sep}`) || isAbsolute(file)) return undefined;
+  return { file: file.split(sep).join("/"), absolutePath };
+};
+
+export const captureMutation = async (root: string, path: string): Promise<MutationCapture | undefined> => {
+  const located = repoPath(root, path);
+  if (!located) return undefined;
+  return { root: resolve(root), ...located, beforeSha: await hashFile(located.absolutePath) };
+};
+
+const writeQueues = new Map<string, Promise<void>>();
+
+const persistRecord = async (target: string, journal: MutationJournal, record: MutationRecord): Promise<void> => {
+  const cutoff = Date.now() - JOURNAL_TTL_MS;
+  let records: MutationRecord[] = [];
+  try {
+    const existing = JSON.parse(await readFile(target, "utf8")) as MutationJournal;
+    if (existing.version === JOURNAL_VERSION && existing.root === journal.root && existing.owner === journal.owner) {
+      records = existing.records.filter((item) => item.at >= cutoff);
+    }
+  } catch {
+    // Missing and torn journals both recover as a fresh per-session file.
+  }
+  records.push(record);
+  journal.records = records.slice(-JOURNAL_MAX_RECORDS);
+  const temporary = `${target}.tmp-${process.pid}-${randomUUID()}`;
+  await writeFile(temporary, JSON.stringify(journal));
+  await rename(temporary, target);
+};
+
+export const finishMutation = async (
+  capture: MutationCapture,
+  sessionId: string,
+  toolCallId: string,
+): Promise<boolean> => {
+  const afterSha = await hashFile(capture.absolutePath);
+  if (capture.beforeSha === afterSha) return false;
+  const owner = ownerFor(sessionId);
+  const target = provenancePathFor(capture.root, sessionId);
+  const record: MutationRecord = {
+    file: capture.file,
+    beforeSha: capture.beforeSha,
+    afterSha,
+    owner,
+    toolCallId,
+    at: Date.now(),
+  };
+  const previous = writeQueues.get(target) ?? Promise.resolve();
+  const queued = previous.catch(() => {}).then(() => persistRecord(target, {
+    version: JOURNAL_VERSION,
+    root: capture.root,
+    owner,
+    records: [],
+  }, record));
+  writeQueues.set(target, queued);
+  try {
+    await queued;
+    return true;
+  } finally {
+    if (writeQueues.get(target) === queued) writeQueues.delete(target);
+  }
+};
+
+const readRecords = async (root: string, since: number): Promise<MutationRecord[]> => {
+  const prefix = prefixFor(root);
+  const cutoff = Math.max(since, Date.now() - JOURNAL_TTL_MS);
+  let names: string[];
+  try {
+    names = (await readdir(tmpdir())).filter((name) => name.startsWith(prefix) && name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const records: MutationRecord[] = [];
+  await Promise.all(names.map(async (name) => {
+    const path = join(tmpdir(), name);
+    try {
+      const journal = JSON.parse(await readFile(path, "utf8")) as MutationJournal;
+      if (journal.version !== JOURNAL_VERSION || journal.root !== resolve(root) || !Array.isArray(journal.records)) return;
+      const live = journal.records.filter((record) => record.at >= cutoff);
+      if (!live.length && journal.records.every((record) => record.at < Date.now() - JOURNAL_TTL_MS)) {
+        await unlink(path).catch(() => {});
+        return;
+      }
+      records.push(...live);
+    } catch {
+      // A concurrent atomic replacement or malformed journal is unattributed.
+    }
+  }));
+  return records.sort((a, b) => a.at - b.at || a.toolCallId.localeCompare(b.toolCallId));
+};
+
+const kindForOwners = (owners: Set<string>, currentOwner: string): ProvenanceKind => {
+  if (!owners.size) return "unattributed";
+  if (owners.size === 1) return owners.has(currentOwner) ? "current-session" : "other-session";
+  return "mixed";
+};
+
+const ownersForTransition = (
+  records: MutationRecord[],
+  beforeSha: string | undefined,
+  afterSha: string | undefined,
+): Set<string> => {
+  const states = new Map<string, Set<string>>();
+  const key = (sha: string | undefined): string => sha ?? "\0deleted";
+  states.set(key(beforeSha), new Set());
+  for (const record of records) {
+    const owners = states.get(key(record.beforeSha));
+    if (!owners) continue;
+    const nextKey = key(record.afterSha);
+    const next = states.get(nextKey) ?? new Set<string>();
+    for (const owner of owners) next.add(owner);
+    next.add(record.owner);
+    states.set(nextKey, next);
+  }
+  return states.get(key(afterSha)) ?? new Set();
+};
+
+export const attributeChanges = async (
+  root: string,
+  sessionId: string,
+  since: number,
+  changes: Array<{ file: string; beforeSha?: string; afterSha?: string }>,
+): Promise<SyncProvenance> => {
+  const records = await readRecords(root, since);
+  const currentOwner = ownerFor(sessionId);
+  const files: Record<string, ProvenanceKind> = {};
+  for (const change of changes) {
+    const matching = records.filter((record) => record.file === change.file);
+    files[change.file] = kindForOwners(
+      ownersForTransition(matching, change.beforeSha, change.afterSha),
+      currentOwner,
+    );
+  }
+  const kinds = new Set(Object.values(files));
+  return {
+    kind: kinds.size === 0 ? "unattributed" : kinds.size === 1 ? [...kinds][0]! : "mixed",
+    files,
+  };
+};

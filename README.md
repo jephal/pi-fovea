@@ -193,7 +193,12 @@ A meaningful change found before agent start lands inside that run's context. A
 post-turn route or dependency change ships with `deliverAs: "steer"`. When the
 agent is about to settle, `triggerTurn` starts the continuation. The compact
 update names the changed files, the route deltas, and the newly relevant files.
-It lists the causal channels behind each link: calls, imports, shared literals,
+It also identifies whether exact edit/write content transitions came from the
+current Pi session, another Fovea-enabled session, or mixed sessions. Shell
+commands, external editors, and agents without Fovea remain `unattributed`
+rather than being guessed. Provenance journals are bounded, expire after seven
+days, and live in `$TMPDIR`; repository content remains the drift oracle. It
+lists the causal channels behind each link: calls, imports, shared literals,
 tests, or co-change history. By default it also embeds the refreshed focus
 context of the top drift target (push). With `sync.pushFocus` off, the update
 ends with a suggested focus probe for the next call (pull). Switching

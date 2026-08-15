@@ -27,7 +27,7 @@ All four accept `maxTokens` (256–16000). Budget is roughly 4 chars per token.
 
 Before an agent starts, pi-fovea establishes its baseline or injects out-of-band semantic drift into that run. After each assistant turn it compares again; meaningful route/dependency drift is delivered as a **steer**, and Fovea triggers a continuation if the agent would otherwise stop. Treat its changed files, route deltas, and causal channels as continuous task context. Comment- and formatting-only edits stay silent.
 
-Sync is **mutation-path agnostic**: pi's edit/write tools, a pi-fabric `fabric_exec` program's inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all register identically. Content hashes are the source of truth; tool events are not consulted for detection. In repos with no `.git` directory this is also the only drift signal — do not fall back to `git status` assumptions.
+Sync is **mutation-path agnostic**: pi's edit/write tools, a pi-fabric `fabric_exec` program's inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all register identically. Content hashes are the source of truth; tool events are not consulted for detection. Successful edit/write events additionally record exact hash transitions so sync can label current-session, other-Fovea-session, and mixed provenance; uninstrumented mutation paths remain explicitly unattributed. In repos with no `.git` directory content drift is also the only change signal — do not fall back to `git status` assumptions.
 
 ## Using with pi-fabric (fabric_exec)
 

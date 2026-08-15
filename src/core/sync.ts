@@ -21,9 +21,12 @@ import { focus, impact, isTestScope } from "./ops.js";
 import { ensureState, ensureStateBackground, getInflight, getState } from "./state.js";
 import type { RepoState } from "./state.js";
 import { getSession } from "./session.js";
+import { attributeChanges, type SyncProvenance } from "./provenance.js";
 
 interface SyncBaseline {
   version: string;
+  /** Wall-clock boundary for accepting mutation transitions into this baseline chain. */
+  capturedAt: number;
   /** anchor id -> carrier file. Anchor escalation requires carrier drift
    * evidence: content-identical carriers keep content-identical anchors by
    * construction, so a delta with an untouched carrier is an extraction
@@ -52,7 +55,7 @@ interface SyncBaseline {
 // version stamp keeps shape changes safe: a mismatched slot degrades to a
 // cold store (today's reload behavior) instead of corrupting verdict math —
 // bump BASELINE_STATE_VERSION when SyncBaseline changes incompatibly.
-const BASELINE_STATE_VERSION = 1;
+const BASELINE_STATE_VERSION = 2;
 const BASELINES_SLOT = Symbol.for("pi-fovea:sync-baselines");
 type BaselinesGlobal = typeof globalThis & {
   [BASELINES_SLOT]?: { v: number; map: Map<string, SyncBaseline> };
@@ -248,6 +251,8 @@ export interface SyncParams {
   steerThreshold: number;
   /** Push vs pull (default push): embed the top file target's focus context. */
   pushFocus?: boolean;
+  /** Pi session UUID used only as a hashed owner key for mutation attribution. */
+  sessionId?: string;
 }
 
 export interface SyncOutcome {
@@ -291,7 +296,7 @@ const snapshot = async (state: RepoState): Promise<SyncBaseline> => {
     shas.set(file, facts.sha1);
     semantics.set(file, semanticFacts(state, file));
   });
-  return { version: state.version, anchors, shas, semantics };
+  return { version: state.version, capturedAt: Date.now(), anchors, shas, semantics };
 };
 
 export const sync = async (
@@ -391,6 +396,16 @@ export const sync = async (
     (file) => !(file in state.facts) && !existsSync(join(state.root, file)),
   );
   const files = [...new Set([...semanticChanged, ...hinted])];
+  const provenance: SyncProvenance | undefined = params.sessionId
+    ? await attributeChanges(root, params.sessionId, prev.capturedAt, [
+      ...changed.map((file) => ({
+        file,
+        beforeSha: prev.shas.get(file),
+        afterSha: state.facts[file]!.sha1,
+      })),
+      ...deleted.map((file) => ({ file, beforeSha: prev.shas.get(file), afterSha: undefined })),
+    ])
+    : undefined;
 
   let warmReasons: Record<string, string[]> = {};
   let warmNodes: Record<string, { file: string; m: number; r: string[] }> = {};
@@ -508,6 +523,7 @@ export const sync = async (
         changedFiles: changed,
         semanticChangedFiles: files,
         deletedFiles: deleted,
+        ...(provenance ? { provenance } : {}),
         ...(suspectAdded.length || suspectRemoved.length
           ? { suspectAnchors: { added: suspectAdded, removed: suspectRemoved } }
           : {}),
@@ -521,9 +537,17 @@ export const sync = async (
     : deleted.length
       ? `deleted ${deleted.slice(0, 4).join(", ")}${deleted.length > 4 ? ` (+${deleted.length - 4} more)` : ""}`
       : "route structure";
+  const origin = provenance?.kind === "current-session"
+    ? "current session"
+    : provenance?.kind === "other-session"
+      ? "another Fovea-enabled session"
+      : provenance?.kind === "mixed"
+        ? "mixed sessions or mutation paths"
+        : "unattributed mutation path";
   const lines: string[] = [
     "Repository structure changed.",
     `Changed: ${changedSummary}`,
+    ...(provenance ? [`Origin: ${origin}.`] : []),
   ];
   for (const id of evidentialAdded.filter((anchor) => !newlyImplicit.includes(anchor)).slice(0, 6)) {
     lines.push(`Route added: ${id}`);
@@ -589,6 +613,7 @@ export const sync = async (
       surprise: round4(surpriseTotal),
       warmReasons,
       deletedFiles: deleted,
+      ...(provenance ? { provenance } : {}),
       ...(embedded ? { pushedFocus: focusTarget } : {}),
       ...(degraded ? { extractionDegraded: true } : {}),
     },

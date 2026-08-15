@@ -11,6 +11,7 @@ import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
 import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
 import { resetSessions } from "./core/session.js";
+import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
 import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
 import { openFoveaSettings } from "./ui/settings.js";
 import type { NodeKind } from "./core/types.js";
@@ -206,6 +207,7 @@ export default function fovea(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const epoch = ++lifecycleEpoch;
+    const sessionId = ctx.sessionManager.getSessionId();
     // pi 0.84 replaces extension runtimes on resume/fork/new/reload. Core
     // module caches may outlive one factory instance, but disclosure and sync
     // baselines are session-local and must never cross that boundary.
@@ -233,7 +235,7 @@ export default function fovea(pi: ExtensionAPI) {
           const pre = configFor(ctx.cwd, ctx.isProjectTrusted());
           void sync(
             ctx.cwd,
-            { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus },
+            { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus, sessionId },
             st,
             { probe: "full" },
           ).catch(() => {});
@@ -262,6 +264,7 @@ export default function fovea(pi: ExtensionAPI) {
   // of re-extracting and re-diffusing while the UI waits.
   const WARM_DEBOUNCE_MS = 250;
   const warmTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingMutations = new Map<string, MutationCapture>();
   const warmAfterEdit = (root: string, cfg: FoveaConfig): void => {
     const rels = turnFiles
       .map((p) => (p.startsWith(root + "/") ? p.slice(root.length + 1) : p))
@@ -278,6 +281,7 @@ export default function fovea(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     for (const timer of warmTimers.values()) clearTimeout(timer);
     warmTimers.clear();
+    pendingMutations.clear();
     lifecycleEpoch++;
     turnFiles = [];
     lastSyncError = undefined;
@@ -287,15 +291,23 @@ export default function fovea(pi: ExtensionAPI) {
   pi.on("turn_start", () => {
     turnFiles = [];
   });
-  pi.on("tool_execution_start", (event) => {
+  pi.on("tool_execution_start", async (event, ctx) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const args = event.args as { path?: unknown };
-    if (typeof args.path === "string") turnFiles.push(args.path);
+    if (typeof args.path !== "string") return;
+    turnFiles.push(args.path);
+    const capture = await captureMutation(ctx.cwd, args.path);
+    if (capture) pendingMutations.set(event.toolCallId, capture);
   });
   // Warm once the file is actually on disk (tool_execution_start fires during
   // preflight, before the write lands); the debounce also coalesces bursts.
-  pi.on("tool_execution_end", (event, ctx) => {
+  pi.on("tool_execution_end", async (event, ctx) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
+    const capture = pendingMutations.get(event.toolCallId);
+    pendingMutations.delete(event.toolCallId);
+    if (!event.isError && capture) {
+      await finishMutation(capture, ctx.sessionManager.getSessionId(), event.toolCallId).catch(() => false);
+    }
     warmAfterEdit(ctx.cwd, configFor(ctx.cwd, ctx.isProjectTrusted()));
   });
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -304,7 +316,7 @@ export default function fovea(pi: ExtensionAPI) {
       if (!syncRuns(cfg)) return;
       const outcome = await sync(
         ctx.cwd,
-        { files: [], budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus },
+        { files: [], budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus, sessionId: ctx.sessionManager.getSessionId() },
         undefined,
         // Respond to the Enter key, never block on it: the TTL-bounded probe
         // detects out-of-band drift, a prepared warm verdict steers pre-prompt,
@@ -342,7 +354,7 @@ export default function fovea(pi: ExtensionAPI) {
       if (!syncRuns(cfg)) return;
       const outcome = await sync(
         ctx.cwd,
-        { files: rels, budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus },
+        { files: rels, budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus, sessionId: ctx.sessionManager.getSessionId() },
         undefined,
         { probe: "cheap" },
       );
