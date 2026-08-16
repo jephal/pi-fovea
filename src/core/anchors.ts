@@ -18,7 +18,15 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join as joinPath } from "node:path";
-import { groupByLang, patternRunAll } from "./astgrep.js";
+import {
+  anonymousVariadics,
+  groupByLang,
+  patternRunAll,
+  scanRules,
+  type AgMatch,
+  type ScanMatch,
+  type ScanRule,
+} from "./astgrep.js";
 import { PATH_TOKEN_RE } from "./extract.js";
 import { classifyLiteral, normalizeLiteral } from "./join.js";
 import { readAll, type FileSource } from "./source.js";
@@ -260,75 +268,148 @@ const joinRoute = (prefix: string, child: string): string => {
   return c ? `/${[p, c].filter(Boolean).join("/")}` : `/${p}`;
 };
 
+interface AnchorMatchGroup {
+  rule: AnchorRule;
+  prefixes: AgMatch[];
+  matches: AgMatch[];
+}
+
+const anchorsFromGroups = (
+  groups: readonly AnchorMatchGroup[],
+  resolveEnclosing: (file: string, line: number) => string | undefined,
+): AnchorDraft[] => {
+  const out: AnchorDraft[] = [];
+  for (const { rule, prefixes: prefixMatches, matches } of groups) {
+    const methodRe = compileMethods(rule.methods);
+    const prefixes = new Map<string, string>();
+    for (const match of prefixMatches) {
+      const prefix = match.single.P?.trim();
+      if (prefix !== undefined && !prefixes.has(match.file)) prefixes.set(match.file, unquote(prefix));
+    }
+    for (const match of matches) {
+      const method = match.single.M;
+      const pathLike = match.single.P;
+      if (!method || !pathLike || !methodRe.test(method)) continue;
+      const prefix = prefixes.get(match.file);
+      let raw = prefix !== undefined && prefix !== "" ? joinRoute(prefix, unquote(pathLike)) : unquote(pathLike);
+      if (rule.mountRoot && !raw.startsWith("/")) raw = "/" + raw.replace(/^\/+/, "");
+      const verbInPath = VERB_IN_PATH.exec(raw);
+      let verbOverride: string | undefined;
+      if (verbInPath) {
+        verbOverride = verbInPath[1]!.toUpperCase();
+        raw = verbInPath[2]!;
+      }
+      if (!PATH_TOKEN_RE.test(raw) && !PLACEHOLDER_ONLY.test(raw)) continue;
+      let httpMethod: string;
+      if (rule.verbFrom) {
+        const verb = match.single[rule.verbFrom];
+        if (!verb || !HTTP_VERB_RE.test(verb)) continue;
+        httpMethod = verb.toUpperCase();
+      } else {
+        httpMethod = verbOverride ?? deriveVerb(method);
+      }
+      const norm = normalizeLiteral(raw, "path");
+      const label = `${httpMethod} ${norm}`;
+      const enclosing = resolveEnclosing(match.file, match.line);
+      out.push({
+        id: label,
+        kind: rule.kind,
+        label,
+        nodeId: enclosing ?? `file:${match.file}`,
+        file: match.file,
+        line: match.line,
+        ...(rule.implicit ? { implicit: true } : {}),
+      });
+    }
+  }
+  return dedupeAnchors(out);
+};
+
+interface AnchorScanGroup {
+  rule: AnchorRule;
+  prefixIds: string[];
+  matchIds: string[];
+}
+
+export interface AnchorScanPlan {
+  rules: ScanRule[];
+  groups: AnchorScanGroup[];
+}
+
+export const anchorScanPlan = (files: string[], pack: AnchorRule[] = DEFAULT_PACK): AnchorScanPlan => {
+  const byLang = groupByLang(files);
+  const rules: ScanRule[] = [];
+  const groups: AnchorScanGroup[] = [];
+  let ordinal = 0;
+  for (const rule of pack) {
+    for (const language of rule.langs) {
+      if (!byLang.get(language)?.length) continue;
+      const prefixIds: string[] = [];
+      const matchIds: string[] = [];
+      for (const pattern of rule.prefixPattern ?? []) {
+        const id = `fovea-anchor-prefix-${ordinal++}`;
+        prefixIds.push(id);
+        rules.push({ id, language, pattern: anonymousVariadics(pattern) });
+      }
+      for (const pattern of rule.patterns ?? [rule.pattern!]) {
+        const id = `fovea-anchor-match-${ordinal++}`;
+        matchIds.push(id);
+        rules.push({
+          id,
+          language,
+          pattern: anonymousVariadics(pattern),
+          constraints: { M: { regex: rule.methods } },
+        });
+      }
+      groups.push({ rule, prefixIds, matchIds });
+    }
+  }
+  return { rules, groups };
+};
+
+export const anchorsFromScan = (
+  matches: readonly ScanMatch[],
+  plan: AnchorScanPlan,
+  resolveEnclosing: (file: string, line: number) => string | undefined,
+): AnchorDraft[] => {
+  const byRule = new Map<string, ScanMatch[]>();
+  for (const match of matches) {
+    const bucket = byRule.get(match.ruleId);
+    if (bucket) bucket.push(match);
+    else byRule.set(match.ruleId, [match]);
+  }
+  const groups: AnchorMatchGroup[] = plan.groups.map(({ rule, prefixIds, matchIds }) => ({
+    rule,
+    prefixes: prefixIds.flatMap((id) => byRule.get(id) ?? []),
+    matches: matchIds.flatMap((id) => byRule.get(id) ?? []),
+  }));
+  return anchorsFromGroups(groups, resolveEnclosing);
+};
+
 export const extractAnchors = async (
   files: string[],
   cwd: string,
   resolveEnclosing: (file: string, line: number) => string | undefined,
   pack: AnchorRule[] = DEFAULT_PACK,
 ): Promise<AnchorDraft[]> => {
+  const plan = anchorScanPlan(files, pack);
+  const scanned = await scanRules(plan.rules, files, cwd);
+  if (scanned !== undefined) return anchorsFromScan(scanned, plan, resolveEnclosing);
+
   const byLang = groupByLang(files);
-  const out: AnchorDraft[] = [];
+  const groups: AnchorMatchGroup[] = [];
   for (const rule of pack) {
-    const methodRe = compileMethods(rule.methods);
-    for (const lang of rule.langs) {
-      const langFiles = byLang.get(lang);
+    for (const language of rule.langs) {
+      const langFiles = byLang.get(language);
       if (!langFiles?.length) continue;
-      const prefixes = new Map<string, string>(); // file -> class-level path prefix
-      if (rule.prefixPattern?.length) {
-        for (const pm of await patternRunAll(rule.prefixPattern, lang, langFiles, cwd)) {
-          const p = pm.single.P?.trim();
-          if (p !== undefined && !prefixes.has(pm.file)) prefixes.set(pm.file, unquote(p));
-        }
-      }
-      const matchSets = await patternRunAll(rule.patterns ?? [rule.pattern!], lang, langFiles, cwd);
-      for (const m of matchSets) {
-        const method = m.single.M;
-        const pathLike = m.single.P;
-        if (!method || !pathLike || !methodRe.test(method)) continue;
-        const prefix = prefixes.get(m.file);
-        let raw = prefix !== undefined && prefix !== "" ? joinRoute(prefix, unquote(pathLike)) : unquote(pathLike);
-        if (rule.mountRoot && !raw.startsWith("/")) raw = "/" + raw.replace(/^\/+/, "");
-        // Verb embedded in the path string (Go 1.22 mux, Starlette Route).
-        const vip = VERB_IN_PATH.exec(raw);
-        let verbOverride: string | undefined;
-        if (vip) {
-          verbOverride = vip[1]!.toUpperCase();
-          raw = vip[2]!;
-        }
-        // $R.$M(...) also matches Map.get("key")-style data access; only real
-        // paths (or router-relative placeholders like ":id", "[id]") anchor.
-        if (!PATH_TOKEN_RE.test(raw) && !PLACEHOLDER_ONLY.test(raw)) continue;
-        let httpMethod: string;
-        if (rule.verbFrom) {
-          const v = m.single[rule.verbFrom];
-          if (!v || !HTTP_VERB_RE.test(v)) continue;
-          httpMethod = v.toUpperCase();
-        } else {
-          httpMethod = verbOverride ?? deriveVerb(method);
-        }
-        const norm = normalizeLiteral(raw, "path");
-        const label = `${httpMethod} ${norm}`;
-        const enclosing = resolveEnclosing(m.file, m.line);
-        out.push({
-          id: label,
-          kind: rule.kind,
-          label,
-          nodeId: enclosing ?? `file:${m.file}`,
-          file: m.file,
-          line: m.line,
-          ...(rule.implicit ? { implicit: true } : {}),
-        });
-      }
+      const prefixes = rule.prefixPattern?.length
+        ? await patternRunAll(rule.prefixPattern, language, langFiles, cwd)
+        : [];
+      const matches = await patternRunAll(rule.patterns ?? [rule.pattern!], language, langFiles, cwd);
+      groups.push({ rule, prefixes, matches });
     }
   }
-  // Dedupe identical anchors at the same site (overlapping rules).
-  const seen = new Set<string>();
-  return out.filter((a) => {
-    const k = `${a.id}|${a.file}|${a.line}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
+  return anchorsFromGroups(groups, resolveEnclosing);
 };
 
 // Frameworks where the route *is* the file path (no route string exists in

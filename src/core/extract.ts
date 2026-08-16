@@ -6,13 +6,17 @@
 // bounded hash-time prefetches are reused; overflow files are read lazily.
 
 import {
+  anonymousVariadics,
   groupByLang,
   isConfigFile,
   outline,
   outlineStructured,
   patternRunAll,
+  type AgMatch,
   type OutlineFile,
   type OutlineSymbol,
+  type ScanMatch,
+  type ScanRule,
 } from "./astgrep.js";
 import { mapLimit } from "./asyncutil.js";
 import { makeFileSource, type FileSource } from "./source.js";
@@ -305,28 +309,31 @@ const IMPORT_PATTERNS: Record<string, string[]> = {
 IMPORT_PATTERNS.JavaScript = IMPORT_PATTERNS.TypeScript!;
 IMPORT_PATTERNS.Tsx = IMPORT_PATTERNS.TypeScript!;
 
-export const extractImports = async (files: string[], cwd: string): Promise<ImportSite[]> => {
-  const perLang = await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
-    const local: ImportSite[] = [];
-    const matches = await patternRunAll(IMPORT_PATTERNS[lang] ?? [], lang, langFiles, cwd);
-    for (const m of matches) {
-      const spec = m.single.M;
-      if (spec) {
-        local.push({ file: m.file, spec, line: m.line });
-        continue;
-      }
-      // Go import block: pull quoted specs out of the captured block text.
-      for (const blockText of [m.text, ...(m.multi.S ?? [])]) {
-        for (const sm of blockText.matchAll(/"([^"\n]+)"/g)) {
-          local.push({ file: m.file, spec: sm[1]!, line: m.line });
-        }
+const importsFromMatches = (matches: readonly AgMatch[]): ImportSite[] => {
+  const out: ImportSite[] = [];
+  for (const m of matches) {
+    const spec = m.single.M;
+    if (spec) {
+      out.push({ file: m.file, spec, line: m.line });
+      continue;
+    }
+    // Go import block: pull quoted specs out of the captured block text.
+    for (const blockText of [m.text, ...(m.multi.S ?? [])]) {
+      for (const sm of blockText.matchAll(/"([^"\n]+)"/g)) {
+        out.push({ file: m.file, spec: sm[1]!, line: m.line });
       }
     }
-    return local;
-  }));
-  const out: ImportSite[] = [];
-  for (const local of perLang) pushAll(out, local);
+  }
   return dedupe(out, (i) => `${i.file}|${i.spec}|${i.line}`);
+};
+
+export const extractImports = async (files: string[], cwd: string): Promise<ImportSite[]> => {
+  const perLang = await Promise.all([...groupByLang(files)].map(([lang, langFiles]) =>
+    patternRunAll(IMPORT_PATTERNS[lang] ?? [], lang, langFiles, cwd),
+  ));
+  const matches: AgMatch[] = [];
+  for (const local of perLang) pushAll(matches, local);
+  return importsFromMatches(matches);
 };
 
 const CALL_PATTERNS = ["$O.$M($$$A)", "$F($$$A)"];
@@ -359,28 +366,32 @@ const CALL_WARDS = new Set([
   "unwrap", "expect", "clone", "into", "from", "collect", "iter", "eprintln",
   "format", "vec", "assert", "asserteq", "assertne", "dbg",
 ]);
+const CALL_WARD_PATTERN = `^(?i:${[...CALL_WARDS].join("|")})$`;
 
 const isTestFile = (file: string): boolean =>
   /(^|\/)(test_|conftest)|\.(test|spec)\.[tj]sx?$|_test\.go$/.test(file);
 
 export { isTestFile };
 
-export const extractCalls = async (files: string[], cwd: string): Promise<CallSite[]> => {
-  const perLang = await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
-    const local: CallSite[] = [];
-    const matches = await patternRunAll(CALL_PATTERNS, lang, langFiles, cwd);
-    for (const m of matches) {
-      const callee = m.single.M ?? m.single.F;
-      if (!callee) continue;
-      const name = callee.trim();
-      if (CALL_WARDS.has(name.toLowerCase())) continue;
-      local.push({ file: m.file, line: m.line, callee: name });
-    }
-    return local;
-  }));
+const callsFromMatches = (matches: readonly AgMatch[]): CallSite[] => {
   const out: CallSite[] = [];
-  for (const local of perLang) pushAll(out, local);
-  return out.filter((c) => c.callee && c.callee.length > 1);
+  for (const m of matches) {
+    const callee = m.single.M ?? m.single.F;
+    if (!callee) continue;
+    const name = callee.trim();
+    if (CALL_WARDS.has(name.toLowerCase())) continue;
+    if (name.length > 1) out.push({ file: m.file, line: m.line, callee: name });
+  }
+  return out;
+};
+
+export const extractCalls = async (files: string[], cwd: string): Promise<CallSite[]> => {
+  const perLang = await Promise.all([...groupByLang(files)].map(([lang, langFiles]) =>
+    patternRunAll(CALL_PATTERNS, lang, langFiles, cwd),
+  ));
+  const matches: AgMatch[] = [];
+  for (const local of perLang) pushAll(matches, local);
+  return callsFromMatches(matches);
 };
 
 const STRING_PATTERNS: Record<string, string[]> = {
@@ -447,18 +458,21 @@ const stripQuotes = (text: string): string => {
   return "";
 };
 
-export const extractLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
-  const perLang = await Promise.all([...groupByLang(files)].map(async ([lang, langFiles]) => {
-    const local: LiteralSite[] = [];
-    const matches = await patternRunAll(STRING_PATTERNS[lang] ?? [], lang, langFiles, cwd);
-    for (const m of matches) {
-      const t = stripQuotes(m.text);
-      if (t) local.push({ file: m.file, line: m.line, text: t });
-    }
-    return local;
-  }));
+const literalsFromMatches = (matches: readonly AgMatch[]): LiteralSite[] => {
   const out: LiteralSite[] = [];
-  for (const local of perLang) pushAll(out, local);
+  for (const m of matches) {
+    const text = stripQuotes(m.text);
+    if (text) out.push({ file: m.file, line: m.line, text });
+  }
+  return out;
+};
+
+const completeLiterals = async (
+  files: string[],
+  cwd: string,
+  source: FileSource,
+  out: LiteralSite[],
+): Promise<LiteralSite[]> => {
   pushAll(out, await extractConfigLiterals(files, cwd, source));
   const codeFiles = files.filter((f) => !isConfigFile(f));
   const templateSites = await mapLimit(codeFiles, SOURCE_SCAN_CONCURRENCY, async (f) => {
@@ -468,14 +482,81 @@ export const extractLiterals = async (files: string[], cwd: string, source: File
     src.split("\n").forEach((lineText, i) => {
       TEMPLATE_RE.lastIndex = 0;
       for (let m; (m = TEMPLATE_RE.exec(lineText)); ) {
-        const t = m[1]!.trim();
-        if (t.length >= 2) local.push({ file: f, line: i + 1, text: t });
+        const text = m[1]!.trim();
+        if (text.length >= 2) local.push({ file: f, line: i + 1, text });
       }
     });
     return local;
   });
   for (const local of templateSites) pushAll(out, local);
-  return dedupe(out, (l) => `${l.file}|${l.line}|${l.text}`);
+  return dedupe(out, (literal) => `${literal.file}|${literal.line}|${literal.text}`);
+};
+
+export const extractLiterals = async (files: string[], cwd: string, source: FileSource = defaultSource(cwd)): Promise<LiteralSite[]> => {
+  const perLang = await Promise.all([...groupByLang(files)].map(([lang, langFiles]) =>
+    patternRunAll(STRING_PATTERNS[lang] ?? [], lang, langFiles, cwd),
+  ));
+  const matches: AgMatch[] = [];
+  for (const local of perLang) pushAll(matches, local);
+  return completeLiterals(files, cwd, source, literalsFromMatches(matches));
+};
+
+const CORE_IMPORT_PREFIX = "fovea-core-import-";
+const CORE_CALL_PREFIX = "fovea-core-call-";
+const CORE_LITERAL_PREFIX = "fovea-core-literal-";
+
+export const coreScanRules = (files: string[]): ScanRule[] => {
+  const rules: ScanRule[] = [];
+  let ordinal = 0;
+  const add = (
+    prefix: string,
+    language: string,
+    pattern: string,
+    constraints?: ScanRule["constraints"],
+  ): void => {
+    rules.push({
+      id: `${prefix}${ordinal++}`,
+      language,
+      pattern: anonymousVariadics(pattern),
+      ...(constraints ? { constraints } : {}),
+    });
+  };
+  for (const [language] of groupByLang(files)) {
+    for (const pattern of IMPORT_PATTERNS[language] ?? []) add(CORE_IMPORT_PREFIX, language, pattern);
+    for (const pattern of CALL_PATTERNS) {
+      const metavar = pattern.startsWith("$O.") ? "M" : "F";
+      add(CORE_CALL_PREFIX, language, pattern, { [metavar]: { not: { regex: CALL_WARD_PATTERN } } });
+    }
+    for (const pattern of STRING_PATTERNS[language] ?? []) add(CORE_LITERAL_PREFIX, language, pattern);
+  }
+  return rules;
+};
+
+export interface ScannedCoreFacts {
+  imports: ImportSite[];
+  calls: CallSite[];
+  literals: LiteralSite[];
+}
+
+export const coreFactsFromScan = async (
+  files: string[],
+  cwd: string,
+  source: FileSource,
+  matches: readonly ScanMatch[],
+): Promise<ScannedCoreFacts> => {
+  const imports: ScanMatch[] = [];
+  const calls: ScanMatch[] = [];
+  const literals: ScanMatch[] = [];
+  for (const match of matches) {
+    if (match.ruleId.startsWith(CORE_IMPORT_PREFIX)) imports.push(match);
+    else if (match.ruleId.startsWith(CORE_CALL_PREFIX)) calls.push(match);
+    else if (match.ruleId.startsWith(CORE_LITERAL_PREFIX)) literals.push(match);
+  }
+  return {
+    imports: importsFromMatches(imports),
+    calls: callsFromMatches(calls),
+    literals: await completeLiterals(files, cwd, source, literalsFromMatches(literals)),
+  };
 };
 
 // Spread-pushing big arrays overflows the argument-list limit on large repos.

@@ -5,8 +5,11 @@
 // SPAWN_CONCURRENCY processes instead of serializing spawnSync behind the
 // TUI's event loop; the loop never stalls waiting on a child process.
 
-import { execFile, spawnSync } from "node:child_process";
-import { SPAWN_CONCURRENCY, mapLimit, spawnGate } from "./asyncutil.js";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SPAWN_CONCURRENCY, envInt, mapLimit, spawnGate } from "./asyncutil.js";
 
 export const LANG_BY_EXT: Record<string, string> = {
   ts: "TypeScript", tsx: "Tsx", mts: "TypeScript", cts: "TypeScript",
@@ -44,6 +47,27 @@ export interface AgMatch {
   single: Record<string, string>;  // $VAR -> text (single metavars)
   multi: Record<string, string[]>; // $$$VAR -> texts
 }
+
+interface ScanConstraint {
+  regex?: string;
+  not?: ScanConstraint;
+  all?: ScanConstraint[];
+}
+
+export interface ScanRule {
+  id: string;
+  language: string;
+  pattern: string;
+  constraints?: Record<string, ScanConstraint>;
+}
+
+export interface ScanMatch extends AgMatch {
+  ruleId: string;
+}
+
+/** Drop redundant named variadic captures while preserving matching and match text. */
+export const anonymousVariadics = (pattern: string): string =>
+  pattern.replace(/\$\$\$[A-Za-z_][A-Za-z0-9_]*/g, () => "$$$");
 
 const binary = (): string => process.env.FOVEA_AST_GREP ?? "ast-grep";
 
@@ -86,8 +110,9 @@ export const hasAstGrepAsync = (): Promise<boolean> => {
 };
 
 // Import-file argument lists on Windows cap around 8k chars; keep chunks
-// conservative. Chunk count = ceil(files / CHUNK) per stage invocation.
-const CHUNK = 160;
+// conservative. Extraction batches align to this boundary so each consolidated
+// scan normally pays one process.
+export const AST_GREP_CHUNK = envInt("FOVEA_AST_GREP_CHUNK", 160, 32, 2048);
 
 // Extraction honesty ledger: a failed ast-grep invocation implicates every
 // file in its chunk. build.ts drains this once per fact pass and folds it
@@ -121,7 +146,7 @@ const run = async (args: string[], cwd: string): Promise<RunResult> =>
           (error, stdout, stderr) => {
             // A maxBuffer breach is a memory guard, not an extraction error:
             // rerun smaller chunks until each response fits the same ceiling.
-            if (error && error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+            if (error && (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || error.code === "E2BIG")) {
               resolve({ ok: false, stdout: "", split: true });
               return;
             }
@@ -203,7 +228,7 @@ const runChunked = async (
   cwd: string,
 ): Promise<Array<{ chunk: string[]; result: RunResult }>> => {
   const chunks: string[][] = [];
-  for (let i = 0; i < files.length; i += CHUNK) chunks.push(files.slice(i, i + CHUNK));
+  for (let i = 0; i < files.length; i += AST_GREP_CHUNK) chunks.push(files.slice(i, i + AST_GREP_CHUNK));
   const adaptive = async (chunk: string[]): Promise<Array<{ chunk: string[]; result: RunResult }>> => {
     const result = await run(chunkArgs(chunk), cwd);
     if (!result.split || chunk.length === 1) return [{ chunk, result }];
@@ -267,6 +292,148 @@ interface RawMatch {
   };
 }
 
+interface RawScanMatch extends RawMatch { ruleId: string }
+
+const fromRawMatch = (m: RawMatch): AgMatch => {
+  const single: Record<string, string> = {};
+  const multi: Record<string, string[]> = {};
+  for (const [key, value] of Object.entries(m.metaVariables?.single ?? {})) single[key] = value.text;
+  for (const [key, value] of Object.entries(m.metaVariables?.multi ?? {})) multi[key] = value.map((item) => item.text);
+  return { file: m.file, line: m.range.start.line + 1, text: m.text, single, multi };
+};
+
+const scanSupport = new Map<string, { ok: boolean; at: number }>();
+const scanSupportInflight = new Map<string, Promise<boolean>>();
+
+const hasRuleScan = (): Promise<boolean> => {
+  const bin = binary();
+  const hit = scanSupport.get(bin);
+  if (hit && (hit.ok || Date.now() - hit.at < FAILURE_TTL_MS)) return Promise.resolve(hit.ok);
+  const pending = scanSupportInflight.get(bin);
+  if (pending) return pending;
+  const probe = spawnGate.run(
+    () => new Promise<boolean>((resolve) => {
+      execFile(bin, ["scan", "--help"], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 }, (error) => {
+        resolve(!error);
+      });
+    }),
+  ).then((ok) => {
+    scanSupport.set(bin, { ok, at: Date.now() });
+    return ok;
+  }).finally(() => scanSupportInflight.delete(bin));
+  scanSupportInflight.set(bin, probe);
+  return probe;
+};
+
+const scanRuleFiles = new Map<string, Promise<string>>();
+
+const materializeRuleFile = (rules: readonly ScanRule[]): Promise<string> => {
+  const key = JSON.stringify(rules);
+  const hit = scanRuleFiles.get(key);
+  if (hit) return hit;
+  const pending = (async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-fovea-scan-"));
+    const documents = rules.map(({ id, language, pattern, constraints }) => JSON.stringify({
+      id,
+      language,
+      rule: { pattern },
+      ...(constraints ? { constraints } : {}),
+    }));
+    const rulePath = join(root, "rules.yml");
+    await writeFile(rulePath, documents.join("\n---\n"));
+    return rulePath;
+  })();
+  scanRuleFiles.set(key, pending);
+  return pending;
+};
+
+const scanChunk = (
+  rulePath: string,
+  files: string[],
+  cwd: string,
+): Promise<ScanMatch[] | undefined> => spawnGate.run(
+  () => new Promise<ScanMatch[] | undefined>((resolve) => {
+    const child = spawn(
+      binary(),
+      ["scan", "--rule", rulePath, "--json=stream", ...files],
+      { cwd, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const matches: ScanMatch[] = [];
+    let carry = "";
+    let parseFailed = false;
+    let timedOut = false;
+    let settled = false;
+    const finish = (value: ScanMatch[] | undefined): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const accept = (line: string): void => {
+      if (!line || parseFailed) return;
+      try {
+        const raw = JSON.parse(line) as RawScanMatch;
+        if (!raw.ruleId || !raw.range?.start || typeof raw.file !== "string") {
+          parseFailed = true;
+          return;
+        }
+        matches.push({ ...fromRawMatch(raw), ruleId: raw.ruleId });
+      } catch {
+        parseFailed = true;
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      const lines = (carry + chunk).split("\n");
+      carry = lines.pop() ?? "";
+      for (const line of lines) accept(line);
+    });
+    child.stderr.resume();
+    child.on("error", () => finish(undefined));
+    child.on("close", (code) => {
+      if (carry.trim()) accept(carry);
+      finish(code === 0 && !timedOut && !parseFailed ? matches : undefined);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, RUN_TIMEOUT);
+    timer.unref?.();
+  }),
+);
+
+/**
+ * Run a mixed-language rule set in one ast-grep parse per file chunk.
+ * Undefined means the optimized interface was unavailable or failed; callers
+ * then use the legacy per-pattern path, preserving compatibility and partial
+ * extraction behavior for malformed repository rules.
+ */
+export const scanRules = async (
+  rules: readonly ScanRule[],
+  files: string[],
+  cwd: string,
+): Promise<ScanMatch[] | undefined> => {
+  if (!rules.length || !files.length) return [];
+  if (!(await hasRuleScan())) return undefined;
+  let rulePath: string;
+  try {
+    rulePath = await materializeRuleFile(rules);
+  } catch {
+    return undefined;
+  }
+  const chunks: string[][] = [];
+  for (let i = 0; i < files.length; i += AST_GREP_CHUNK) {
+    chunks.push(files.slice(i, i + AST_GREP_CHUNK));
+  }
+  const settled = await mapLimit(chunks, SPAWN_CONCURRENCY, (chunk) =>
+    scanChunk(rulePath, chunk, cwd),
+  );
+  if (settled.some((matches) => matches === undefined)) return undefined;
+  const out: ScanMatch[] = [];
+  for (const matches of settled) for (const match of matches!) out.push(match);
+  return out;
+};
+
 // `ast-grep run --pattern` with JSON output for a set of files of one language.
 const patternRun = async (
   pattern: string,
@@ -297,13 +464,7 @@ const patternRun = async (
       recordFailure("run", chunk, lang);
       continue;
     }
-    for (const m of parsed) {
-      const single: Record<string, string> = {};
-      const multi: Record<string, string[]> = {};
-      for (const [k, v] of Object.entries(m.metaVariables?.single ?? {})) single[k] = v.text;
-      for (const [k, v] of Object.entries(m.metaVariables?.multi ?? {})) multi[k] = v.map((x) => x.text);
-      out.push({ file: m.file, line: m.range.start.line + 1, text: m.text, single, multi });
-    }
+    for (const m of parsed) out.push(fromRawMatch(m));
   }
   return out;
 };

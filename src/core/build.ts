@@ -19,12 +19,33 @@ import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promis
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { dirname, join as joinPath } from "node:path";
-import { IO_CONCURRENCY, envInt, mapLimit, yieldToLoop } from "./asyncutil.js";
+import { IO_CONCURRENCY, SPAWN_CONCURRENCY, envInt, mapLimit, yieldToLoop } from "./asyncutil.js";
 import { gitOut } from "./git.js";
-import { LANG_BY_EXT, drainExtractionFailures, isBinaryExt, isConfigFile, langOf } from "./astgrep.js";
-import { extractCalls, extractImports, extractLiterals, extractSymbols } from "./extract.js";
+import {
+  AST_GREP_CHUNK,
+  LANG_BY_EXT,
+  drainExtractionFailures,
+  isBinaryExt,
+  isConfigFile,
+  langOf,
+  scanRules,
+} from "./astgrep.js";
+import {
+  coreFactsFromScan,
+  coreScanRules,
+  extractCalls,
+  extractImports,
+  extractLiterals,
+  extractSymbols,
+} from "./extract.js";
 import { assembleGraphWithIndex as assembleGraph } from "./graph.js";
-import { extractAnchors, extractFileRoutes, loadRepoRules } from "./anchors.js";
+import {
+  anchorScanPlan,
+  anchorsFromScan,
+  extractAnchors,
+  extractFileRoutes,
+  loadRepoRules,
+} from "./anchors.js";
 import { aggregateFiles, harvestFile, promote, type FileSigs } from "./discover.js";
 import { makeFileSource } from "./source.js";
 import type { CallSite, Graph, ImportSite, LiteralSite, SymbolRec } from "./types.js";
@@ -285,6 +306,24 @@ const newFactStore = (root: string): FactStore => ({
   savedAt: 0,
 });
 
+const emptyFileFacts = (sha1: string): FileFacts => ({
+  sha1,
+  symbols: [],
+  imports: [],
+  calls: [],
+  literals: [],
+  anchors: [],
+});
+
+const pendingFileFacts = (file: string, sha1: string, text: string): FileFacts => {
+  const facts = emptyFileFacts(sha1);
+  const language = langOf(file);
+  if (!language) return facts;
+  const sigs = harvestFile(language, text);
+  if (Object.keys(sigs).length) facts.sigs = sigs;
+  return facts;
+};
+
 interface CacheHeader { fovea: number; root: string; rulesSha: string; enrolled?: string[] }
 interface CacheLine {
   file: string;
@@ -449,12 +488,12 @@ const persistFactsSoon = (store: FactStore, minGapMs = 1500): void => {
 };
 
 /**
- * Run all extraction stages for a batch of files, replacing their records in
- * the store. Stages are concurrent (they write disjoint fields); subprocess
- * concurrency stays bounded by the spawn gate. Taint is tracked per file so
- * partial facts from failed passes never reach disk; only hash/stat markers do.
+ * Replace dirty records through independent, bounded batches. Each batch runs
+ * symbols, one consolidated rule scan, and file routes concurrently; the global
+ * spawn gate bounds work across batches. Failed fallback stages still taint their
+ * files, so partial live facts never reach disk.
  */
-const EXTRACTION_BATCH = 64;
+const EXTRACTION_BATCH = AST_GREP_CHUNK;
 
 const extractInto = async (
   root: string,
@@ -473,20 +512,58 @@ const extractInto = async (
     }
   };
 
+  const batches: string[][] = [];
   for (let start = 0; start < files.length; start += EXTRACTION_BATCH) {
-    const batch = files.slice(start, start + EXTRACTION_BATCH);
+    batches.push(files.slice(start, start + EXTRACTION_BATCH));
+  }
+  const extracted = await mapLimit(batches, SPAWN_CONCURRENCY, async (batch) => {
     const code = batch.filter((f) => !isConfigFile(f));
-    const [symbols, imports, calls, literals] = await Promise.all([
+    const anchorPlan = anchorScanPlan(code, packRules.pack);
+    const rules = [...coreScanRules(code), ...anchorPlan.rules];
+    const [symbols, scanned, fileRouteAnchors] = await Promise.all([
       extractSymbols(code, root, source),
-      extractImports(code, root),
-      extractCalls(code, root),
-      extractLiterals(batch, root, source),
+      scanRules(rules, code, root),
+      extractFileRoutes(code, root, packRules.fileRoutes, source),
     ]);
+    const symsByFile = new Map<string, SymbolRec[]>();
+    for (const rel of code) symsByFile.set(rel, []);
+    for (const symbol of symbols) symsByFile.get(symbol.file)?.push(symbol);
+    const enclosingId = (file: string, line: number): string | undefined => {
+      const syms = symsByFile.get(file) ?? [];
+      let best: SymbolRec | undefined;
+      for (const symbol of syms) {
+        if (symbol.line <= line && (!best || symbol.line > best.line)) best = symbol;
+      }
+      return best ? `${best.name}@${best.file}` : `file:${file}`;
+    };
 
+    let imports: ImportSite[];
+    let calls: CallSite[];
+    let literals: LiteralSite[];
+    let anchors: AnchorDraft[];
+    if (scanned !== undefined) {
+      const core = await coreFactsFromScan(batch, root, source, scanned);
+      imports = core.imports;
+      calls = core.calls;
+      literals = core.literals;
+      anchors = anchorsFromScan(scanned, anchorPlan, enclosingId);
+    } else {
+      [imports, calls, literals, anchors] = await Promise.all([
+        extractImports(code, root),
+        extractCalls(code, root),
+        extractLiterals(batch, root, source),
+        extractAnchors(code, root, enclosingId, packRules.pack),
+      ]);
+    }
+
+    return { batch, symbols, imports, calls, literals, anchors, fileRouteAnchors };
+  });
+
+  for (const result of extracted) {
     // Replace records immutably: a baseline snapshot holding the previous
     // object must keep seeing the previous generation. The caller seeded each
     // dirty record with the content hash — carry it forward untouched.
-    for (const f of batch) {
+    for (const f of result.batch) {
       const prev = store.facts.get(f);
       store.facts.set(f, {
         sha1: prev?.sha1 ?? "",
@@ -495,24 +572,15 @@ const extractInto = async (
         calls: [],
         literals: [],
         anchors: [],
+        ...(prev?.sigs ? { sigs: prev.sigs } : {}),
       });
     }
-    putByFile(symbols, (f) => f.symbols);
-    putByFile(imports, (f) => f.imports);
-    putByFile(calls, (f) => f.calls);
-    putByFile(literals, (f) => f.literals);
-
-    // Tier-3 harvest: regex histogram, cheap and CPU-only.
-    for (const f of code) {
-      const lang = langOf(f);
-      if (!lang) continue;
-      const text = contents.get(f) ?? (await source.read(f));
-      if (text === undefined) continue;
-      const sigs = harvestFile(lang, text);
-      if (Object.keys(sigs).length) store.facts.get(f)!.sigs = sigs;
-    }
-
-    await runAnchorPass(root, store, batch, packRules, source);
+    putByFile(result.symbols, (f) => f.symbols);
+    putByFile(result.imports, (f) => f.imports);
+    putByFile(result.calls, (f) => f.calls);
+    putByFile(result.literals, (f) => f.literals);
+    putByFile(result.anchors, (f) => f.anchors);
+    putByFile(result.fileRouteAnchors, (f) => f.anchors);
     await yieldToLoop();
   }
 };
@@ -524,68 +592,76 @@ const runAnchorPass = async (
   packRules: { pack: Awaited<ReturnType<typeof loadRepoRules>>["pack"]; fileRoutes: Awaited<ReturnType<typeof loadRepoRules>>["fileRoutes"] },
   source = makeFileSource(root),
 ): Promise<void> => {
+  const batches: string[][] = [];
   for (let start = 0; start < files.length; start += EXTRACTION_BATCH) {
-    const anchorFiles = files.slice(start, start + EXTRACTION_BATCH).filter((f) => !isConfigFile(f));
-    if (!anchorFiles.length) continue;
+    const batch = files.slice(start, start + EXTRACTION_BATCH).filter((file) => !isConfigFile(file));
+    if (batch.length) batches.push(batch);
+  }
+  const extracted = await mapLimit(batches, SPAWN_CONCURRENCY, async (anchorFiles) => {
     const symsByFile = new Map<string, SymbolRec[]>();
     for (const rel of anchorFiles) symsByFile.set(rel, store.facts.get(rel)?.symbols ?? []);
     const enclosingId = (file: string, line: number): string | undefined => {
       const syms = symsByFile.get(file) ?? [];
       let best: SymbolRec | undefined;
-      for (const s of syms) if (s.line <= line && (!best || s.line > best.line)) best = s;
+      for (const symbol of syms) {
+        if (symbol.line <= line && (!best || symbol.line > best.line)) best = symbol;
+      }
       return best ? `${best.name}@${best.file}` : `file:${file}`;
     };
     const [anchors, fileRouteAnchors] = await Promise.all([
       extractAnchors(anchorFiles, root, enclosingId, packRules.pack),
       extractFileRoutes(anchorFiles, root, packRules.fileRoutes, source),
     ]);
-    for (const f of anchorFiles) {
-      const prev = store.facts.get(f);
-      if (prev && prev.anchors.length) store.facts.set(f, { ...prev, anchors: [] });
+    return { anchorFiles, anchors, fileRouteAnchors };
+  });
+
+  for (const result of extracted) {
+    for (const file of result.anchorFiles) {
+      const previous = store.facts.get(file);
+      if (previous?.anchors.length) store.facts.set(file, { ...previous, anchors: [] });
     }
-    for (const v of anchors) store.facts.get(v.file)?.anchors.push(v);
-    for (const v of fileRouteAnchors) store.facts.get(v.file)?.anchors.push(v);
+    for (const anchor of result.anchors) store.facts.get(anchor.file)?.anchors.push(anchor);
+    for (const anchor of result.fileRouteAnchors) store.facts.get(anchor.file)?.anchors.push(anchor);
     await yieldToLoop();
   }
 };
 
-/**
- * Re-derive the implicit (tier-3 discovered) rule set for the current sigs
- * and re-anchor exactly what the pack left stale. Anchors extract under the
- * BASE pack during a fact pass because tier-3 promotions depend on sigs
- * harvested mid-pass, so a pass leaves its dirty batch only base-anchored.
- * The re-pass scope is therefore:
- *  - the full code-file set only when the discovered pack actually changed
- *    (previous anchors carry a different rulesSha — fresh builds included,
- *    where the stored sha is ""), and
- *  - just the dirty batch when the pack is unchanged but synthesizes implicit
- *    rules the fact pass did not apply to them. Previously EVERY dirty refresh
- *    re-ran ast-grep anchor extraction over every code file, which dominated
- *    drift refreshes on repos with discovered rules.
- */
-const applyRulePack = async (
+type ActiveRulePack = Awaited<ReturnType<typeof loadRepoRules>> & { previousSha: string };
+
+/** Resolve discovered rules before AST extraction so dirty files anchor once. */
+const resolveRulePack = (
+  store: FactStore,
+  base: Awaited<ReturnType<typeof loadRepoRules>>,
+): ActiveRulePack => {
+  const sigsByFile: Record<string, FileSigs | undefined> = {};
+  for (const [file, facts] of store.facts) sigsByFile[file] = facts.sigs;
+  const implicitRules = promote(aggregateFiles(sigsByFile), base.pack);
+  const pack = implicitRules.length ? [...base.pack, ...implicitRules] : base.pack;
+  const sha = implicitRules.length
+    ? createHash("sha1").update(base.sha).update(JSON.stringify(implicitRules.map((rule) => rule.id).sort())).digest("hex")
+    : base.sha;
+  const previousSha = store.rulesSha;
+  store.rulesSha = sha;
+  return { pack, fileRoutes: base.fileRoutes, sha, previousSha };
+};
+
+/** Re-anchor only unchanged records left stale when the active pack moves. */
+const reanchorStaleClean = async (
   root: string,
   store: FactStore,
   files: string[],
-  dirty: string[],
+  dirty: readonly string[],
+  active: ActiveRulePack,
 ): Promise<void> => {
-  const base = await loadRepoRules(root);
-  const sigsByFile: Record<string, FileSigs | undefined> = {};
-  for (const [f, rec] of store.facts) sigsByFile[f] = rec.sigs;
-  const implicitRules = promote(aggregateFiles(sigsByFile), base.pack);
-  const pack = implicitRules.length ? [...base.pack, ...implicitRules] : base.pack;
-  const rulesSha = implicitRules.length
-    ? createHash("sha1").update(base.sha).update(JSON.stringify(implicitRules.map((r) => r.id).sort())).digest("hex")
-    : base.sha;
-  const prevSha = store.rulesSha;
-  store.rulesSha = rulesSha;
-  if (rulesSha !== prevSha) {
-    const codeFiles = files.filter((f) => !isConfigFile(f) && !store.generated.has(f) && store.facts.has(f));
-    await runAnchorPass(root, store, codeFiles, { pack, fileRoutes: base.fileRoutes });
-  } else if (rulesSha !== base.sha && dirty.length) {
-    const dirtyCode = dirty.filter((f) => !isConfigFile(f) && !store.generated.has(f) && store.facts.has(f));
-    await runAnchorPass(root, store, dirtyCode, { pack, fileRoutes: base.fileRoutes });
-  }
+  if (active.sha === active.previousSha) return;
+  const dirtySet = new Set(dirty);
+  const stale = files.filter((file) =>
+    !dirtySet.has(file) &&
+    !isConfigFile(file) &&
+    !store.generated.has(file) &&
+    store.facts.has(file),
+  );
+  if (stale.length) await runAnchorPass(root, store, stale, active);
 };
 
 /** Drain the failure ledger into this store's taint set for the given batch. */
@@ -600,9 +676,9 @@ const settleTaint = (store: FactStore, batch: ReadonlySet<string>): void => {
   }
 };
 
-// Additive-only contract: a fact pass drains the global ledger twice (stage
-// pass, then the anchor re-pass). Clearing batch taint belongs ONCE, before
-// re-extraction starts; a mid-pass clear would wipe earlier drains.
+// Additive-only contract: a fact pass can drain after dirty extraction and
+// again after stale-clean re-anchoring. Clear batch taint only once before work;
+// a mid-pass clear would wipe failures from the first drain.
 const clearTaint = (store: FactStore, batch: Iterable<string>): void => {
   for (const f of batch) {
     store.tainted.delete(f);
@@ -691,7 +767,7 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
       store.tainted.delete(rel);
       store.failedSha.delete(rel);
       store.meta.set(rel, meta);
-      store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+      store.facts.set(rel, emptyFileFacts(got.sha1));
       cacheDirty = true;
       return;
     }
@@ -712,19 +788,17 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
     dirty.push(rel);
     cacheDirty = true;
     store.meta.set(rel, meta);
-    store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+    store.facts.set(rel, pendingFileFacts(rel, got.sha1, got.text));
   });
 
-  const base = await loadRepoRules(root);
-  const rulesBefore = store.rulesSha;
+  const active = resolveRulePack(store, await loadRepoRules(root));
   clearTaint(store, dirty);
-  await extractInto(root, store, dirty, contents, { pack: base.pack, fileRoutes: base.fileRoutes });
+  await extractInto(root, store, dirty, contents, active);
   settleTaint(store, new Set(files));
-  await applyRulePack(root, store, files, dirty);
-  // Anchor extraction failures implicate their files too (drained inside settleTaint
-  // ran before applyRulePack; capture anchor-stage failures as a second drain).
+  await reanchorStaleClean(root, store, files, dirty, active);
+  // A pack move can re-anchor clean records after the dirty extraction drain.
   settleTaint(store, new Set(files));
-  if (store.rulesSha !== rulesBefore) cacheDirty = true;
+  if (active.sha !== active.previousSha) cacheDirty = true;
 
   for (const f of unreadable) {
     store.unreadable.add(f);
@@ -839,7 +913,7 @@ export const refreshFacts = async (
       store.generated.add(rel);
       store.tainted.delete(rel);
       store.failedSha.delete(rel);
-      store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+      store.facts.set(rel, emptyFileFacts(got.sha1));
       continue;
     }
     store.generated.delete(rel);
@@ -847,17 +921,15 @@ export const refreshFacts = async (
     const prev = store.facts.get(rel);
     if (prev && prev.sha1 === got.sha1 && !store.tainted.has(rel)) continue;
     dirty.push(rel);
-    store.facts.set(rel, { sha1: got.sha1, symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+    store.facts.set(rel, pendingFileFacts(rel, got.sha1, got.text));
   }
 
-  const base = await loadRepoRules(root);
+  const active = resolveRulePack(store, await loadRepoRules(root));
   clearTaint(store, dirty);
-  await extractInto(root, store, dirty, contents, { pack: base.pack, fileRoutes: base.fileRoutes });
+  await extractInto(root, store, dirty, contents, active);
   settleTaint(store, candidates);
-  // Dirty files had anchors extracted under the base pack; clean files kept
-  // the stored pack's. applyRulePack re-anchors exactly what that leaves stale.
-  await applyRulePack(root, store, files, dirty);
-  // A rules change can re-anchor clean files too; retain those failures.
+  await reanchorStaleClean(root, store, files, dirty, active);
+  // A pack move can re-anchor clean records after the dirty extraction drain.
   settleTaint(store, new Set(files));
 
   for (const f of unreadable) {
