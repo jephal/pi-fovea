@@ -9,7 +9,7 @@ import { join, posix } from "node:path";
 import { prFiles, uncommittedFiles } from "./git.js";
 import { chebyshevVectors, chooseOrder, heatField } from "./heat.js";
 import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine, type RevealedNode } from "./render.js";
-import { FOCUS_T0, getSession, TK_ORDER } from "./session.js";
+import { FOCUS_T0, getSession, observeSessionPaths, TK_ORDER } from "./session.js";
 import { detectBasins } from "./basins.js";
 import { classifyLiteral, normalizeLiteral } from "./join.js";
 import { isTestFile } from "./extract.js";
@@ -535,6 +535,7 @@ export const focus = async (
     overflowTo: overflowArtifact("focus", `${root}|${query}`),
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);
+  observeSessionPaths(root, fit.revealed.map((node) => node.file));
   return {
     text: fit.text,
     tokens: fit.tokens,
@@ -587,6 +588,7 @@ export const dwell = async (root: string, factor?: number, budget?: number): Pro
     overflowTo: overflowArtifact("dwell", root),
   });
   for (const id of fit.revealedIds) session.disclosed.add(id);
+  observeSessionPaths(root, fit.revealed.map((node) => node.file));
   return {
     text: fit.text,
     tokens: fit.tokens,

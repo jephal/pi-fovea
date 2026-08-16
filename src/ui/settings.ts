@@ -31,6 +31,7 @@ import {
   loadFoveaConfig,
   loadFoveaConfigForScope,
   SYNC_MODES,
+  SYNC_SCOPES,
   saveFoveaConfig,
   type FoveaConfig,
   type FoveaConfigScope,
@@ -270,6 +271,11 @@ const buildItems = (
     description:
       "enabled shows sync messages; hidden delivers them to the model without rendering them in the transcript; disabled turns sync off. FOVEA_TURN_SYNC=off overrides.",
     values: SYNC_MODES,
+  }),
+  setting("sync.scope", "Sync attention", config.sync.scope, {
+    description:
+      "session steers only for top-level directories/files this conversation entered; repository restores root-wide steering. Index coverage remains root-wide in both modes.",
+    values: SYNC_SCOPES,
   }),
   setting("sync.budget", "Sync budget", String(config.sync.budget), {
     description: "Max tokens for proactive repository steering sent to the model.",

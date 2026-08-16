@@ -12,7 +12,7 @@ import { hasAstGrep } from "../src/core/astgrep.js";
 import { listFiles, persistFacts, readEnrolledBoundaries } from "../src/core/build.js";
 import { ensureState, evictState } from "../src/core/ops.js";
 import { resetSyncBaselines, sync } from "../src/core/sync.js";
-import { resetSessions } from "../src/core/session.js";
+import { observeSessionPaths, resetSessions } from "../src/core/session.js";
 
 const git = (cwd: string, args: string): void => {
   execSync(`git -c user.name=t -c user.email=t@t ${args}`, { cwd, stdio: "ignore" });
@@ -170,6 +170,53 @@ describe.skipIf(!hasAstGrep())("progressive disclosure refresh", () => {
       expect([...st2.store.enrolled]).toEqual([]);
       expect(st2.files).not.toContain("sub/a.ts");
       expect(st2.facts["sub/a.ts"]).toBeUndefined();
+    } finally {
+      evictState(superRoot);
+      rmSync(dirname(superRoot), { recursive: true, force: true });
+    }
+  });
+
+  it("indexes nested drift without steering a session focused elsewhere", async () => {
+    const superRoot = makeSuperproject();
+    resetSyncBaselines();
+    resetSessions();
+    try {
+      const initial = await ensureState(superRoot);
+      const baseline = await sync(superRoot, {
+        files: [],
+        budget: 512,
+        steerThreshold: 0.01,
+        scope: "session",
+        sessionId: "session-a",
+      }, initial, { probe: "full" });
+      expect(baseline.details.baseline).toBe("established");
+      observeSessionPaths(superRoot, ["top.ts"]);
+
+      appendFileSync(join(superRoot, "sub", "a.ts"), "export const sibling = 2;\n");
+      const outcome = await sync(superRoot, {
+        files: [],
+        budget: 512,
+        steerThreshold: 0.01,
+        scope: "session",
+        sessionId: "session-a",
+      });
+
+      expect(outcome.red).toBe(false);
+      expect(outcome.details).toMatchObject({
+        outsideAttention: true,
+        attentionScopes: ["top.ts"],
+      });
+      expect(outcome.details.ignoredFiles).toContain("sub/a.ts");
+      expect((await ensureState(superRoot)).files).toContain("sub/a.ts");
+
+      const again = await sync(superRoot, {
+        files: [],
+        budget: 512,
+        steerThreshold: 0.01,
+        scope: "session",
+        sessionId: "session-a",
+      });
+      expect(again.structural).toBe(false);
     } finally {
       evictState(superRoot);
       rmSync(dirname(superRoot), { recursive: true, force: true });

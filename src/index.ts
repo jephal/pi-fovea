@@ -10,7 +10,7 @@ import { loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
 import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
-import { resetSessions } from "./core/session.js";
+import { observeSessionPaths, resetSessions } from "./core/session.js";
 import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
 import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
 import { openFoveaSettings } from "./ui/settings.js";
@@ -71,6 +71,7 @@ const requestsNativeGrep = (params: {
 const text = (s: string) => ({ type: "text" as const, text: s });
 const syncRuns = (config: FoveaConfig): boolean => config.sync.mode !== "disabled";
 const syncDisplays = (config: FoveaConfig): boolean => config.sync.mode === "enabled";
+const ATTENTION_PATH_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
 
 const NODE_KINDS = new Set<NodeKind>([
   "function", "method", "class", "interface", "type", "field", "decl", "file", "anchor",
@@ -235,7 +236,7 @@ export default function fovea(pi: ExtensionAPI) {
           const pre = configFor(ctx.cwd, ctx.isProjectTrusted());
           void sync(
             ctx.cwd,
-            { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus, sessionId },
+            { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus, scope: pre.sync.scope, sessionId },
             st,
             { probe: "full" },
           ).catch(() => {});
@@ -292,8 +293,11 @@ export default function fovea(pi: ExtensionAPI) {
     turnFiles = [];
   });
   pi.on("tool_execution_start", async (event, ctx) => {
-    if (event.toolName !== "edit" && event.toolName !== "write") return;
     const args = event.args as { path?: unknown };
+    if (ATTENTION_PATH_TOOLS.has(event.toolName) && typeof args.path === "string") {
+      observeSessionPaths(ctx.cwd, [args.path]);
+    }
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
     if (typeof args.path !== "string") return;
     turnFiles.push(args.path);
     const capture = await captureMutation(ctx.cwd, args.path);
@@ -316,7 +320,7 @@ export default function fovea(pi: ExtensionAPI) {
       if (!syncRuns(cfg)) return;
       const outcome = await sync(
         ctx.cwd,
-        { files: [], budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus, sessionId: ctx.sessionManager.getSessionId() },
+        { files: [], budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus, scope: cfg.sync.scope, sessionId: ctx.sessionManager.getSessionId() },
         undefined,
         // Respond to the Enter key, never block on it: the TTL-bounded probe
         // detects out-of-band drift, a prepared warm verdict steers pre-prompt,
@@ -334,7 +338,7 @@ export default function fovea(pi: ExtensionAPI) {
           },
         };
       }
-      if (outcome.structural && !outcome.details.baseline && !outcome.details.deferred && cfg.sync.ackClean && ctx.hasUI) {
+      if (outcome.structural && !outcome.details.baseline && !outcome.details.deferred && !outcome.details.outsideAttention && cfg.sync.ackClean && ctx.hasUI) {
         ctx.ui.notify("fovea: checked repository changes; no new action is needed.", "info");
       }
     } catch (error) {
@@ -354,22 +358,25 @@ export default function fovea(pi: ExtensionAPI) {
       if (!syncRuns(cfg)) return;
       const outcome = await sync(
         ctx.cwd,
-        { files: rels, budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus, sessionId: ctx.sessionManager.getSessionId() },
+        { files: rels, budget: cfg.sync.budget, steerThreshold: cfg.sync.steerThreshold, pushFocus: cfg.sync.pushFocus, scope: cfg.sync.scope, sessionId: ctx.sessionManager.getSessionId() },
         undefined,
         { probe: "cheap" },
       );
       lastSyncError = undefined;
       if (!outcome.structural) return;
       if (outcome.red && outcome.text) {
-        // Continuous intelligence joins the active agent loop: steer reaches
-        // the model before its next call, and triggerTurn continues an idle run.
+        // Self/mixed/unattributed work can still receive an immediate
+        // consequence steer. Another session's relevant update waits for the
+        // next user prompt and therefore cannot restart an idle agent.
         pi.sendMessage({
           customType: "pi-fovea-sync",
           content: outcome.text,
           display: syncDisplays(cfg),
           details: outcome.details,
-        }, { deliverAs: "steer", triggerTurn: true });
-      } else if (!outcome.details.baseline && cfg.sync.ackClean && ctx.hasUI) {
+        }, outcome.delivery === "next-prompt"
+          ? { deliverAs: "nextTurn" }
+          : { deliverAs: "steer", triggerTurn: true });
+      } else if (!outcome.details.baseline && !outcome.details.outsideAttention && cfg.sync.ackClean && ctx.hasUI) {
         ctx.ui.notify("fovea: checked repository changes; no new action is needed.", "info");
       }
     } catch (error) {
@@ -495,6 +502,9 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         if (signal?.aborted) throw new Error("Fovea impact cancelled");
         onUpdate?.({ content: [text("Tracing likely change impact…")], details: { phase: "impact" } });
+        if ((params.root === undefined || params.root === ctx.cwd) && params.files?.length) {
+          observeSessionPaths(ctx.cwd, params.files);
+        }
         const r = await impact(root, {
           files: params.files,
           symbols: params.symbols,
@@ -565,7 +575,7 @@ export default function fovea(pi: ExtensionAPI) {
           `${unreadableCount ? ` · !${unreadableCount} files unreadable` : ""}` +
           `${oversizedCount ? ` · !${oversizedCount} files over size cap` : ""}` +
           `${generatedCount ? ` · !${generatedCount} generated files skipped` : ""} · ` +
-          `sync ${cfg.sync.mode} · grep ${cfg.tools.grepMode} · ` +
+          `sync ${cfg.sync.mode}/${cfg.sync.scope} · grep ${cfg.tools.grepMode} · ` +
           `${astGrep.code === 0 ? astGrep.stdout.trim() : "ast-grep unavailable"}`,
           "info",
         );

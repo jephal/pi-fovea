@@ -5,8 +5,9 @@
 // the cheap unchanged path; semantic fingerprints ignore coordinate-only drift.
 //
 // A route change or enough newly relevant files emits compact causal context.
-// Pre-agent drift is injected directly; post-turn drift is sent as a steer and
-// triggers a continuation if the agent would otherwise become idle.
+// Root-wide indexing stays broad, while extension sessions steer only for
+// logical directories they entered. Other-session context waits for the next
+// user prompt instead of restarting an idle agent.
 //
 // The first sync establishes the baseline. Baselines reset on /new, /fork,
 // and /fovea reset alongside focus sessions.
@@ -20,7 +21,7 @@ import { gitProbe } from "./git.js";
 import { focus, impact, isTestScope } from "./ops.js";
 import { ensureState, ensureStateBackground, getInflight, getState } from "./state.js";
 import type { RepoState } from "./state.js";
-import { getSession } from "./session.js";
+import { getSession, observeSessionPaths, syncScopeForPath } from "./session.js";
 import { attributeChanges, type SyncProvenance } from "./provenance.js";
 
 interface SyncBaseline {
@@ -251,6 +252,8 @@ export interface SyncParams {
   steerThreshold: number;
   /** Push vs pull (default push): embed the top file target's focus context. */
   pushFocus?: boolean;
+  /** Session-local attention by default; repository restores broad steering. */
+  scope?: "session" | "repository";
   /** Pi session UUID used only as a hashed owner key for mutation attribution. */
   sessionId?: string;
 }
@@ -261,6 +264,8 @@ export interface SyncOutcome {
   /** Issues worth spending model tokens on. */
   red: boolean;
   text?: string;
+  /** Immediate for current/mixed/unattributed work; deferred for another session. */
+  delivery?: "steer" | "next-prompt";
   tokens: number;
   details: Record<string, unknown>;
 }
@@ -305,6 +310,7 @@ export const sync = async (
   now?: RepoState,
   opts?: { probe?: "cheap" | "full" | "defer" },
 ): Promise<SyncOutcome> => {
+  if (params.sessionId && params.files?.length) observeSessionPaths(root, params.files);
   let state = now;
   if (!state) {
     // Cold roots build in the background; a first answer beats a full build.
@@ -368,34 +374,79 @@ export const sync = async (
   const current = new Map(state.graph.anchors.map((a) => [a.id, a.implicit === true]));
   const currentCarrier = new Map(state.graph.anchors.map((a) => [a.id, a.file]));
   const currentIds = new Set(current.keys());
-  const added = [...currentIds].filter((id) => !prev.anchors.has(id));
-  const removed = [...prev.anchors.keys()].filter((id) => !currentIds.has(id));
-  const newlyImplicit = added.filter((id) => current.get(id));
+  const allAdded = [...currentIds].filter((id) => !prev.anchors.has(id));
+  const allRemoved = [...prev.anchors.keys()].filter((id) => !currentIds.has(id));
 
   const session = getSession(root);
+  const scopedSync = params.scope !== "repository" && params.sessionId !== undefined;
+  const attentionScopes = [...session.syncScopes].sort();
+  const relevantFile = (file: string | undefined): boolean => {
+    if (!scopedSync) return true;
+    if (!file) return false;
+    const scope = syncScopeForPath(root, file);
+    return scope !== undefined && session.syncScopes.has(scope);
+  };
+  const added = allAdded.filter((id) => relevantFile(currentCarrier.get(id)));
+  const removed = allRemoved.filter((id) => relevantFile(prev.anchors.get(id)));
+  const newlyImplicit = added.filter((id) => current.get(id));
+
   const disclosedFiles = new Set<string>();
   for (const id of session.disclosed) {
     const at = id.indexOf("@");
     if (at >= 0) disclosedFiles.add(id.slice(at + 1));
   }
 
-  // Exact change set: facts whose content hash moved since the baseline.
-  // Deleted files can't warm anything (absent from the graph) but ride along
-  // in details for observability.
-  const changed = Object.keys(state.facts).filter(
+  // Index and baseline the whole root, but seed proactive consequences only
+  // from logical directories this conversation deliberately entered.
+  const allChanged = Object.keys(state.facts).filter(
     (file) => prev.shas.get(file) !== state.facts[file]!.sha1,
   );
-  const semanticChanged = semanticDrift(state, prev);
+  const allSemanticChanged = semanticDrift(state, prev);
+  const changed = allChanged.filter(relevantFile);
+  const semanticChanged = allSemanticChanged.filter(relevantFile);
   const hinted = (params.files ?? []).filter((file) => semanticChanged.includes(file));
   // Absent-from-facts is usually a coverage gap (failed/unreadable/oversized
   // bucket, or a transient sweep race), not a deletion — stat is the arbiter,
   // same as the resurrection path in ensureState. Reporting an on-disk file
   // as deleted misleads the model and self-perpetuates: the false red steer
   // fires every sync while the gap persists (phantom-deletion loop).
-  const deleted = [...prev.shas.keys()].filter(
+  const allDeleted = [...prev.shas.keys()].filter(
     (file) => !(file in state.facts) && !existsSync(join(state.root, file)),
   );
+  const deleted = allDeleted.filter(relevantFile);
+  const ignoredFiles = [...new Set([
+    ...allChanged.filter((file) => !relevantFile(file)),
+    ...allDeleted.filter((file) => !relevantFile(file)),
+  ])].sort();
   const files = [...new Set([...semanticChanged, ...hinted])];
+
+  // Coverage enrollment is not authored task drift. Adopt sibling-directory
+  // changes silently so the broad umbrella graph stays current without
+  // waking this session or replaying the same change on its next turn.
+  const outsideAttentionOnly = scopedSync && ignoredFiles.length > 0 &&
+    changed.length === 0 && deleted.length === 0 && added.length === 0 && removed.length === 0;
+  if (outsideAttentionOnly) {
+    warmCache.delete(root);
+    setBaseline(root, {
+      ...(await snapshot(state)),
+      heat: prev.heat,
+      warmthArmed: prev.warmthArmed,
+      pushed: prev.pushed,
+    });
+    return {
+      structural: true, red: false, tokens: 0,
+      details: {
+        version: state.version,
+        outsideAttention: true,
+        attentionScopes,
+        ignoredFiles,
+        changedFiles: [],
+        semanticChangedFiles: [],
+        deletedFiles: [],
+      },
+    };
+  }
+
   const provenance: SyncProvenance | undefined = params.sessionId
     ? await attributeChanges(root, params.sessionId, prev.capturedAt, [
       ...changed.map((file) => ({
@@ -523,6 +574,7 @@ export const sync = async (
         changedFiles: changed,
         semanticChangedFiles: files,
         deletedFiles: deleted,
+        ...(ignoredFiles.length ? { ignoredFiles, attentionScopes } : {}),
         ...(provenance ? { provenance } : {}),
         ...(suspectAdded.length || suspectRemoved.length
           ? { suspectAnchors: { added: suspectAdded, removed: suspectRemoved } }
@@ -544,6 +596,7 @@ export const sync = async (
       : provenance?.kind === "mixed"
         ? "mixed sessions or mutation paths"
         : "unattributed mutation path";
+  const delivery = provenance?.kind === "other-session" ? "next-prompt" : "steer";
   const lines: string[] = [
     "Repository structure changed.",
     `Changed: ${changedSummary}`,
@@ -571,10 +624,12 @@ export const sync = async (
     ?? files[0]
     ?? orderedWarm[0];
   const pushFocus = params.pushFocus !== false;
-  const steerLine = "Steer: account for this update before continuing.";
+  const actionLine = delivery === "next-prompt"
+    ? "Notice: review this concurrent update on the next prompt if it affects the task."
+    : "Steer: account for this update before continuing.";
   let embedded = false;
   if (pushFocus && focusTarget && focusTarget in state.facts && !pushed.has(focusTarget)) {
-    const detailBudget = params.budget - Math.ceil([...lines, steerLine].join("\n").length / 4);
+    const detailBudget = params.budget - Math.ceil([...lines, actionLine].join("\n").length / 4);
     if (detailBudget >= 128) {
       try {
         // Reuse the state this verdict was computed against: both the warmed
@@ -596,13 +651,13 @@ export const sync = async (
       ? `Next: fovea_focus ${JSON.stringify(focusTarget)} to see what it now connects to.`
       : "Next: fovea_sketch for the updated silhouette.");
   }
-  lines.push(steerLine);
+  lines.push(actionLine);
   while (lines.length > 3 && Math.ceil(lines.join("\n").length / 4) > params.budget) {
     lines.splice(lines.length - 2, 1);
   }
   const text = lines.join("\n");
   return {
-    structural: true, red: true, text, tokens: Math.ceil(text.length / 4),
+    structural: true, red: true, text, delivery, tokens: Math.ceil(text.length / 4),
     details: {
       version: state.version,
       added,
@@ -613,6 +668,7 @@ export const sync = async (
       surprise: round4(surpriseTotal),
       warmReasons,
       deletedFiles: deleted,
+      ...(ignoredFiles.length ? { ignoredFiles, attentionScopes } : {}),
       ...(provenance ? { provenance } : {}),
       ...(embedded ? { pushedFocus: focusTarget } : {}),
       ...(degraded ? { extractionDegraded: true } : {}),

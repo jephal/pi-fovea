@@ -27,7 +27,7 @@ const setup = (stored: unknown) => {
 
 describe("fovea config", () => {
   it("defaults sync to visible and every budget knob to 512", () => {
-    expect(DEFAULT_FOVEA_CONFIG.sync).toMatchObject({ mode: "enabled", budget: 512 });
+    expect(DEFAULT_FOVEA_CONFIG.sync).toMatchObject({ mode: "enabled", scope: "session", budget: 512 });
     expect(DEFAULT_FOVEA_CONFIG.tools).toMatchObject({
       defaultBudget: 512,
       grepMode: "augment",
@@ -87,14 +87,24 @@ describe("fovea config", () => {
     }
   });
 
+  it("loads repository-wide sync explicitly", () => {
+    const { root, agentDir, cwd } = setup({ sync: { scope: "repository" } });
+    try {
+      expect(loadFoveaConfig({ cwd, agentDir, projectTrusted: false }).sync.scope).toBe("repository");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects unknown modes and clamps the augment budget", () => {
     const { root, agentDir, cwd } = setup({
-      sync: { mode: "invisible" },
+      sync: { mode: "invisible", scope: "workspace" },
       tools: { grepMode: "overwrite", grepAugmentBudget: 99999 },
     });
     try {
       const config = loadFoveaConfig({ cwd, agentDir, projectTrusted: false });
       expect(config.sync.mode).toBe("enabled");
+      expect(config.sync.scope).toBe("session");
       expect(config.tools.grepMode).toBe("augment");
       expect(config.tools.grepAugmentBudget).toBe(8192);
     } finally {

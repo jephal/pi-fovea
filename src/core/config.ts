@@ -10,10 +10,14 @@ import path from "node:path";
 
 export const SYNC_MODES = ["enabled", "hidden", "disabled"] as const;
 type SyncMode = (typeof SYNC_MODES)[number];
+export const SYNC_SCOPES = ["session", "repository"] as const;
+type SyncScope = (typeof SYNC_SCOPES)[number];
 
 interface FoveaSyncConfig {
   /** Continuous sync delivery: visible, model-only, or fully disabled. */
   mode: SyncMode;
+  /** Session-local logical directories by default; repository restores broad steering. */
+  scope: SyncScope;
   /** Token budget for proactive model steering context. */
   budget: number;
   /** Also send a tiny model-visible ack on clean turns (default false: silent green). */
@@ -51,6 +55,7 @@ export interface FoveaConfig {
 export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   sync: {
     mode: "enabled",
+    scope: "session",
     budget: 512,
     ackClean: false,
     // Masses are heat units leaked outside the changed files (1 unit seeded
@@ -125,6 +130,7 @@ const applyPartial = (base: FoveaConfig, partial: unknown): FoveaConfig => {
         SYNC_MODES,
         typeof sync.enabled === "boolean" ? (sync.enabled ? "enabled" : "disabled") : base.sync.mode,
       ),
+      scope: enumValue(sync.scope, SYNC_SCOPES, base.sync.scope),
       budget: intValue("sync.budget", sync.budget, base.sync.budget),
       ackClean: boolValue(sync.ackClean, base.sync.ackClean),
       steerThreshold: floatValue("sync.steerThreshold", sync.steerThreshold, base.sync.steerThreshold),

@@ -160,9 +160,11 @@ with the fact cache so restarts restore your working set. The same rule covers
 submodules and embedded checkouts in Git roots: their contents join the graph
 as `<submodule>/<path>` the first time something inside changes — porcelain
 reports inner drift collapsed to the boundary, which enrolls it automatically —
-and a removed project un-enrolls without leaving orphan facts. Every fovea_* tool still
-accepts a `root` for a full, immediate map of one project.
-`FOVEA_MAX_FILES` caps the merged listing either way.
+and a removed project un-enrolls without leaving orphan facts. Enrollment expands
+index coverage only: with the default session-local sync scope, a sibling project
+can join the umbrella graph and cache without steering conversations that never
+entered it. Every fovea_* tool still accepts a `root` for a full, immediate map
+of one project. `FOVEA_MAX_FILES` caps the merged listing either way.
 Cold runs stay bounded through streamed JSONL cache I/O, 64-file extraction
 batches, adaptive ast-grep chunk splitting, and a two-root resident LRU. The
 limits accept environment overrides:
@@ -183,25 +185,32 @@ details.
 
 ## Turn sync
 
-Continuous sync is enabled and visible by default. Before an agent starts, Fovea establishes its
-baseline or injects any outside drift ahead of the first model call. After
-every assistant turn it compares symbols, calls, imports, literals, and anchors
-again. Content hashes keep the unchanged fast path cheap. Edits that touch only
-comments or formatting raise no signal.
+Continuous sync is enabled and visible by default. Before an agent starts,
+Fovea establishes its baseline or injects relevant drift ahead of the first
+model call. After every assistant turn it compares symbols, calls, imports,
+literals, and anchors again. Content hashes keep the unchanged fast path cheap.
+Edits that touch only comments or formatting raise no signal.
 
-A meaningful change found before agent start lands inside that run's context. A
-post-turn route or dependency change ships with `deliverAs: "steer"`. When the
-agent is about to settle, `triggerTurn` starts the continuation. The compact
-update names the changed files, the route deltas, and the newly relevant files.
-It also identifies whether exact edit/write content transitions came from the
-current Pi session, another Fovea-enabled session, or mixed sessions. Shell
-commands, external editors, and agents without Fovea remain `unattributed`
-rather than being guessed. Provenance journals are bounded, expire after seven
-days, and live in `$TMPDIR`; repository content remains the drift oracle. It
-lists the causal channels behind each link: calls, imports, shared literals,
-tests, or co-change history. By default it also embeds the refreshed focus
-context of the top drift target (push). With `sync.pushFocus` off, the update
-ends with a suggested focus probe for the next call (pull). Switching
+The default `sync.scope` is `"session"`: path-bearing read/search/edit tools,
+explicit focus/dwell results, and file-seeded impact calls add the top-level
+logical directory (or exact root file) to that conversation's attention. Fovea
+still indexes and baselines the whole root. Drift solely in sibling directories
+is absorbed silently, so broad umbrella coverage does not become broad model
+context. Set `sync.scope` to `"repository"` to restore root-wide steering.
+
+A meaningful current, mixed, or unattributed change inside the attention scope
+can still ship post-turn with `deliverAs: "steer"` and `triggerTurn`. A relevant
+change attributed solely to another Fovea-enabled session is queued for the
+next user prompt instead; it never restarts an idle agent. The compact update
+names changed files, route deltas, and newly relevant files. Shell commands,
+external editors, and agents without Fovea remain `unattributed` rather than
+being guessed, while the path scope still keeps unrelated sibling sandboxes
+quiet. Provenance journals are bounded, expire after seven days, and live in
+`$TMPDIR`; repository content remains the drift oracle. Updates list causal
+channels such as calls, imports, shared literals, tests, or co-change history.
+By default Fovea also embeds the refreshed focus context of the top drift target
+(push). With `sync.pushFocus` off, the update ends with a suggested focus probe
+for the next call (pull). Switching
 branches re-baselines silently instead of steering: a `git checkout`
 re-materializes the worktree, but the branch diff is not authored drift —
 commits, pulls, and rebases still report. Clean turns stay silent. Enable `sync.ackClean` if you want an ack for those. Set `sync.mode` to
@@ -222,7 +231,7 @@ extraction artifacts quiet by construction.
 
 Runtime controls:
 
-- `/fovea status`: loaded package and ast-grep versions, indexed coverage, anchor scopes, sync and grep modes
+- `/fovea status`: loaded package and ast-grep versions, indexed coverage, anchor scopes, sync mode/attention scope, and grep mode
 - `/fovea reset`: clear focus disclosure and depth, then establish a fresh sync baseline
 - `/fovea reload`: hot-reload extensions and activate newly installed source; sync baselines (the verdict ledger) ride through on a global slot, so a reload no longer replays charged cascades as first disclosures
 - `/fovea settings`: configure sync, budgets, and hybrid grep
@@ -246,6 +255,7 @@ effective while its global default is being edited.
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
 | `sync.mode` | `"enabled"` | `"enabled"` shows model-visible sync messages, `"hidden"` keeps them model-visible but out of the transcript, and `"disabled"` turns sync off. Legacy `sync.enabled` booleans still parse. |
+| `sync.scope` | `"session"` | `"session"` steers only for top-level directories/root files this conversation entered while indexing the whole root; `"repository"` restores root-wide steering. |
 | `sync.budget` | `512` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |

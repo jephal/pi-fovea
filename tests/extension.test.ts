@@ -8,6 +8,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import extension from "../src/index.js";
 import { resetSessions } from "../src/core/session.js";
+import { captureMutation, finishMutation, provenancePathFor } from "../src/core/provenance.js";
 import { hasAstGrep } from "../src/core/astgrep.js";
 import { cachePathFor } from "../src/core/build.js";
 import { ensureState, evictState, getInflight, getState } from "../src/core/ops.js";
@@ -417,12 +418,10 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     }
   });
 
-  it("defers hintless out-of-band drift instead of blocking the send", async () => {
-    // A raw filesystem write (bash / external editor / fabric_exec) has no
-    // tool-event warm, so the send path must NOT pay re-extraction +
-    // re-assembly inline. The TTL-bounded probe spots it, before_agent_start
-    // returns fast with nothing injected, and turn_end (the correctness
-    // backstop) rebuilds once, off the send path, and steers.
+  it("silently absorbs hintless drift before the session enters a directory", async () => {
+    // A raw filesystem write has no activity path tying it to this task. The
+    // send path still defers the rebuild, then turn_end refreshes the broad
+    // index and baseline without injecting sibling work into the conversation.
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-before-agent-"));
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
@@ -445,10 +444,13 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       const results = await loaded.emit("before_agent_start", { prompt: "continue" }, ctx);
       expect(results.filter((result) => result !== undefined)).toEqual([]);
       expect(loaded.messages).toHaveLength(0);
+      const beforeVersion = getState(root)!.version;
       await loaded.emit("turn_end", {}, ctx);
-      expect(loaded.messages).toHaveLength(1);
-      expect(loaded.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
-      expect(String(loaded.messages[0]!.message.content)).toContain("GET /api/users/{*}/idle");
+      expect(loaded.messages).toHaveLength(0);
+      expect(getState(root)!.version).not.toBe(beforeVersion);
+      // The outside-attention baseline advances, so the drift cannot replay.
+      await loaded.emit("turn_end", {}, ctx);
+      expect(loaded.messages).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -553,6 +555,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       await loaded.emit("before_agent_start", { prompt: "change the route" }, ctx); // establish pre-edit baseline
       await loaded.emit("turn_start", {}, ctx);
       const main = path.join(root, "server/main.go");
+      await loaded.emit(
+        "tool_execution_start",
+        { toolCallId: "read-1", toolName: "read", args: { path: main } },
+        ctx,
+      );
       writeFileSync(
         main,
         readFileSync(main, "utf8").replace(
@@ -573,6 +580,49 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     }
   });
 
+  it("queues another session's relevant update for the next prompt", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-other-session-"));
+    cpSync(FIXTURE, root, { recursive: true });
+    execSync("git init -qb main && git add -A", { cwd: root });
+    execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    resetSessions();
+    resetSyncBaselines();
+    const loaded = load();
+    const ctx = fakeCtx(root, false, "session-a");
+    const main = path.join(root, "server/main.go");
+    try {
+      await ensureState(root);
+      await loaded.emit("before_agent_start", { prompt: "watch server" }, ctx);
+      await loaded.emit("turn_start", {}, ctx);
+      await loaded.emit(
+        "tool_execution_start",
+        { toolCallId: "read-1", toolName: "read", args: { path: main } },
+        ctx,
+      );
+      const capture = await captureMutation(root, main);
+      expect(capture).toBeDefined();
+      writeFileSync(
+        main,
+        readFileSync(main, "utf8").replace(
+          'r.POST("/api/users", server.CreateUserHandler)',
+          'r.POST("/api/users", server.CreateUserHandler)\n\tr.GET("/api/users/:id/concurrent", server.GetUserHandler)',
+        ),
+      );
+      expect(await finishMutation(capture!, "session-b", "other-edit")).toBe(true);
+
+      await loaded.emit("turn_end", {}, ctx);
+
+      expect(loaded.messages).toHaveLength(1);
+      expect(loaded.messages[0]!.options).toEqual({ deliverAs: "nextTurn" });
+      expect(String(loaded.messages[0]!.message.content)).toContain("Origin: another Fovea-enabled session.");
+      expect(String(loaded.messages[0]!.message.content)).toContain("Notice: review this concurrent update");
+      expect(String(loaded.messages[0]!.message.content)).not.toContain("Steer:");
+    } finally {
+      rmSync(provenancePathFor(root, "session-b"), { force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps hidden sync intelligence model-visible without rendering it", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-hidden-sync-"));
     cpSync(FIXTURE, root, { recursive: true });
@@ -589,6 +639,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       await loaded.emit("before_agent_start", { prompt: "change the route" }, ctx);
       await loaded.emit("turn_start", {}, ctx);
       const main = path.join(root, "server/main.go");
+      await loaded.emit(
+        "tool_execution_start",
+        { toolCallId: "read-1", toolName: "read", args: { path: main } },
+        ctx,
+      );
       writeFileSync(
         main,
         readFileSync(main, "utf8").replace(

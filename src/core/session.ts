@@ -3,6 +3,7 @@
 // periphery, while a new seed/scope resets to sharp context. Cached Chebyshev
 // vectors keep dwell cheap across wider timescales within that focus.
 
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { ROOT_CACHE_LIMIT } from "./asyncutil.js";
 import type { NodeKind } from "./types.js";
 
@@ -20,6 +21,8 @@ export interface FoveaSession {
   focusKey: string;
   scope: FocusScope;
   disclosed: Set<string>;
+  /** Top-level logical directories/files this conversation deliberately entered. */
+  syncScopes: Set<string>;
   tk: Float64Array[];
   tkKey: string;
 }
@@ -44,12 +47,40 @@ export const getSession = (root: string): FoveaSession => {
     focusKey: "",
     scope: {},
     disclosed: new Set<string>(),
+    syncScopes: new Set<string>(),
     tk: [],
     tkKey: "",
   };
   sessions.set(root, s);
   while (sessions.size > ROOT_CACHE_LIMIT) sessions.delete(sessions.keys().next().value!);
   return s;
+};
+
+const repoRelativePath = (root: string, input: string): string | undefined => {
+  const raw = input.startsWith("@") ? input.slice(1) : input;
+  const rel = relative(resolve(root), resolve(root, raw));
+  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+  return rel.split(sep).join("/");
+};
+
+/** A shared-root session treats each top-level child as a logical workspace.
+ * Root files remain exact scopes, while any descendant maps to its first path
+ * segment. This keeps umbrella indexing broad without letting sibling task
+ * directories enter the active conversation. */
+export const syncScopeForPath = (root: string, input: string): string | undefined => {
+  const rel = repoRelativePath(root, input);
+  if (!rel) return undefined;
+  const slash = rel.indexOf("/");
+  return slash < 0 ? rel : rel.slice(0, slash);
+};
+
+export const observeSessionPaths = (root: string, paths: readonly string[]): string[] => {
+  const session = getSession(root);
+  for (const path of paths) {
+    const scope = syncScopeForPath(root, path);
+    if (scope) session.syncScopes.add(scope);
+  }
+  return [...session.syncScopes].sort();
 };
 
 // `/new` and friends: same repo, fresh eyes.
