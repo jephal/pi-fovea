@@ -6,12 +6,11 @@
 // external-editor keybinding switches the configuration layer being viewed and saved.
 
 import {
-  CONFIG_DIR_NAME,
   DynamicBorder,
-  getAgentDir,
   type ExtensionContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { configDirName, resolveAgentDir } from "../core/agent-dir.js";
 import {
   Container,
   type Component,
@@ -216,8 +215,8 @@ export class FoveaSettingsComponent extends Container {
 
   private updateSaveScopeText(): void {
     const destination = this.saveScope === "project"
-      ? `Project overrides (${CONFIG_DIR_NAME}/fovea.json)`
-      : `Global defaults (~/${CONFIG_DIR_NAME}/agent/fovea.json)`;
+      ? `Project overrides (${configDirName}/fovea.json)`
+      : `Global defaults (~/${configDirName}/agent/fovea.json)`;
     const keys = this.keybindings?.getKeys("app.editor.external") ?? [];
     const shortcut = keys.map(formatKey).join("/");
     const hint = !this.projectScopeAvailable
@@ -328,7 +327,7 @@ export const openFoveaSettings = async (
     context.ui.notify("Fovea settings are available in TUI mode", "warning");
     return { grepRegistrationChanged: false };
   }
-  const agentDir = getAgentDir();
+  const agentDir = resolveAgentDir();
   const scopes = {
     cwd: context.cwd,
     agentDir,

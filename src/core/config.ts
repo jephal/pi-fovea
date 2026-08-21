@@ -4,7 +4,7 @@
 // defaults; the FOVEA_TURN_SYNC=off environment variable always wins, the
 // same way PI_FABRIC_* overrides win over stored fabric config.
 
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { configDirName } from "./agent-dir.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -88,7 +88,7 @@ export interface FoveaConfigScopes {
 }
 
 export const globalFoveaConfigPath = (agentDir: string): string => path.join(agentDir, "fovea.json");
-export const projectFoveaConfigPath = (cwd: string): string => path.join(cwd, CONFIG_DIR_NAME, "fovea.json");
+export const projectFoveaConfigPath = (cwd: string): string => path.join(cwd, configDirName, "fovea.json");
 
 const BOUNDS: Record<string, [number, number]> = {
   "sync.budget": [128, 8192],

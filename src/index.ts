@@ -4,8 +4,9 @@
 // incremental across sessions.
 
 import { readFileSync } from "node:fs";
-import { createGrepTool, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { resolveAgentDir } from "./core/agent-dir.js";
 import { loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
@@ -13,7 +14,6 @@ import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.
 import { observeSessionPaths, resetSessions } from "./core/session.js";
 import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
 import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
-import { openFoveaSettings } from "./ui/settings.js";
 import type { NodeKind } from "./core/types.js";
 
 const PACKAGE_VERSION = (() => {
@@ -89,7 +89,7 @@ export default function fovea(pi: ExtensionAPI) {
       configs.set(root, hit);
       return hit;
     }
-    const cfg = loadFoveaConfig({ cwd: root, agentDir: agentDir ?? getAgentDir(), projectTrusted: trusted });
+    const cfg = loadFoveaConfig({ cwd: root, agentDir: agentDir ?? resolveAgentDir(), projectTrusted: trusted });
     configs.set(root, cfg);
     while (configs.size > ROOT_CACHE_LIMIT) configs.delete(configs.keys().next().value!);
     return cfg;
@@ -159,6 +159,10 @@ export default function fovea(pi: ExtensionAPI) {
       return undefined;
     }
   });
+  // pi-core's createGrepTool drags the whole host module graph into this
+  // extension's loader (~1s of startup). Load it only on first native use.
+  const loadNativeGrepTool = (root: string) =>
+    import("@earendil-works/pi-coding-agent").then(({ createGrepTool }) => createGrepTool(root));
   const registerGrepOverride = (): void => {
     if (grepOverrideRegistered) return;
     grepOverrideRegistered = true;
@@ -175,7 +179,7 @@ export default function fovea(pi: ExtensionAPI) {
       async execute(id, params, signal, onUpdate, ctx) {
         const root = ctx.cwd;
         if (requestsNativeGrep(params)) {
-          const native = createGrepTool(root);
+          const native = await loadNativeGrepTool(root);
           return native.execute(id, params, signal, onUpdate);
         }
         const budget = configFor(root, ctx.isProjectTrusted()).tools.defaultBudget;
@@ -183,7 +187,7 @@ export default function fovea(pi: ExtensionAPI) {
         try {
           const result = await focus(root, query, budget, { fresh: true });
           if (Number(result.details.seeds ?? 0) === 0) {
-            const native = createGrepTool(root);
+            const native = await loadNativeGrepTool(root);
             return native.execute(id, params, signal, onUpdate);
           }
           return {
@@ -194,7 +198,7 @@ export default function fovea(pi: ExtensionAPI) {
           // A broken graph backend must not break text search: degrade to
           // native grep and mark the result, the way a graph miss does.
           const message = error instanceof Error ? error.message : String(error);
-          const native = createGrepTool(root);
+          const native = await loadNativeGrepTool(root);
           const fallback = await native.execute(id, params, signal, onUpdate);
           return {
             ...fallback,
@@ -542,6 +546,7 @@ export default function fovea(pi: ExtensionAPI) {
         return;
       }
       if (sub === "settings") {
+        const { openFoveaSettings } = await import("./ui/settings.js");
         const result = await openFoveaSettings(ctx, { onConfigApplied: () => configs.clear() });
         if (result.grepRegistrationChanged) {
           ctx.ui.notify("Reloading extensions to apply the grep tool change…", "info");
