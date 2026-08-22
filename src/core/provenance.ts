@@ -30,6 +30,12 @@ export interface MutationCapture {
   beforeSha?: string;
 }
 
+export interface MutationTransition {
+  path: string;
+  beforeSha?: string | undefined;
+  afterSha?: string | undefined;
+}
+
 type ProvenanceKind = "current-session" | "other-session" | "mixed" | "unattributed";
 
 export interface SyncProvenance {
@@ -68,7 +74,11 @@ export const captureMutation = async (root: string, path: string): Promise<Mutat
 
 const writeQueues = new Map<string, Promise<void>>();
 
-const persistRecord = async (target: string, journal: MutationJournal, record: MutationRecord): Promise<void> => {
+const persistRecords = async (
+  target: string,
+  journal: MutationJournal,
+  additions: readonly MutationRecord[],
+): Promise<void> => {
   const cutoff = Date.now() - JOURNAL_TTL_MS;
   let records: MutationRecord[] = [];
   try {
@@ -79,11 +89,47 @@ const persistRecord = async (target: string, journal: MutationJournal, record: M
   } catch {
     // Missing and torn journals both recover as a fresh per-session file.
   }
-  records.push(record);
+  records.push(...additions);
   journal.records = records.slice(-JOURNAL_MAX_RECORDS);
   const temporary = `${target}.tmp-${process.pid}-${randomUUID()}`;
   await writeFile(temporary, JSON.stringify(journal));
   await rename(temporary, target);
+};
+
+export const recordMutationTransitions = async (
+  root: string,
+  transitions: readonly MutationTransition[],
+  sessionId: string,
+  toolCallId: string,
+): Promise<number> => {
+  const resolvedRoot = resolve(root);
+  const owner = ownerFor(sessionId);
+  const at = Date.now();
+  const records = transitions.flatMap((transition): MutationRecord[] => {
+    const located = repoPath(root, transition.path);
+    if (!located || transition.beforeSha === transition.afterSha) return [];
+    return [{
+      file: located.file,
+      beforeSha: transition.beforeSha,
+      afterSha: transition.afterSha,
+      owner,
+      toolCallId,
+      at,
+    }];
+  });
+  if (records.length === 0) return 0;
+  const target = provenancePathFor(resolvedRoot, sessionId);
+  const previous = writeQueues.get(target) ?? Promise.resolve();
+  const queued = previous.catch(() => {}).then(() => persistRecords(target, {
+    version: JOURNAL_VERSION, root: resolvedRoot, owner, records: [],
+  }, records));
+  writeQueues.set(target, queued);
+  try {
+    await queued;
+    return records.length;
+  } finally {
+    if (writeQueues.get(target) === queued) writeQueues.delete(target);
+  }
 };
 
 export const recordMutationTransition = async (
@@ -93,25 +139,9 @@ export const recordMutationTransition = async (
   afterSha: string | undefined,
   sessionId: string,
   toolCallId: string,
-): Promise<boolean> => {
-  const located = repoPath(root, path);
-  if (!located || beforeSha === afterSha) return false;
-  const resolvedRoot = resolve(root);
-  const owner = ownerFor(sessionId);
-  const target = provenancePathFor(resolvedRoot, sessionId);
-  const record: MutationRecord = { file: located.file, beforeSha, afterSha, owner, toolCallId, at: Date.now() };
-  const previous = writeQueues.get(target) ?? Promise.resolve();
-  const queued = previous.catch(() => {}).then(() => persistRecord(target, {
-    version: JOURNAL_VERSION, root: resolvedRoot, owner, records: [],
-  }, record));
-  writeQueues.set(target, queued);
-  try {
-    await queued;
-    return true;
-  } finally {
-    if (writeQueues.get(target) === queued) writeQueues.delete(target);
-  }
-};
+): Promise<boolean> => (await recordMutationTransitions(
+  root, [{ path, beforeSha, afterSha }], sessionId, toolCallId,
+)) === 1;
 
 export const finishMutation = async (
   capture: MutationCapture,
@@ -123,6 +153,9 @@ export const finishMutation = async (
 
 const readRecords = async (root: string, since: number): Promise<MutationRecord[]> => {
   const prefix = prefixFor(root);
+  await Promise.all([...writeQueues.entries()]
+    .filter(([path]) => path.split(/[/\\]/u).at(-1)?.startsWith(prefix))
+    .map(([, pending]) => pending.catch(() => {})));
   const cutoff = Math.max(since, Date.now() - JOURNAL_TTL_MS);
   let names: string[];
   try {
@@ -182,12 +215,17 @@ export const attributeChanges = async (
   changes: Array<{ file: string; beforeSha?: string; afterSha?: string }>,
 ): Promise<SyncProvenance> => {
   const records = await readRecords(root, since);
+  const recordsByFile = new Map<string, MutationRecord[]>();
+  for (const record of records) {
+    const matching = recordsByFile.get(record.file) ?? [];
+    matching.push(record);
+    recordsByFile.set(record.file, matching);
+  }
   const currentOwner = ownerFor(sessionId);
   const files: Record<string, ProvenanceKind> = {};
   for (const change of changes) {
-    const matching = records.filter((record) => record.file === change.file);
     files[change.file] = kindForOwners(
-      ownersForTransition(matching, change.beforeSha, change.afterSha),
+      ownersForTransition(recordsByFile.get(change.file) ?? [], change.beforeSha, change.afterSha),
       currentOwner,
     );
   }

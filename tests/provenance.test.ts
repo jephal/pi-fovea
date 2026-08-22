@@ -9,6 +9,7 @@ import {
   finishMutation,
   provenancePathFor,
   recordMutationTransition,
+  recordMutationTransitions,
 } from "../src/core/provenance.js";
 
 const hash = (text: string): string => createHash("sha1").update(text).digest("hex");
@@ -63,6 +64,23 @@ describe("sync provenance", () => {
     await expect(attributeChanges(root, "session-a", 0, [{
       file: "file.ts", beforeSha: hash("one\n"), afterSha: hash("two\n"),
     }])).resolves.toEqual({ kind: "current-session", files: { "file.ts": "current-session" } });
+  });
+
+  it("persists and attributes a multi-file receipt batch", async () => {
+    const { root } = rootWithFile();
+    writeFileSync(join(root, "other.ts"), "alpha\n");
+    await expect(recordMutationTransitions(root, [
+      { path: "file.ts", beforeSha: hash("one\n"), afterSha: hash("two\n") },
+      { path: "other.ts", beforeSha: hash("alpha\n"), afterSha: hash("beta\n") },
+    ], "session-a", "receipt-batch")).resolves.toBe(2);
+    journals.push(provenancePathFor(root, "session-a"));
+    await expect(attributeChanges(root, "session-a", 0, [
+      { file: "file.ts", beforeSha: hash("one\n"), afterSha: hash("two\n") },
+      { file: "other.ts", beforeSha: hash("alpha\n"), afterSha: hash("beta\n") },
+    ])).resolves.toEqual({
+      kind: "current-session",
+      files: { "file.ts": "current-session", "other.ts": "current-session" },
+    });
   });
 
   it("reports a transition chain owned by multiple sessions as mixed", async () => {
