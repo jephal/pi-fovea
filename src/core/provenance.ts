@@ -13,6 +13,7 @@ interface MutationRecord {
   afterSha?: string;
   owner: string;
   toolCallId: string;
+  commitOrder?: number;
   at: number;
 }
 
@@ -34,6 +35,7 @@ export interface MutationTransition {
   path: string;
   beforeSha?: string | undefined;
   afterSha?: string | undefined;
+  commitOrder?: number | undefined;
 }
 
 type ProvenanceKind = "current-session" | "other-session" | "mixed" | "unattributed";
@@ -114,6 +116,7 @@ export const recordMutationTransitions = async (
       afterSha: transition.afterSha,
       owner,
       toolCallId,
+      ...(transition.commitOrder === undefined ? {} : { commitOrder: transition.commitOrder }),
       at,
     }];
   });
@@ -179,7 +182,10 @@ const readRecords = async (root: string, since: number): Promise<MutationRecord[
       // A concurrent atomic replacement or malformed journal is unattributed.
     }
   }));
-  return records.sort((a, b) => a.at - b.at || a.toolCallId.localeCompare(b.toolCallId));
+  return records.sort((a, b) => a.at - b.at
+    || a.owner.localeCompare(b.owner)
+    || (a.commitOrder ?? Number.MAX_SAFE_INTEGER) - (b.commitOrder ?? Number.MAX_SAFE_INTEGER)
+    || a.toolCallId.localeCompare(b.toolCallId));
 };
 
 const kindForOwners = (owners: Set<string>, currentOwner: string): ProvenanceKind => {

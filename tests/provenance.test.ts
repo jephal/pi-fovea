@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   attributeChanges,
   captureMutation,
@@ -81,6 +81,25 @@ describe("sync provenance", () => {
       kind: "current-session",
       files: { "file.ts": "current-session", "other.ts": "current-session" },
     });
+  });
+
+  it("uses receipt commit order when timestamps cannot order one session's transitions", async () => {
+    const { root } = rootWithFile();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    try {
+      await recordMutationTransitions(root, [{
+        path: "file.ts", beforeSha: hash("one\n"), afterSha: hash("two\n"), commitOrder: 4,
+      }], "session-a", "z-call");
+      await recordMutationTransitions(root, [{
+        path: "file.ts", beforeSha: hash("two\n"), afterSha: hash("three\n"), commitOrder: 5,
+      }], "session-a", "a-call");
+      journals.push(provenancePathFor(root, "session-a"));
+      await expect(attributeChanges(root, "session-a", 0, [{
+        file: "file.ts", beforeSha: hash("one\n"), afterSha: hash("three\n"),
+      }])).resolves.toEqual({ kind: "current-session", files: { "file.ts": "current-session" } });
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("reports a transition chain owned by multiple sessions as mixed", async () => {
