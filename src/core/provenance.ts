@@ -86,29 +86,23 @@ const persistRecord = async (target: string, journal: MutationJournal, record: M
   await rename(temporary, target);
 };
 
-export const finishMutation = async (
-  capture: MutationCapture,
+export const recordMutationTransition = async (
+  root: string,
+  path: string,
+  beforeSha: string | undefined,
+  afterSha: string | undefined,
   sessionId: string,
   toolCallId: string,
 ): Promise<boolean> => {
-  const afterSha = await hashFile(capture.absolutePath);
-  if (capture.beforeSha === afterSha) return false;
+  const located = repoPath(root, path);
+  if (!located || beforeSha === afterSha) return false;
+  const resolvedRoot = resolve(root);
   const owner = ownerFor(sessionId);
-  const target = provenancePathFor(capture.root, sessionId);
-  const record: MutationRecord = {
-    file: capture.file,
-    beforeSha: capture.beforeSha,
-    afterSha,
-    owner,
-    toolCallId,
-    at: Date.now(),
-  };
+  const target = provenancePathFor(resolvedRoot, sessionId);
+  const record: MutationRecord = { file: located.file, beforeSha, afterSha, owner, toolCallId, at: Date.now() };
   const previous = writeQueues.get(target) ?? Promise.resolve();
   const queued = previous.catch(() => {}).then(() => persistRecord(target, {
-    version: JOURNAL_VERSION,
-    root: capture.root,
-    owner,
-    records: [],
+    version: JOURNAL_VERSION, root: resolvedRoot, owner, records: [],
   }, record));
   writeQueues.set(target, queued);
   try {
@@ -118,6 +112,14 @@ export const finishMutation = async (
     if (writeQueues.get(target) === queued) writeQueues.delete(target);
   }
 };
+
+export const finishMutation = async (
+  capture: MutationCapture,
+  sessionId: string,
+  toolCallId: string,
+): Promise<boolean> => recordMutationTransition(
+  capture.root, capture.file, capture.beforeSha, await hashFile(capture.absolutePath), sessionId, toolCallId,
+);
 
 const readRecords = async (root: string, since: number): Promise<MutationRecord[]> => {
   const prefix = prefixFor(root);

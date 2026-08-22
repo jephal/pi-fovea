@@ -8,6 +8,7 @@ import {
   captureMutation,
   finishMutation,
   provenancePathFor,
+  recordMutationTransition,
 } from "../src/core/provenance.js";
 
 const hash = (text: string): string => createHash("sha1").update(text).digest("hex");
@@ -51,6 +52,17 @@ describe("sync provenance", () => {
       kind: "other-session",
       files: { "file.ts": "other-session" },
     });
+  });
+
+  it("attributes an explicit trusted hash transition", async () => {
+    const { root, file } = rootWithFile();
+    await expect(recordMutationTransition(
+      root, file, hash("one\n"), hash("two\n"), "session-a", "receipt-a",
+    )).resolves.toBe(true);
+    journals.push(provenancePathFor(root, "session-a"));
+    await expect(attributeChanges(root, "session-a", 0, [{
+      file: "file.ts", beforeSha: hash("one\n"), afterSha: hash("two\n"),
+    }])).resolves.toEqual({ kind: "current-session", files: { "file.ts": "current-session" } });
   });
 
   it("reports a transition chain owned by multiple sessions as mixed", async () => {

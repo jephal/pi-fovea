@@ -205,7 +205,7 @@ next user prompt instead; it never restarts an idle agent. The compact update
 names changed files, route deltas, and newly relevant files. Shell commands,
 external editors, and agents without Fovea remain `unattributed` rather than
 being guessed, while the path scope still keeps unrelated sibling sandboxes
-quiet. Provenance journals are bounded, expire after seven days, and live in
+quiet. Provenance journals accept either intercepted mutations or explicit trusted SHA-1 transitions, are bounded, expire after seven days, and live in
 `$TMPDIR`; repository content remains the drift oracle. Updates list causal
 channels such as calls, imports, shared literals, tests, or co-change history.
 By default Fovea also embeds the refreshed focus context of the top drift target
