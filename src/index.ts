@@ -13,6 +13,7 @@ import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
 import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
 import { observeSessionPaths, resetSessions } from "./core/session.js";
+import { gitOut } from "./core/git.js";
 import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
 import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
 import type { NodeKind } from "./core/types.js";
@@ -575,14 +576,13 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         const [state, tracked, astGrep] = await Promise.all([
           sketch(ctx.cwd, 256),
-          pi.exec("git", ["-C", ctx.cwd, "ls-files"], { timeout: 15_000 })
-            .catch(() => ({ code: -1, stdout: "" })),
+          gitOut(ctx.cwd, ["ls-files"], { timeout: 15_000 }),
           pi.exec(process.env.FOVEA_AST_GREP ?? "ast-grep", ["--version"], { timeout: 15_000 })
             .catch(() => ({ code: -1, stdout: "" })),
         ]);
         const indexed = Number(state.details.files ?? 0);
-        const trackedCount = tracked.code === 0
-          ? tracked.stdout.split("\n").filter(Boolean).length
+        const trackedCount = tracked !== undefined
+          ? tracked.split("\n").filter(Boolean).length
           : undefined;
         const coverage = trackedCount === undefined ? `${indexed} indexed files` : `${indexed}/${trackedCount} tracked files indexed`;
         const failedCount = Number(state.details.extractionFailures ?? 0);
