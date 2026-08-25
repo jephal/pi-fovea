@@ -4,6 +4,7 @@
 // incremental across sessions.
 
 import { readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolveAgentDir } from "./core/agent-dir.js";
@@ -78,6 +79,20 @@ const NODE_KINDS = new Set<NodeKind>([
 ]);
 const focusKind = (value: string | undefined): NodeKind | undefined =>
   value && NODE_KINDS.has(value as NodeKind) ? value as NodeKind : undefined;
+
+// The agent-facing extension may inspect the active workspace, but should not
+// turn an LLM-provided root argument into an arbitrary filesystem reader.
+// Nested repositories remain usable; parents and unrelated absolute paths do
+// not. The standalone CLI intentionally keeps its explicit root behavior.
+const workspaceRoot = (cwd: string, requested?: string): string => {
+  const base = resolve(cwd);
+  const root = resolve(base, requested ?? ".");
+  const rel = relative(base, root);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`fovea: root must be the current workspace or one of its descendants: ${requested ?? "."}`);
+  }
+  return root;
+};
 
 export default function fovea(pi: ExtensionAPI) {
   // Per-root config cache; invalidated by settings saves (/fovea settings).
@@ -238,6 +253,7 @@ export default function fovea(pi: ExtensionAPI) {
           // first prompt fast-paths instead of paying the snapshot on the
           // send path. A /new, /fork, or reload bumps the epoch and clears it.
           const pre = configFor(ctx.cwd, ctx.isProjectTrusted());
+          if (!syncRuns(pre)) return;
           void sync(
             ctx.cwd,
             { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus, scope: pre.sync.scope, sessionId },
@@ -297,6 +313,7 @@ export default function fovea(pi: ExtensionAPI) {
     turnFiles = [];
   });
   pi.on("tool_execution_start", async (event, ctx) => {
+    if (!syncRuns(configFor(ctx.cwd, ctx.isProjectTrusted()))) return;
     const args = event.args as { path?: unknown };
     if (ATTENTION_PATH_TOOLS.has(event.toolName) && typeof args.path === "string") {
       observeSessionPaths(ctx.cwd, [args.path]);
@@ -310,6 +327,7 @@ export default function fovea(pi: ExtensionAPI) {
   // Warm once the file is actually on disk (tool_execution_start fires during
   // preflight, before the write lands); the debounce also coalesces bursts.
   pi.on("tool_execution_end", async (event, ctx) => {
+    if (!syncRuns(configFor(ctx.cwd, ctx.isProjectTrusted()))) return;
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const capture = pendingMutations.get(event.toolCallId);
     pendingMutations.delete(event.toolCallId);
@@ -404,7 +422,7 @@ export default function fovea(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({ root: RootParam, maxTokens: BudgetParam }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea sketch cancelled");
         onUpdate?.({ content: [text("Surveying production architecture…")], details: { phase: "sketch" } });
@@ -439,7 +457,7 @@ export default function fovea(pi: ExtensionAPI) {
       maxTokens: BudgetParam,
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea focus cancelled");
         onUpdate?.({ content: [text("Resolving focused repository context…")], details: { phase: "focus" } });
@@ -474,7 +492,7 @@ export default function fovea(pi: ExtensionAPI) {
       maxTokens: BudgetParam,
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea dwell cancelled");
         onUpdate?.({ content: [text("Widening the current graph context…")], details: { phase: "diffuse" } });
@@ -502,7 +520,7 @@ export default function fovea(pi: ExtensionAPI) {
       maxTokens: BudgetParam,
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea impact cancelled");
         onUpdate?.({ content: [text("Tracing likely change impact…")], details: { phase: "impact" } });

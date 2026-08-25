@@ -54,7 +54,9 @@ export interface FoveaConfig {
 
 export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   sync: {
-    mode: "enabled",
+    // Agent-only fork default: indexing is available, but proactive context
+    // steering is opt-in so loading the package cannot start extra turns.
+    mode: "disabled",
     scope: "session",
     budget: 512,
     ackClean: false,
@@ -68,7 +70,9 @@ export const DEFAULT_FOVEA_CONFIG: FoveaConfig = {
   },
   tools: {
     defaultBudget: 512,
-    grepMode: "augment",
+    // Leave Pi's native grep untouched by default. The graph tools are
+    // explicit; augment/replace are opt-in integration modes.
+    grepMode: "off",
     grepAugmentBudget: 512,
   },
 };

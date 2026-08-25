@@ -101,6 +101,11 @@ const enableGrep = async () => {
   return { root, ...loaded };
 };
 
+const enableProjectSync = (root: string, mode: "enabled" | "hidden" = "enabled"): void => {
+  mkdirSync(path.join(root, ".pi"), { recursive: true });
+  writeFileSync(path.join(root, ".pi", "fovea.json"), JSON.stringify({ sync: { mode } }));
+};
+
 describe("extension entry", () => {
   it("registers four graph tools and /fovea before session startup", () => {
     const { tools, commands } = load();
@@ -114,8 +119,21 @@ describe("extension entry", () => {
     expect(commands.get("fovea")!.getArgumentCompletions?.("").map((item) => item.value)).toEqual([
       "status", "settings", "reset", "reload",
     ]);
-    expect(DEFAULT_FOVEA_CONFIG.tools.grepMode).toBe("augment");
+    expect(DEFAULT_FOVEA_CONFIG.sync.mode).toBe("disabled");
+    expect(DEFAULT_FOVEA_CONFIG.tools.grepMode).toBe("off");
     expect(DEFAULT_FOVEA_CONFIG.tools.grepAugmentBudget).toBe(512);
+  });
+
+  it("rejects graph roots outside the active workspace", async () => {
+    const { tools } = load();
+    const focusTool = tools.get("fovea_focus")!;
+    await expect(focusTool.execute(
+      "outside-root",
+      { query: "secret", root: ".." },
+      new AbortController().signal,
+      undefined,
+      fakeCtx(FIXTURE),
+    )).rejects.toThrow(/current workspace or one of its descendants/);
   });
 
   it("reloads extension source through /fovea reload", async () => {
@@ -221,8 +239,8 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(message).toMatch(/pi-fovea \d+\.\d+\.\d+/);
     expect(message).toContain("tracked files indexed");
     expect(message).toContain("production anchors");
-    expect(message).toContain("sync enabled");
-    expect(message).toContain("grep augment");
+    expect(message).toContain("sync disabled");
+    expect(message).toContain("grep off");
     expect(message).toContain("ast-grep");
   });
 
@@ -320,6 +338,9 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
 
   it("co-existence: native grep results gain a Fovea graph section for symbol queries", async () => {
     resetSessions();
+    const agentDirRoot = mkdtempSync(path.join(tmpdir(), "pi-fovea-augment-global-"));
+    writeFileSync(path.join(agentDirRoot, "fovea.json"), JSON.stringify({ tools: { grepMode: "augment" } }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDirRoot);
     const loaded = load();
     const [patch] = await loaded.emit("tool_result", {
       type: "tool_result",
@@ -357,6 +378,8 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       isError: false,
     }, fakeCtx(FIXTURE));
     expect((scopedPatch as { content: Array<{ text: string }> }).content).toHaveLength(2);
+    vi.unstubAllEnvs();
+    rmSync(agentDirRoot, { recursive: true, force: true });
   });
 
   it("skips augmentation for regex patterns, errors, non-grep tools, and off/replace modes", async () => {
@@ -426,10 +449,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root); // session_start pre-warm equivalent
       await loaded.emit("before_agent_start", { prompt: "first" }, ctx);
@@ -464,10 +488,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root);
       await loaded.emit("before_agent_start", { prompt: "first" }, ctx);
@@ -514,8 +539,9 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root);
       await loaded.emit("session_start", { reason: "startup" }, ctx);
@@ -546,10 +572,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root); // session_start pre-warm equivalent
       await loaded.emit("before_agent_start", { prompt: "change the route" }, ctx); // establish pre-edit baseline
@@ -585,10 +612,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root, false, "session-a");
+    const ctx = fakeCtx(root, true, "session-a");
     const main = path.join(root, "server/main.go");
     try {
       await ensureState(root);
@@ -683,6 +711,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       expect(before.filter((result) => result !== undefined)).toEqual([]);
       expect(loaded.messages).toHaveLength(0);
       expect(getState(root)).toBeUndefined();
+      expect(existsSync(provenancePathFor(root, "test-session"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -697,10 +726,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root);
       await loaded.emit("before_agent_start", { prompt: "add a route" }, ctx);

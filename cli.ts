@@ -105,23 +105,9 @@ try {
     const st = await ensureState(root);
     const sigs = aggregateFiles(Object.fromEntries(Object.entries(st.facts).map(([k, v]) => [k, v.sigs])));
     const promoted = promote(sigs, DEFAULT_PACK);
-    if (flags.has("adopt") && promoted.length) {
-      const { mkdirSync, writeFileSync, readFileSync } = await import("node:fs");
-      const { join } = await import("node:path");
-      mkdirSync(join(root, ".fovea"), { recursive: true });
-      const rulesFile = join(root, ".fovea", "rules.json");
-      let existing = { rules: [] as unknown[] };
-      try { existing = JSON.parse(readFileSync(rulesFile, "utf8")); } catch { /* new */ }
-      const stamp = promoted.map((r) => ({
-        id: r.id.slice("implicit:".length),
-        langs: r.langs,
-        pattern: r.patterns[0],
-        methods: r.methods,
-        kind: r.kind,
-      }));
-      existing.rules = [...existing.rules, ...stamp];
-      writeFileSync(rulesFile, JSON.stringify(existing, null, 2) + "\n");
-      out = `wrote ${stamp.length} discovered rule(s) to .fovea/rules.json`;
+    if (flags.has("adopt")) {
+      console.error("fovea rules --adopt is disabled in the agent-safe fork; write project rules explicitly instead.");
+      process.exit(2);
     } else if (flags.has("sigs")) {
       out = sigs.filter((s) => s.pathN > 0)
         .sort((a, b) => posterior(b.pathN, b.n) - posterior(a.pathN, a.n))
