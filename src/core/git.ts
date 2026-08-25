@@ -23,6 +23,8 @@ export const gitOut = async (
             encoding: "utf8",
             timeout: opts.timeout ?? GIT_TIMEOUT,
             maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024,
+            // Graph inspection must not refresh or lock the repository index.
+            env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
           },
           (error, stdout) => {
             if (error) {
