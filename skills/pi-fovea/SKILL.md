@@ -5,7 +5,7 @@ description: Token-efficient repo navigation with the pi-fovea code graph. Use w
 
 # pi-fovea
 
-pi-fovea maintains a cross-language code graph of the working repository — routes, symbols, imports, calls, string/env literals — and exposes it through progressive disclosure: cheap silhouettes first, detail only where you point it. It costs almost nothing until you ask, and it re-syncs automatically whenever file content drifts, no matter which tool made the edit.
+This agent-safe fork maintains a cross-language code graph of the working repository — routes, symbols, imports, calls, and safe cross-file literals — and exposes it through progressive disclosure: cheap silhouettes first, detail only where you point it. Graph tools are explicit and token-bounded. Continuous turn sync and grep interception are opt-in, so loading the package does not create extra model turns or alter Pi's native file/search tools.
 
 ## The loop
 
@@ -25,7 +25,7 @@ All four accept `maxTokens` (256–16000). Budget is roughly 4 chars per token.
 
 ## Turn sync
 
-Before an agent starts, pi-fovea establishes its baseline or injects relevant out-of-band semantic drift into that run. After each assistant turn it compares again. The default `sync.scope: "session"` indexes the whole root but steers only for top-level directories/root files this conversation entered through path-bearing tools or focus. Sibling-directory drift advances the index and baseline silently. Current, mixed, and unattributed changes in scope may trigger a continuation; changes owned solely by another Fovea session wait for the next user prompt and cannot restart an idle agent. Comment- and formatting-only edits stay silent. Set `sync.scope: "repository"` only when root-wide steering is intentional.
+Continuous turn sync is disabled by default in this fork. If explicitly enabled, before an agent starts pi-fovea establishes its baseline or injects relevant out-of-band semantic drift into that run. After each assistant turn it compares again. The default `sync.scope: "session"` indexes the whole root but steers only for top-level directories/root files this conversation entered through path-bearing tools or focus. Sibling-directory drift advances the index and baseline silently. Current, mixed, and unattributed changes in scope may trigger a continuation; changes owned solely by another Fovea session wait for the next user prompt and cannot restart an idle agent. Comment- and formatting-only edits stay silent. Set `sync.scope: "repository"` only when root-wide steering is intentional.
 
 Sync is **mutation-path agnostic**: pi's edit/write tools, a pi-fabric `fabric_exec` program's inner `pi.edit`, a bash heredoc, a subagent, or an editor save outside the session all register identically. Content hashes are the source of truth; tool events establish attention but are not the drift oracle. Successful edit/write events additionally record exact hash transitions so sync can label current-session, other-Fovea-session, and mixed provenance; uninstrumented mutation paths remain explicitly unattributed. In repos with no `.git` directory content drift is also the only change signal — do not fall back to `git status` assumptions.
 
@@ -45,6 +45,6 @@ The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON
 
 ## Settings
 
-Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`; the external-editor key (`Ctrl+G` by default) switches the displayed and saved layer between global defaults and project overrides. `tools.grepMode` controls the grep integration: `"augment"` (default) keeps native grep semantics and appends a Fovea graph section to symbol-query results — including `pi.grep` calls inside fabric_exec — `"replace"` keeps the legacy bare-query takeover, `"off"` is native only.
+Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`; the external-editor key (`Ctrl+G` by default) switches the displayed and saved layer between global defaults and project overrides. This fork defaults to `sync.mode: "disabled"` and `tools.grepMode: "off"`. Set `sync.mode` to `"enabled"` or `"hidden"` and `tools.grepMode` to `"augment"`/`"replace"` only when those integrations are intentional.
 
 Budget overflow is not a dead end: any `… more results collapsed or outside budget` footer names a tmp artifact (`/tmp/pi-fovea-<op>-<hash>.txt`) holding the FULL list — read or grep that file for the remainder. Reach for `fovea_dwell` when you want a wider neighborhood, not just more of the same list.

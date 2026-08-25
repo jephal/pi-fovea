@@ -17,20 +17,18 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 </div>
 
-pi-fovea gives the model a map of your repo on every prompt. The repo compiles
-once into a cross-language graph of code. Symbols, files, and route anchors
-share one network. Your question becomes an interest vector that diffuses
-through the graph as heat. The renderer caps the field inside a token budget.
-Near the question you get exact source locations and full signatures. One hop
-out you get typed relationships. Past that the repo collapses to a skeleton.
+This agent-safe fork gives the model a compact, query-driven map of your repo.
+The repo compiles into a cross-language graph of code. Symbols, files, and
+route anchors share one network. The model's question becomes an interest
+vector that diffuses through the graph as heat. The renderer caps the field
+inside a token budget. Near the question the model gets exact source locations
+and full signatures. One hop out it gets typed relationships. Past that the
+repo collapses to a skeleton.
 
-When a session starts, Fovea records a baseline of the repo. If files
-changed while Pi was idle, those changes enter context before the first model
-call. Fovea checks the repo again after each assistant turn. Detection uses
-file content hashes. An edit from a Pi tool, fabric_exec, bash, a subagent,
-or an editor looks the same to Fovea. Edits that touch only comments or
-formatting stay silent. A meaningful change arrives as a **steer**. When the
-agent is about to stop, Fovea starts the next turn itself.
+Graph tools are explicit. Continuous turn sync and grep interception are
+disabled by default, so loading the package does not create extra model turns
+or alter Pi's native file/search tools. Sensitive credential-bearing files are
+excluded before extraction and cache persistence.
 
 ## Where fovea fits in shipping a feature
 
@@ -67,7 +65,7 @@ match returns the nearest symbols plus their locations. Direct graph edges
 carry labels such as caller, callee, route, shared literal, and co-change.
 Symbols that merely share a file stay collapsed.
 
-The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`,
+The **Hybrid grep** toggle is off by default in this fork. `grep({ pattern: "CreateUser" })`,
 `grep({ pattern: "Controller.create" })`, and route paths travel through the
 graph. Calls that carry text-search options or obvious regexes go to Pi's
 native grep. A graph miss falls back to native text. A graph error, such as a
@@ -146,6 +144,25 @@ npm i -g pi-fovea      # or: pnpm add -g pi-fovea, bun add -g pi-fovea
 
 From a checkout, `pnpm fovea` runs the live source via `tsx`, and `pnpm run build:cli` rebuilds `dist/cli.mjs` (the `prepack` hook keeps the published bundle in sync).
 
+## Agent-safe defaults
+
+This fork is intended to help agents navigate code, not to provide a human
+code browser. It defaults to explicit graph tools only:
+
+- `sync.mode: "disabled"` — no proactive model messages or extra turns;
+- `tools.grepMode: "off"` — Pi's native grep/read/edit tools are untouched;
+- credential-bearing files (`.env*`, auth/credential/secret/token manifests,
+  private-key files, and package auth files) are excluded before extraction;
+- graph roots supplied through Pi tools must be the current workspace or a
+  descendant; the standalone CLI retains its explicit-root behavior;
+- the CLI's `rules --adopt` repository-writing operation is disabled.
+
+The graph cache, overflow artifacts, and co-change cache are written only
+under `$TMPDIR`. The runtime has no HTTP client or telemetry path. It invokes
+only the fixed `git` executable and the explicitly configured `ast-grep`
+executable, both without a shell. Enable sync or hybrid grep only through an
+explicit trusted configuration change.
+
 ## Large workspaces and startup
 
 Indexing runs in the background at `session_start`. Your first prompt never
@@ -185,7 +202,7 @@ details.
 
 ## Turn sync
 
-Continuous sync is enabled and visible by default. Before an agent starts,
+Continuous sync is disabled by default in this fork. When explicitly enabled,
 Fovea establishes its baseline or injects relevant drift ahead of the first
 model call. After every assistant turn it compares symbols, calls, imports,
 literals, and anchors again. Content hashes keep the unchanged fast path cheap.
@@ -254,14 +271,14 @@ effective while its global default is being edited.
 
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
-| `sync.mode` | `"enabled"` | `"enabled"` shows model-visible sync messages, `"hidden"` keeps them model-visible but out of the transcript, and `"disabled"` turns sync off. Legacy `sync.enabled` booleans still parse. |
+| `sync.mode` | `"disabled"` | `"enabled"` shows model-visible sync messages, `"hidden"` keeps them model-visible but out of the transcript, and `"disabled"` turns sync off. Legacy `sync.enabled` booleans still parse. |
 | `sync.scope` | `"session"` | `"session"` steers only for top-level directories/root files this conversation entered while indexing the whole root; `"repository"` restores root-wide steering. |
 | `sync.budget` | `512` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |
 | `sync.pushFocus` | `true` | embed a budgeted focus preview of the top drift target in red syncs |
 | `tools.defaultBudget` | `512` | fallback maxTokens for the fovea_* tools |
-| `tools.grepMode` | `"augment"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
+| `tools.grepMode` | `"off"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
 | `tools.grepAugmentBudget` | `512` | token cap for the appended graph section |
 
 Budgets cap the rendered view, not the map: whenever sketch, focus, dwell, or
@@ -300,7 +317,7 @@ hub, that hub upgrades to first-class.
 fovea anchors <root> --discovered   # the △ hypothesis hubs only
 fovea rules <root>                  # promoted rules with evidence
 fovea rules <root> --sigs           # every path-touching signature, by precision
-fovea rules <root> --adopt          # persist promotions into .fovea/rules.json
+# `--adopt` is disabled in the agent-safe fork; write project rules explicitly.
 ```
 
 `.fovea/rules.json` pins community or project rules in the repo:

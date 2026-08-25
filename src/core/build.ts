@@ -82,6 +82,11 @@ export interface ExtractionReport {
   generated: string[];
 }
 const IGNORE_DIRS = new Set([".git", "node_modules", "dist", "vendor", ".venv", "venv", "target", "coverage", ".next", "build", "__pycache__", ".pi", ".pi-fovea", "deps", "_build", ".tox", "Pods", ".cargo"]);
+// Secrets and credentials are not useful graph input. Excluding them before
+// extraction prevents both literal values and derived facts from entering the
+// cache or model-facing relationship output.
+const SENSITIVE_FILE_RE = /(?:^|\/)\.env(?:\..*)?$|(?:^|\/)(?:\.npmrc|\.pypirc|credentials?\.(?:json|ya?ml|toml|ini)|secrets?\.(?:json|ya?ml|toml|ini)|auth\.(?:json|ya?ml|toml|ini)|tokens?\.(?:json|ya?ml|toml|ini))$|\.(?:pem|key|p12|pfx)$/i;
+const isSensitiveFile = (f: string): boolean => SENSITIVE_FILE_RE.test(f);
 // File count is also a resident-graph budget, not just a discovery limit.
 // Override deliberately for giant monorepos; normal roots stay bounded.
 const MAX_FILES = envInt("FOVEA_MAX_FILES", 8000, 100, 100_000);
@@ -95,6 +100,7 @@ const LOCKFILE_NAMES = new Set([
 ]);
 
 const isJunk = (f: string): boolean => {
+  if (isSensitiveFile(f)) return true;
   const segs = f.split("/");
   for (const s of segs) if (IGNORE_DIRS.has(s)) return true;
   const base = segs[segs.length - 1]!.toLowerCase();

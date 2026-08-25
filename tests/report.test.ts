@@ -78,6 +78,23 @@ describe("bounded discovery", () => {
     }
   });
 
+  it("skips credential-bearing files before extraction", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fovea-sensitive-"));
+    try {
+      writeFileSync(join(root, ".env"), "DATABASE_URL=postgres://user:password@example.invalid/db\n");
+      writeFileSync(join(root, ".env.example"), "DATABASE_URL=postgres://example\n");
+      writeFileSync(join(root, "credentials.json"), '{"token":"should-not-enter-the-graph"}\n');
+      writeFileSync(join(root, "tls.pem"), "-----BEGIN PRIVATE KEY-----\nsecret\n");
+      writeFileSync(join(root, "safe.ts"), "export function SafeGraphInput() {}\n");
+      expect(await listFiles(root)).toEqual(["safe.ts"]);
+      const { store } = await loadFacts(root, await listFiles(root));
+      expect([...store.facts.keys()]).toEqual(["safe.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cachePathFor(root), { force: true });
+    }
+  });
+
   it("skips Cargo package caches during umbrella walks", async () => {
     // ~/.cargo/registry/src and ~/.cargo/git/checkouts hold vendored crate
     // copies (e.g. aws-lc-sys' generated BoringSSL tables), the same class of
