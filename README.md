@@ -4,7 +4,7 @@
 
 **A foveated repo-mapping extension for [Pi](https://github.com/earendil-works/pi-coding-agent)**
 
-_See the whole repo on every prompt, sharp where you work and cheap everywhere else._
+_Give agents the whole repo's shape, then only the relevant context._
 
 <p>
   <img src="https://raw.githubusercontent.com/monotykamary/pi-fovea/main/media/cover.svg" alt="pi-fovea: a code graph seen through a fovea, hot at the center and collapsed at the rim" width="1100">
