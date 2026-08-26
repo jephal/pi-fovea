@@ -157,8 +157,11 @@ code browser. It defaults to explicit graph tools only:
   descendant; the standalone CLI retains its explicit-root behavior;
 - the CLI's `rules --adopt` repository-writing operation is disabled.
 
-The graph cache, overflow artifacts, and co-change cache are written only
-under `$TMPDIR`. The runtime has no HTTP client or telemetry path. It invokes
+The compatibility JSONL and co-change caches live under `$TMPDIR`; private
+per-worktree SQLite snapshots live outside the repository in
+`$FOVEA_CACHE_DIR/pi-fovea/worktrees` (or `$XDG_CACHE_HOME`, then `~/.cache`).
+Overflow artifacts use a `0700` private temp subdirectory and `0600` files.
+The runtime has no HTTP client or telemetry path. It invokes
 only the fixed `git` executable and the explicitly configured `ast-grep`
 executable, both without a shell. Enable sync or hybrid grep only through an
 explicit trusted configuration change.
@@ -195,10 +198,58 @@ limits accept environment overrides:
 | `FOVEA_MEMORY_HALF_LIFE_HOURS` | `48` | wall-clock half-life of the per-node sync memory (charged cascade warmth) |
 | `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
 | `FOVEA_MAX_SUBMODULE_DEPTH` | `4` | recursion cap for nested submodules |
+| `FOVEA_CACHE_DIR` | XDG cache home / `~/.cache` | absolute cache home; Fovea creates its private `pi-fovea/worktrees` namespace beneath it |
+| `FOVEA_NO_CACHE` | unset | any truthy value disables SQLite, JSONL, and co-change persistence for the process |
+| `FOVEA_CACHE_TTL_DAYS` | `30` | age after which an inactive cache can be reclaimed |
+| `FOVEA_CACHE_MAX_BYTES` | `536870912` | total private worktree-cache budget before oldest eligible entries are reclaimed |
+| `FOVEA_CACHE_CLEANUP_GAP_MS` | `21600000` | minimum gap between automatic cleanup scans |
 
 Files over the size cap keep their place in the model's view of the repo.
 Failed extractions do the same. You find both in `/fovea status` and in tool
 details.
+
+### Cache lifecycle and privacy
+
+On a cold root, Fovea creates a private `0700` per-worktree directory and
+records the physical root plus Git worktree metadata. Automatic cleanup runs
+best-effort and is throttled (six hours by default). It reclaims only an old,
+missing, or pruned-worktree entry, and only when it has no live process lease.
+Any malformed identity, unreadable entry, active lease, or `fovea.sqlite-wal` /
+`-shm` sidecar is **kept**, not guessed away. The size budget chooses the oldest
+otherwise eligible entries; it never forces deletion of a protected cache.
+
+Inspect without mutation with `fovea cache status` or `fovea cache dry-run`.
+`fovea cache purge <root>` and `/fovea cache purge` explicitly target only that
+root; they retain the same lease and WAL/SHM protections. `/fovea cache` and
+`/fovea cache dry-run` show the in-session diagnostic summary. Set
+`FOVEA_NO_CACHE=1` for ephemeral/CI runs, or set an absolute
+`FOVEA_CACHE_DIR=/secure/cache/home` to select the cache home. A cache failure
+is always an optimization failure: graph construction proceeds from source.
+
+Sensitive filenames are excluded before extraction. As a second boundary,
+model-facing renders and overflow artifacts redact common inline API keys,
+tokens, passwords, private-key blocks, and JWT-shaped values. This is a guard
+rail rather than permission to index secrets.
+
+### Lazy SQLite queries
+
+When Node provides `node:sqlite` and the current indexed snapshot is available,
+cold or evicted `fovea_focus`, `fovea_dwell`, and file/symbol-seeded
+`fovea_impact` do not hydrate the repository graph. They use indexed
+symbol/anchor/literal/file seeds and a capped weighted breadth-first read of
+incident relationships. The result keeps typed edge labels and deterministic
+ordering; its details identify `queryMode: "sqlite-index"`, bounded confidence,
+and any omitted long-path or co-change evidence. A locked, unavailable, or
+replaced snapshot falls back to the eager in-memory graph, preserving
+small-repository compatibility. A resident impact state deliberately keeps its
+existing full-history co-change ranking rather than discarding that evidence.
+
+`fovea_sketch` deliberately remains a whole-repository operation: its
+production-first ranking and basin silhouette require global conductance. Index
+construction/refresh likewise still builds the full derived graph before it
+atomically publishes the SQLite snapshot. The trade-off is a little per-query
+SQLite open/planning latency in exchange for avoiding unrelated facts, nodes,
+and edges in focused-operation memory.
 
 ## Turn sync
 
@@ -282,8 +333,9 @@ effective while its global default is being edited.
 | `tools.grepAugmentBudget` | `512` | token cap for the appended graph section |
 
 Budgets cap the rendered view, not the map: whenever sketch, focus, dwell, or
-impact truncate results for budget, the full list spills to
-`$TMPDIR/pi-fovea-<op>-<hash>.txt` and the footer names the path — read or grep
+impact truncate results for budget, the full list spills to a private
+`$TMPDIR/pi-fovea-overflow/pi-fovea-<op>-<hash>.txt` artifact (`0700` directory,
+`0600` file) and the footer names the path — read or grep
 the file for the remainder. `fovea_dwell` remains the semantic widen.
 
 ## How routes are found
@@ -403,7 +455,8 @@ pnpm run bench        # rate–distortion bench against ../pi-fabric
 ```
 
 pi loads the extension straight from `src/` through jiti, so nothing needs
-building. Per-repo JSONL caches live in `$TMPDIR`, guarded by per-file content
+building. The SQLite snapshot is a private per-worktree cache; the compatibility
+per-repo JSONL cache lives in `$TMPDIR`, guarded by per-file content
 sha1 values and stat manifests. Cache I/O streams. Only dirty files re-run
 ast-grep. Failed extractions keep fact-free hash markers that stay visible
 across launches. Those files skip the retry on each start. Bump `CACHE_VERSION`

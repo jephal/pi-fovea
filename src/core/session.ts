@@ -25,6 +25,8 @@ export interface FoveaSession {
   syncScopes: Set<string>;
   tk: Float64Array[];
   tkKey: string;
+  /** SQLite-backed focused requests retain only stable seed keys, not a graph. */
+  lazy?: { seeds: string[]; generation: number; files: number; uncertain: true };
 }
 
 export const FOCUS_T0 = 2;
@@ -50,6 +52,7 @@ export const getSession = (root: string): FoveaSession => {
     syncScopes: new Set<string>(),
     tk: [],
     tkKey: "",
+    lazy: undefined,
   };
   sessions.set(root, s);
   while (sessions.size > ROOT_CACHE_LIMIT) sessions.delete(sessions.keys().next().value!);

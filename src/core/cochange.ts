@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { dirname, join as joinPath } from "node:path";
 import { envInt } from "./asyncutil.js";
 import { gitHead, gitOut, gitPrefix, gitRelativePath } from "./git.js";
+import { cacheDisabled } from "./worktree-cache.js";
 
 const LOG_COMMITS = 400;
 const MAX_FILES_PER_COMMIT = 24; // squashed monsters carry no pair signal
@@ -96,10 +97,12 @@ export const coChangeHistory = async (
   const tracked = new Set(filesInGraph);
   const key = createHash("sha1").update([...tracked].sort().join("\n")).digest("hex").slice(0, 12);
   const cp = cachePath(root);
-  try {
-    const cached = JSON.parse(await readFile(cp, "utf8")) as CacheShape;
-    if (cached.v === 2 && cached.head === head && cached.key === key) return groupPairs(cached.pairs);
-  } catch { /* recompute */ }
+  if (!cacheDisabled()) {
+    try {
+      const cached = JSON.parse(await readFile(cp, "utf8")) as CacheShape;
+      if (cached.v === 2 && cached.head === head && cached.key === key) return groupPairs(cached.pairs);
+    } catch { /* recompute */ }
+  }
 
   const log = await gitOut(root, ["log", "--format=%x00%ct", "--numstat", "-n", String(LOG_COMMITS), "--no-renames", "--diff-filter=AMR", "--", "."]) ?? "";
   // numstat lines: "<added>\t<deleted>\t<file>"; each commit begins with a NUL
@@ -166,10 +169,12 @@ export const coChangeHistory = async (
   }
   const pairs = scored.filter((_, i) => keep.has(i));
 
-  try {
-    await mkdir(dirname(cp), { recursive: true });
-    await writeFile(cp, JSON.stringify({ v: 2, head, key, pairs } satisfies CacheShape));
-  } catch { /* cache is an optimization */ }
+  if (!cacheDisabled()) {
+    try {
+      await mkdir(dirname(cp), { recursive: true });
+      await writeFile(cp, JSON.stringify({ v: 2, head, key, pairs } satisfies CacheShape), { mode: 0o600 });
+    } catch { /* cache is an optimization */ }
+  }
   return groupPairs(pairs);
 };
 

@@ -51,6 +51,8 @@ import { makeFileSource } from "./source.js";
 import type { CallSite, Graph, ImportSite, LiteralSite, SymbolRec } from "./types.js";
 import type { AnchorDraft } from "./anchors.js";
 import type { JoinIndex } from "./join.js";
+import { loadSqliteSnapshot, saveSqliteSnapshot } from "./sqlite-store.js";
+import { cacheDisabled } from "./worktree-cache.js";
 
 export interface FileFacts {
   sha1: string;
@@ -65,7 +67,7 @@ export interface FileFacts {
   sigs?: FileSigs;
 }
 
-const CACHE_VERSION = 11; // bump when extractor semantics or the cache schema change (v11: generated-source skip for minified bundles)
+export const CACHE_VERSION = 11; // bump when extractor semantics or the cache schema change (v11: generated-source skip for minified bundles)
 
 // Honest coverage: what the extractor could NOT see. Tools and status render
 // this so a thin graph never reads as a small repo (files dropped silently).
@@ -341,12 +343,16 @@ interface CacheLine {
   failed?: true;
   /** Marker only: generated sources carry empty facts, never partial ones. */
   generated?: true;
+  /** Marker only: stat/read failures have no semantic facts to preserve. */
+  unreadable?: true;
+  oversized?: true;
 }
 
 export const cachePathFor = (root: string): string =>
   joinPath(tmpdir(), `pi-fovea-${createHash("sha1").update(root).digest("hex").slice(0, 16)}.json`);
 
 const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
+  if (cacheDisabled()) return undefined;
   const stream = createReadStream(cachePathFor(root), { encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   let store: FactStore | undefined;
@@ -374,6 +380,8 @@ const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
         const rec = JSON.parse(line) as CacheLine;
         store.meta.set(rec.file, { size: rec.size, mtime: rec.mtime });
         if (rec.generated) store.generated.add(rec.file);
+        if (rec.unreadable) store.unreadable.add(rec.file);
+        if (rec.oversized) store.oversized.add(rec.file);
         if (rec.failed) {
           store.tainted.add(rec.file);
           store.failedSha.set(rec.file, rec.sha1);
@@ -394,9 +402,27 @@ const loadDiskStore = async (root: string): Promise<FactStore | undefined> => {
   }
 };
 
+const sqliteStore = async (root: string): Promise<FactStore | undefined> => {
+  if (cacheDisabled()) return undefined;
+  const snapshot = await loadSqliteSnapshot(root, CACHE_VERSION);
+  if (!snapshot) return undefined;
+  const store = newFactStore(root);
+  store.rulesSha = snapshot.rulesSha;
+  for (const boundary of snapshot.enrolled) store.enrolled.add(boundary);
+  for (const [file, facts] of snapshot.facts) store.facts.set(file, facts);
+  for (const [file, meta] of snapshot.meta) store.meta.set(file, meta);
+  for (const file of snapshot.tainted) store.tainted.add(file);
+  for (const [file, sha1] of snapshot.failedSha) store.failedSha.set(file, sha1);
+  for (const file of snapshot.unreadable) store.unreadable.add(file);
+  for (const file of snapshot.oversized) store.oversized.add(file);
+  for (const file of snapshot.generated) store.generated.add(file);
+  return store;
+};
+
 const persistDebounce = new Map<string, ReturnType<typeof setTimeout>>();
 
-export const persistFacts = async (store: FactStore): Promise<void> => {
+const persistJsonlFacts = async (store: FactStore): Promise<void> => {
+  if (cacheDisabled()) return;
   const header = JSON.stringify({
     fovea: CACHE_VERSION,
     root: store.root,
@@ -411,13 +437,19 @@ export const persistFacts = async (store: FactStore): Promise<void> => {
     try {
       let batch = header + "\n";
       let count = 0;
-      const files = new Set([...store.facts.keys(), ...store.failedSha.keys()]);
+      const files = new Set([
+        ...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized,
+      ]);
       for (const file of files) {
         const facts = store.facts.get(file);
         const meta = store.meta.get(file);
         if (!meta) continue;
         let line: CacheLine | undefined;
-        if (store.tainted.has(file)) {
+        if (store.unreadable.has(file)) {
+          line = { file, sha1: "", size: meta.size, mtime: meta.mtime, unreadable: true };
+        } else if (store.oversized.has(file)) {
+          line = { file, sha1: "", size: meta.size, mtime: meta.mtime, oversized: true };
+        } else if (store.tainted.has(file)) {
           const sha1 = store.failedSha.get(file) ?? facts?.sha1;
           if (sha1) line = { file, sha1, size: meta.size, mtime: meta.mtime, failed: true };
         } else if (facts) {
@@ -440,11 +472,28 @@ export const persistFacts = async (store: FactStore): Promise<void> => {
       await handle.close();
     }
     await rename(tmpName, target);
-    store.savedAt = Date.now();
   } catch {
     await rm(tmpName, { force: true }).catch(() => undefined);
     // Cache is an optimization; never fail the build over it.
   }
+};
+
+/**
+ * SQLite is the durable source when available. For this release only, keep a
+ * compatibility JSONL mirror so a later unsupported/locked/corrupt SQLite
+ * open can warm-start without extraction; readers still always prefer rows.
+ */
+export const persistFacts = async (store: FactStore): Promise<void> => {
+  if (cacheDisabled()) return;
+  try {
+    const files = [...store.meta.keys()].sort();
+    const { graph } = await assembleGraph(store.root, files, store.facts);
+    await saveSqliteSnapshot(store, graph, CACHE_VERSION);
+  } catch {
+    // JSONL is independently written below and keeps SQLite failures harmless.
+  }
+  await persistJsonlFacts(store);
+  store.savedAt = Date.now();
 };
 
 /**
@@ -453,6 +502,9 @@ export const persistFacts = async (store: FactStore): Promise<void> => {
  * the first listing so a restart restores coverage without a fresh edit.
  */
 export const readEnrolledBoundaries = async (root: string): Promise<string[]> => {
+  if (cacheDisabled()) return [];
+  const sqlite = await loadSqliteSnapshot(root, CACHE_VERSION);
+  if (sqlite) return sqlite.enrolled;
   const stream = createReadStream(cachePathFor(root), { encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
@@ -706,9 +758,12 @@ export interface FactsOutcome {
  */
 export const loadFacts = async (root: string, files: string[]): Promise<FactsOutcome> => {
   drainExtractionFailures();
-  const disk = await loadDiskStore(root);
+  const sqlite = await sqliteStore(root);
+  const disk = sqlite ?? await loadDiskStore(root);
   const store = disk ?? newFactStore(root);
-  let cacheDirty = disk === undefined;
+  // Import a valid legacy JSONL cache into a newly-created/recovered SQLite
+  // database on this pass. A bad or unsupported database never costs facts.
+  let cacheDirty = disk === undefined || (!sqlite && disk !== undefined);
   const fileSet = new Set(files);
   const knownFiles = new Set([...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized]);
   for (const f of knownFiles) {
@@ -809,7 +864,10 @@ export const loadFacts = async (root: string, files: string[]): Promise<FactsOut
   for (const f of unreadable) {
     store.unreadable.add(f);
     if (store.facts.delete(f)) cacheDirty = true;
-    if (store.meta.delete(f)) cacheDirty = true;
+    // Retain a marker row across restarts. It remains fact-free and will be
+    // retried as soon as a later stat/read succeeds.
+    if (!store.meta.has(f)) store.meta.set(f, { size: 0, mtime: 0 });
+    cacheDirty = true;
     store.oversized.delete(f);
     store.generated.delete(f);
     store.failedSha.delete(f);
@@ -838,6 +896,10 @@ export interface RefreshStats {
   deleted: string[];
   /** Files whose facts now exist and did not before. */
   added: string[];
+  /** Any fact-state transition requiring the resident graph to be rebuilt. */
+  updated: string[];
+  /** Anchors were recalculated because configured or inferred rules moved. */
+  rulesChanged: boolean;
 }
 
 /**
@@ -856,6 +918,7 @@ export const refreshFacts = async (
   drainExtractionFailures();
   const fileSet = new Set(files);
   const deleted: string[] = [];
+  const updated = new Set<string>();
   const removeFile = (known: string): void => {
     store.facts.delete(known);
     store.meta.delete(known);
@@ -865,6 +928,7 @@ export const refreshFacts = async (
     store.oversized.delete(known);
     store.generated.delete(known);
     deleted.push(known);
+    updated.add(known);
   };
   const knownFiles = new Set([...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized]);
   for (const known of knownFiles) {
@@ -878,9 +942,10 @@ export const refreshFacts = async (
   const added = files.filter((f) => !knownFiles.has(f));
   const candidates = new Set<string>([...changed, ...added]);
   for (const gone of deleted) candidates.delete(gone);
-  // Known failures pay one stat per refresh; only a content/stat change
-  // re-enters expensive ast-grep extraction.
+  // Known failures and unreadable markers pay one stat per refresh; only a
+  // content/stat change re-enters expensive extraction.
   for (const f of store.tainted) if (fileSet.has(f)) candidates.add(f);
+  for (const f of store.unreadable) if (fileSet.has(f)) candidates.add(f);
 
   const stats = await statMany(root, [...candidates]);
   const contents = new Map<string, string>();
@@ -900,6 +965,7 @@ export const refreshFacts = async (
     store.meta.set(rel, meta);
     if (meta.size > MAX_FILE_BYTES) {
       oversized.push(rel);
+      if (store.facts.has(rel) || !store.oversized.has(rel)) updated.add(rel);
       store.facts.delete(rel);
       store.tainted.delete(rel);
       store.failedSha.delete(rel);
@@ -916,6 +982,7 @@ export const refreshFacts = async (
     store.unreadable.delete(rel);
     spend(rel, got.text, contents);
     if (isGeneratedSource(rel, got.text)) {
+      if (!store.generated.has(rel) || store.facts.get(rel)?.sha1 !== got.sha1) updated.add(rel);
       store.generated.add(rel);
       store.tainted.delete(rel);
       store.failedSha.delete(rel);
@@ -927,6 +994,7 @@ export const refreshFacts = async (
     const prev = store.facts.get(rel);
     if (prev && prev.sha1 === got.sha1 && !store.tainted.has(rel)) continue;
     dirty.push(rel);
+    updated.add(rel);
     store.facts.set(rel, pendingFileFacts(rel, got.sha1, got.text));
   }
 
@@ -937,11 +1005,17 @@ export const refreshFacts = async (
   await reanchorStaleClean(root, store, files, dirty, active);
   // A pack move can re-anchor clean records after the dirty extraction drain.
   settleTaint(store, new Set(files));
+  if (active.sha !== active.previousSha) {
+    for (const file of files) if (store.facts.has(file)) updated.add(file);
+  }
 
   for (const f of unreadable) {
+    if (store.facts.has(f) || !store.unreadable.has(f)) updated.add(f);
     store.unreadable.add(f);
     store.facts.delete(f);
-    store.meta.delete(f);
+    // Preserve a fact-free marker row so SQLite/JSONL report the condition
+    // after eviction; a successful future stat replaces this placeholder.
+    if (!store.meta.has(f)) store.meta.set(f, { size: 0, mtime: 0 });
     store.oversized.delete(f);
     store.generated.delete(f);
     store.failedSha.delete(f);
@@ -960,6 +1034,8 @@ export const refreshFacts = async (
       reExtracted: dirty.sort(),
       deleted: deleted.sort(),
       added: added.filter((f) => !unreadable.includes(f) && !store.oversized.has(f) && !store.generated.has(f) && !store.tainted.has(f)).sort(),
+      updated: [...updated].sort(),
+      rulesChanged: active.sha !== active.previousSha,
     },
   };
 };
