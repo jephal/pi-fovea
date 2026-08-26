@@ -3,7 +3,8 @@
 // per-worktree home outside the repository.
 
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, writeFile } from "node:fs/promises";
+import { unlinkSync } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { gitOut } from "./git.js";
@@ -11,11 +12,13 @@ import { gitOut } from "./git.js";
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by pi-fovea.\n# For information about cache directory tags, see:\n#\thttp://www.brynosaurus.com/cachedir/\n";
-const IDENTITY_VERSION = 1;
+const IDENTITY_VERSION = 2;
 
 export interface WorktreeIdentity {
-  /** Canonical physical top-level directory (or the canonical plain root). */
+  /** Canonical physical root requested by the caller (not Git's top level). */
   root: string;
+  /** Canonical Git top-level which contains root; absent for a non-Git root. */
+  gitRoot?: string;
   /** Canonical per-worktree Git directory; absent for a non-Git root. */
   gitDir?: string;
   /** Canonical shared Git directory; absent for a non-Git root. */
@@ -46,13 +49,26 @@ const isInside = (child: string, parent: string): boolean => {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== "..");
 };
 
+const ownedByCurrentUser = (uid: number): boolean =>
+  typeof process.getuid !== "function" || uid === process.getuid();
+
 const privateDirectory = async (path: string): Promise<void> => {
   await mkdir(path, { recursive: true, mode: DIRECTORY_MODE });
   const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) {
-    throw new Error(`fovea: private cache path is not a directory: ${path}`);
+  if (!info.isDirectory() || info.isSymbolicLink() || !ownedByCurrentUser(info.uid)) {
+    throw new Error(`fovea: private cache path is not a current-user directory: ${path}`);
   }
   await chmod(path, DIRECTORY_MODE);
+};
+
+/** Resolve only a current-user owned directory, never following its final symlink. */
+const secureCacheHome = async (path: string, create: boolean): Promise<string> => {
+  if (create) await mkdir(path, { recursive: true, mode: DIRECTORY_MODE });
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink() || !ownedByCurrentUser(info.uid)) {
+    throw new Error(`fovea: cache home is not a current-user directory: ${path}`);
+  }
+  return realpath(path);
 };
 
 const privateFile = async (path: string, contents?: string): Promise<void> => {
@@ -91,7 +107,10 @@ const gitIdentity = async (root: string): Promise<WorktreeIdentity | undefined> 
     // root. This catches contaminated Git environment or a surprising Git
     // response before we create a cache under its identity.
     if (!isInside(root, physicalRoot)) return undefined;
-    return { root: physicalRoot, gitDir: physicalGitDir, commonGitDir: physicalCommonGitDir };
+    // The cache is scoped to the caller's physical root. Git's top-level is
+    // retained as metadata for validation, but must never collapse distinct
+    // subdirectory roots into one worktree cache entry.
+    return { root, gitRoot: physicalRoot, gitDir: physicalGitDir, commonGitDir: physicalCommonGitDir };
   } catch {
     return undefined;
   }
@@ -114,15 +133,12 @@ const cacheHomeFor = (override?: string): string => {
 };
 
 const privateCacheBase = async (identity: WorktreeIdentity, options: WorktreeCacheOptions): Promise<string> => {
-  let home = cacheHomeFor(options.cacheHome);
-  await mkdir(home, { recursive: true });
-  home = await realpath(home);
-  if (isInside(home, identity.root)) {
-    home = resolve(tmpdir(), "pi-fovea-cache");
-    await mkdir(home, { recursive: true });
-    home = await realpath(home);
+  let home = await secureCacheHome(cacheHomeFor(options.cacheHome), true);
+  const activeRoots = [identity.root, identity.gitRoot].filter((path): path is string => !!path);
+  if (activeRoots.some((root) => isInside(home, root))) {
+    home = await secureCacheHome(resolve(tmpdir(), "pi-fovea-cache"), true);
   }
-  if (isInside(home, identity.root)) {
+  if (activeRoots.some((root) => isInside(home, root))) {
     throw new Error("fovea: no safe cache location exists outside the active root");
   }
   const app = join(home, "pi-fovea");
@@ -137,8 +153,7 @@ export const cacheWorktreesDir = async (options: WorktreeCacheOptions & { create
   if (cacheDisabled()) return undefined;
   let home = cacheHomeFor(options.cacheHome);
   try {
-    if (options.create) await mkdir(home, { recursive: true, mode: DIRECTORY_MODE });
-    home = await realpath(home);
+    home = await secureCacheHome(home, !!options.create);
     const app = join(home, "pi-fovea");
     const worktrees = join(app, "worktrees");
     if (options.create) {
@@ -149,19 +164,40 @@ export const cacheWorktreesDir = async (options: WorktreeCacheOptions & { create
   } catch { return undefined; }
 };
 
-const leased = new Set<string>();
+const leased = new Map<string, Set<string>>();
 const releaseLeases = (): void => {
-  for (const path of leased) void writeFile(path, JSON.stringify({ pid: process.pid, touchedAt: 0 }) + "\n", { mode: FILE_MODE }).catch(() => undefined);
+  // Node does not await asynchronous work from an `exit` handler. A real
+  // cleanup must be synchronous so a dead process cannot leave a fresh lease.
+  for (const paths of leased.values()) for (const path of paths) {
+    try { unlinkSync(path); } catch { /* already removed or inaccessible */ }
+  }
+  leased.clear();
 };
 process.once("exit", releaseLeases);
-const touchLease = async (dir: string): Promise<void> => {
+const touchLease = async (root: string, dir: string): Promise<void> => {
   const path = join(dir, "lease.json");
+  // Verify an existing lease before writing it: writeFile otherwise follows a
+  // symlink, even inside a directory we created earlier in this process.
+  await privateFile(path);
   // Cache dirs are private and verified above. The lease is still mode 0600
   // because it names a worktree indirectly and lifecycle treats malformed
   // records as protection rather than a deletion authorization.
   await writeFile(path, JSON.stringify({ pid: process.pid, touchedAt: Date.now() }) + "\n", { mode: FILE_MODE });
   await chmod(path, FILE_MODE);
-  leased.add(path);
+  let paths = leased.get(root);
+  if (!paths) {
+    paths = new Set();
+    leased.set(root, paths);
+  }
+  paths.add(path);
+};
+
+/** Release an idle resident root's lease; SQLite handles are always short-lived. */
+export const releaseWorktreeLease = async (root: string): Promise<void> => {
+  const paths = leased.get(root);
+  if (!paths) return;
+  leased.delete(root);
+  await Promise.all([...paths].map((path) => unlink(path).catch(() => undefined)));
 };
 
 const identityKey = (identity: WorktreeIdentity): string =>
@@ -185,6 +221,27 @@ const verifyIdentity = async (path: string, identity: WorktreeIdentity): Promise
  * Lazily establish private cache/database storage for a root. The call is
  * idempotent and intentionally performs no JSON-cache migration in phase one.
  */
+/**
+ * Return a named file path inside the verified private worktree cache.
+ * Existing files are re-verified and chmodded because `mode` only affects
+ * creation; callers create absent files with exclusive/no-follow-safe writes.
+ */
+export const worktreeCacheFilePath = async (root: string, name: string): Promise<string> => {
+  if (name !== "facts.jsonl") throw new Error("fovea: unsupported private cache file");
+  const cache = await ensureWorktreeCache(root);
+  const path = join(cache.dir, name);
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink() || !ownedByCurrentUser(info.uid)) {
+      throw new Error(`fovea: private cache path is not a current-user regular file: ${path}`);
+    }
+    await chmod(path, FILE_MODE);
+  } catch (error: unknown) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  return path;
+};
+
 export const ensureWorktreeCache = async (
   root: string,
   options: WorktreeCacheOptions = {},
@@ -200,7 +257,7 @@ export const ensureWorktreeCache = async (
     throw new Error(`fovea: invalid cache directory tag: ${dir}`);
   }
   await verifyIdentity(join(dir, "identity.json"), identity);
-  await touchLease(dir);
+  await touchLease(identity.root, dir);
   const databasePath = join(dir, "fovea.sqlite");
   await privateFile(databasePath);
   return { identity, dir, databasePath };

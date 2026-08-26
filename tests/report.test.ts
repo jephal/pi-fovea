@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AST_GREP_CHUNK, hasAstGrep } from "../src/core/astgrep.js";
-import { cachePathFor, listFiles, loadFacts } from "../src/core/build.js";
+import { listFiles, loadFacts } from "../src/core/build.js";
 import { sketch } from "../src/core/ops.js";
 import { resetSessions } from "../src/core/session.js";
 
@@ -25,7 +25,6 @@ const copyFixture = (): { root: string; cleanup: () => void } => {
     root,
     cleanup: () => {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     },
   };
 };
@@ -91,7 +90,6 @@ describe("bounded discovery", () => {
       expect([...store.facts.keys()]).toEqual(["safe.ts"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 
@@ -123,7 +121,6 @@ describe("bounded discovery", () => {
       expect(store.facts.has("generated.ts")).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 });
@@ -186,7 +183,6 @@ describe("consolidated extraction scheduling", () => {
       expect(invocations.filter((line) => line.startsWith("outline "))).toHaveLength(4);
     } finally {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 });
