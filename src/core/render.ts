@@ -4,8 +4,8 @@
 // Budget conformance is a prefix fit: candidates sorted by heat, binary search
 // on prefix length — aider's render-and-count loop generalized to a field.
 
-import { writeFileSync } from "node:fs";
 import type { Edge, EdgeKind, Graph, NodeRec } from "./types.js";
+import { redactSensitiveText, writePrivateArtifact } from "./privacy.js";
 
 export const tokenEstimate = (text: string): number => Math.ceil(text.length / 4);
 
@@ -260,7 +260,7 @@ export const revealFoveated = (
   let overflowPath: string | undefined;
   if (truncated && opts.overflowTo) {
     try {
-      writeFileSync(opts.overflowTo, `${header}\n${allItems.join("\n")}\n`);
+      writePrivateArtifact(opts.overflowTo, `${header}\n${allItems.join("\n")}\n`);
       overflowPath = opts.overflowTo;
     } catch {
       // An unwritable artifact drops the footer pointer; that only shortens
@@ -268,6 +268,7 @@ export const revealFoveated = (
       text = k >= 0 ? renderK(k, "") : header;
     }
   }
+  text = redactSensitiveText(text);
   const tokens = tokenEstimate(text);
   return {
     text,
@@ -317,12 +318,13 @@ export const revealGroups = (
   let overflowPath: string | undefined;
   if (kBest < ordered.length && opts.overflowTo) {
     try {
-      writeFileSync(opts.overflowTo, [opts.header, ...ordered.map((gl) => `${gl.label.padEnd(2)} ${gl.detail}`)].join("\n") + "\n");
+      writePrivateArtifact(opts.overflowTo, [opts.header, ...ordered.map((gl) => `${gl.label.padEnd(2)} ${gl.detail}`)].join("\n") + "\n");
       overflowPath = opts.overflowTo;
     } catch {
       text = renderK(kBest, "");
     }
   }
+  text = redactSensitiveText(text);
   return {
     text,
     tokens: tokenEstimate(text),

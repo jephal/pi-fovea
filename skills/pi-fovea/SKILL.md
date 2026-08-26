@@ -41,10 +41,12 @@ When writing or editing code **inside a `fabric_exec` program**, the fovea tools
 
 ## CLI
 
-The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON and TSV modes). Prefer the in-session tools unless you need scripting or a second opinion outside the extension's session state.
+The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON and TSV modes). Prefer the in-session tools unless you need scripting or a second opinion outside the extension's session state. `fovea cache status` inspects private persistent-cache health, `fovea cache dry-run` lists conservative cleanup candidates without mutation, and `fovea cache purge <root>` explicitly targets one inactive root. `/fovea cache [dry-run|purge]` exposes the matching in-session diagnostics.
+
+`FOVEA_NO_CACHE=1` disables durable SQLite, JSONL, and co-change caches for ephemeral runs. `FOVEA_CACHE_DIR` selects an absolute cache home (Fovea appends its private namespace); do not point it inside the repository. Cleanup is throttled and skips a live lease, malformed identity, or SQLite WAL/SHM sidecar rather than deleting an ambiguous entry.
 
 ## Settings
 
 Use `/fovea status` for loaded version and index coverage, `/fovea reset` for fresh state, `/fovea reload` after updates, and `/fovea settings` for configuration. Files live under `~/.pi/agent/fovea.json` or trusted `.pi/fovea.json`; the external-editor key (`Ctrl+G` by default) switches the displayed and saved layer between global defaults and project overrides. This fork defaults to `sync.mode: "disabled"` and `tools.grepMode: "off"`. Set `sync.mode` to `"enabled"` or `"hidden"` and `tools.grepMode` to `"augment"`/`"replace"` only when those integrations are intentional.
 
-Budget overflow is not a dead end: any `… more results collapsed or outside budget` footer names a tmp artifact (`/tmp/pi-fovea-<op>-<hash>.txt`) holding the FULL list — read or grep that file for the remainder. Reach for `fovea_dwell` when you want a wider neighborhood, not just more of the same list.
+Budget overflow is not a dead end: any `… more results collapsed or outside budget` footer names a private tmp artifact (`/tmp/pi-fovea-overflow/pi-fovea-<op>-<hash>.txt`) holding the FULL list — read or grep that file for the remainder. It is stored in a `0700` directory as a `0600` no-follow file and redacted defensively. Reach for `fovea_dwell` when you want a wider neighborhood, not just more of the same list.

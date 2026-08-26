@@ -117,7 +117,7 @@ describe("extension entry", () => {
     expect(tools.has("grep")).toBe(false);
     expect(commands.has("fovea")).toBe(true);
     expect(commands.get("fovea")!.getArgumentCompletions?.("").map((item) => item.value)).toEqual([
-      "status", "settings", "reset", "reload",
+      "status", "cache", "cache dry-run", "cache purge", "settings", "reset", "reload",
     ]);
     expect(DEFAULT_FOVEA_CONFIG.sync.mode).toBe("disabled");
     expect(DEFAULT_FOVEA_CONFIG.tools.grepMode).toBe("off");

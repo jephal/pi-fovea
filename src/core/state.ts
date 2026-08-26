@@ -13,6 +13,8 @@ import {
 import type { ExtractionReport, FactStore, FileFacts } from "./build.js";
 import { assembleGraphWithIndex } from "./graph.js";
 import { gitProbe, gitReflogAction } from "./git.js";
+import { ensureWorktreeCache } from "./worktree-cache.js";
+import { manageCache } from "./cache-lifecycle.js";
 import { ROOT_CACHE_LIMIT, envInt, yieldToLoop } from "./asyncutil.js";
 import { loadRepoRules } from "./anchors.js";
 import { buildCsr, type Csr } from "./heat.js";
@@ -157,6 +159,12 @@ const assembleState = async (
 };
 
 const buildState = async (root: string): Promise<RepoState> => {
+  // Establish the private cache home before the first graph attempt. Failure
+  // is non-fatal: the fact layer retains its in-memory/JSONL fallback.
+  await ensureWorktreeCache(root).catch(() => undefined);
+  // A cache lifecycle scan is throttled internally and refuses ambiguous,
+  // leased, or WAL-open entries. Index construction never waits on failure.
+  await manageCache().catch(() => undefined);
   if (!(await hasAstGrepAsync())) {
     throw new Error(
       "fovea: `ast-grep` binary not found on PATH (set FOVEA_AST_GREP to override). Install: https://ast-grep.github.io/",
@@ -166,8 +174,8 @@ const buildState = async (root: string): Promise<RepoState> => {
   const routeRes = fileRoutes.map((r) => new RegExp(r.re));
   const probe = await gitProbe(root);
   const gitKind: RepoState["gitKind"] = probe ? "git" : "plain";
-  // Cold start: the fact cache header remembers which nested boundaries this
-  // root had enrolled, so a restart restores coverage without a fresh edit.
+  // Cold start: persisted SQLite/JSONL metadata remembers nested boundaries,
+  // so a restart restores coverage without a fresh edit.
   const files = await listFiles(root, routeRes, new Set(await readEnrolledBoundaries(root)));
   const { store, report } = await factPass(() => loadFacts(root, files));
   return assembleState(root, files, store, report, gitKind, probe?.head,
@@ -239,7 +247,9 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
       }
       // Untracked directories appear collapsed ("dir/") in porcelain; adds
       // inside them only surface through a relist. Relist moments are rare.
-      let needsList = probe.relist || disclosureChanged || probe.changes.some((c) => c.path.endsWith("/"));
+      // A HEAD move can add/remove supported paths even with a clean
+      // porcelain, so always relist before reusing cache facts across refs.
+      let needsList = headMoved || probe.relist || disclosureChanged || probe.changes.some((c) => c.path.endsWith("/"));
       if (probe.changes.length) {
         // Porcelain collapses any drift inside a nested checkout (submodule
         // or embedded repo: HEAD move, dirty content, untracked files) to
@@ -319,7 +329,8 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
     refreshFacts(state.root, store, files, [...new Set(changed)], [...new Set(deleted)]),
   );
   const noDelta =
-    !stats.reExtracted.length && !stats.deleted.length && !stats.added.length && files.length === state.files.length;
+    !stats.reExtracted.length && !stats.deleted.length && !stats.added.length &&
+    !stats.updated.length && !stats.rulesChanged && files.length === state.files.length;
   if (noDelta) {
     state.probedAt = Date.now();
     state.extraction = report; // reports are state-wide (taint/unreadable live in the store)

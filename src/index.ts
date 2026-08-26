@@ -17,6 +17,7 @@ import { gitOut } from "./core/git.js";
 import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
 import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
 import type { NodeKind } from "./core/types.js";
+import { manageCache } from "./core/cache-lifecycle.js";
 
 const PACKAGE_VERSION = (() => {
   try {
@@ -543,13 +544,13 @@ export default function fovea(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("fovea", {
-    description: "pi-fovea status, settings, reset, and reload",
+    description: "pi-fovea status, cache diagnostics, settings, reset, and reload",
     getArgumentCompletions: (prefix) =>
-      ["status", "settings", "reset", "reload"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
+      ["status", "cache", "cache dry-run", "cache purge", "settings", "reset", "reload"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/)[0] || "status";
-      if (!["status", "settings", "reset", "reload"].includes(sub)) {
-        ctx.ui.notify("Usage: /fovea status | settings | reset | reload", "warning");
+      if (!["status", "cache", "settings", "reset", "reload"].includes(sub)) {
+        ctx.ui.notify("Usage: /fovea status | cache [dry-run|purge] | settings | reset | reload", "warning");
         return;
       }
       if (sub === "reload") {
@@ -562,6 +563,22 @@ export default function fovea(pi: ExtensionAPI) {
         resetSessions();
         resetSyncBaselines();
         ctx.ui.notify("Fovea focus history and sync baseline reset.", "info");
+        return;
+      }
+      if (sub === "cache") {
+        const action = args.trim().split(/\s+/)[1] ?? "status";
+        if (!["status", "dry-run", "purge"].includes(action)) {
+          ctx.ui.notify("Usage: /fovea cache [dry-run|purge]", "warning");
+          return;
+        }
+        const result = await manageCache({ dryRun: action === "dry-run", purge: action === "purge", root: action === "purge" ? ctx.cwd : undefined });
+        ctx.ui.notify(
+          result.enabled
+            ? `fovea cache ${action}: ${result.entries.length} entries · ${result.totalBytes} bytes · ${result.candidates.length} candidates` +
+              `${result.deleted.length ? ` · deleted ${result.deleted.length}` : ""}${result.skipped.length ? ` · skipped ${result.skipped.length}` : ""}${result.throttled ? " · throttled" : ""}`
+            : "fovea cache disabled by FOVEA_NO_CACHE",
+          "info",
+        );
         return;
       }
       if (sub === "settings") {
