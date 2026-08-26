@@ -1,10 +1,10 @@
-import { existsSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { manageCache } from "../src/core/cache-lifecycle.js";
-import { ensureWorktreeCache } from "../src/core/worktree-cache.js";
+import { ensureWorktreeCache, releaseWorktreeLease } from "../src/core/worktree-cache.js";
 
 const DAY = 86_400_000;
 
@@ -28,18 +28,40 @@ describe("cache lifecycle", () => {
       writeFileSync(`${staleCache.databasePath}-wal`, "open");
       const walRun = await manageCache({ cacheHome: home, dryRun: true, now: Date.now(), ttlDays: 1 });
       expect(walRun.skipped.some((item) => item.dir === staleCache.dir && item.reason.includes("WAL/SHM"))).toBe(true);
-      rmSync(`${staleCache.databasePath}-wal`);
+      // An abandoned sidecar ages out with its cache rather than protecting it
+      // forever after a crashed SQLite process.
+      utimesSync(`${staleCache.databasePath}-wal`, new Date(Date.now() - 90 * DAY), new Date(Date.now() - 90 * DAY));
       const dry = await manageCache({ cacheHome: home, dryRun: true, now: Date.now(), ttlDays: 1 });
       expect(dry.candidates).toContain(staleCache.dir);
       expect(existsSync(staleCache.dir)).toBe(true);
 
+      // A pre-existing marker may have permissive bits; lifecycle repairs it.
+      const marker = join(home, "pi-fovea", "cleanup.json");
+      writeFileSync(marker, "{}\n", { mode: 0o644 });
       const deleted = await manageCache({ cacheHome: home, now: Date.now(), ttlDays: 1 });
+      expect(statSync(marker).mode & 0o777).toBe(0o600);
       expect(deleted.deleted).toContain(staleCache.dir);
       expect(existsSync(staleCache.dir)).toBe(false);
       expect(existsSync(liveCache.dir)).toBe(true);
     } finally {
       rmSync(live, { recursive: true, force: true });
       rmSync(stale, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("releases an idle process lease so a removed worktree can be cleaned", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fovea-cache-life-release-home-"));
+    const root = mkdtempSync(join(tmpdir(), "fovea-cache-life-release-root-"));
+    try {
+      const cache = await ensureWorktreeCache(root, { cacheHome: home });
+      rmSync(root, { recursive: true, force: true });
+      await releaseWorktreeLease(cache.identity.root);
+      const result = await manageCache({ cacheHome: home, purge: true, root });
+      expect(result.deleted).toContain(cache.dir);
+      expect(existsSync(cache.dir)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });
     }
   });

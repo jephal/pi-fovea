@@ -15,6 +15,29 @@ export const redactSensitiveText = (input: string): string => input
   .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, REDACTED)
   .replace(/\b((?:api[_-]?key|access[_-]?token|auth(?:orization)?|client[_-]?secret|password|secret|token)\s*(?:=|:))\s*(?:["']?)[^\s,"'`)}\]]{8,}/gi, `$1 ${REDACTED}`);
 
+/**
+ * Stronger value-level scrubbing for durable facts. Extraction often stores a
+ * string literal without its surrounding `API_KEY =` context, so persistence
+ * must also recognize credential-bearing URLs and common standalone API keys.
+ */
+export const redactSensitiveValue = (input: string): string => redactSensitiveText(input)
+  .replace(/\b(?:sk|rk)-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g, REDACTED)
+  .replace(/\bAIza[A-Za-z0-9_-]{20,}\b/g, REDACTED)
+  .replace(/\bAKIA[0-9A-Z]{16}\b/g, REDACTED)
+  .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`)
+  .replace(/([?&](?:api[_-]?key|access[_-]?token|auth(?:orization)?|client[_-]?secret|password|secret|token)=)[^&#\s]+/gi, `$1${REDACTED}`);
+
+/** Recursively copy JSON-compatible cache payloads while redacting strings. */
+export const redactSensitiveCacheValue = <T>(value: T): T => {
+  if (typeof value === "string") return redactSensitiveValue(value) as T;
+  if (Array.isArray(value)) return value.map(redactSensitiveCacheValue) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .map(([key, entry]) => [redactSensitiveValue(key), redactSensitiveCacheValue(entry)])) as T;
+  }
+  return value;
+};
+
 const overflowDir = (): string => {
   const dir = join(tmpdir(), "pi-fovea-overflow");
   mkdirSync(dir, { recursive: true, mode: 0o700 });

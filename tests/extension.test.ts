@@ -10,7 +10,6 @@ import extension from "../src/index.js";
 import { resetSessions } from "../src/core/session.js";
 import { captureMutation, finishMutation, provenancePathFor } from "../src/core/provenance.js";
 import { hasAstGrep } from "../src/core/astgrep.js";
-import { cachePathFor } from "../src/core/build.js";
 import { ensureState, evictState, getInflight, getState } from "../src/core/ops.js";
 import { DEFAULT_FOVEA_CONFIG } from "../src/core/config.js";
 import { resetSyncBaselines, warmCacheHas } from "../src/core/sync.js";
@@ -181,7 +180,6 @@ describe("extension entry", () => {
       vi.unstubAllEnvs();
       evictState(root);
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 
@@ -563,7 +561,6 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     } finally {
       evictState(root);
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 
@@ -777,27 +774,30 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(result.content[0]!.text).toContain("web/api.ts");
   });
 
-  it("kicks a background index at session start without ever blocking the prompt", async () => {
+  it("does not prewarm at session start unless FOVEA_EAGER_INDEX=1", async () => {
     const loaded = load();
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-"));
     try {
       writeFileSync(path.join(root, "probe.ts"), "export const probe = 1;\n");
       evictState(root);
-      // session_start returns promptly and the build runs out-of-band.
+      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
+      expect(getInflight(root)).toBeUndefined();
+      expect(getState(root)).toBeUndefined();
+
+      vi.stubEnv("FOVEA_EAGER_INDEX", "1");
       await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
       const pending = getInflight(root);
       expect(pending).toBeDefined();
-      const state = await pending!;
-      expect(getState(root)?.version).toBe(state.version);
-      // The fact cache materializes for the next session's warm start.
-      expect(existsSync(cachePathFor(root))).toBe(true);
-      // ast-grep missing: the gate short-circuits before kicking anything.
+      await pending!;
+      // Non-sync eager indexing is only a bootstrap; future graph calls use
+      // the durable bounded path rather than retaining the full graph.
+      expect(getState(root)).toBeUndefined();
+
+      // Availability is still deferred to the explicit eager background job.
       const other = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-missing-"));
       try {
         vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
         await loaded.emit("session_start", { reason: "new" }, fakeCtx(other, true));
-        // Availability is probed asynchronously too: session start still
-        // returns first, then the background build rejects without state.
         const unavailable = getInflight(other);
         expect(unavailable).toBeDefined();
         await expect(unavailable).rejects.toThrow(/ast-grep/);
@@ -811,7 +811,6 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       vi.unstubAllEnvs();
       evictState(root);
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 });

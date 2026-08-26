@@ -7,13 +7,15 @@ import {
   filterSupported,
   listFiles,
   loadFacts,
+  persistFacts,
+  persistFactsSoon,
   readEnrolledBoundaries,
   refreshFacts,
 } from "./build.js";
 import type { ExtractionReport, FactStore, FileFacts } from "./build.js";
 import { assembleGraphWithIndex } from "./graph.js";
 import { gitProbe, gitReflogAction } from "./git.js";
-import { ensureWorktreeCache } from "./worktree-cache.js";
+import { ensureWorktreeCache, releaseWorktreeLease } from "./worktree-cache.js";
 import { manageCache } from "./cache-lifecycle.js";
 import { ROOT_CACHE_LIMIT, envInt, yieldToLoop } from "./asyncutil.js";
 import { loadRepoRules } from "./anchors.js";
@@ -65,6 +67,11 @@ export interface RepoState {
 
 const states = new Map<string, RepoState>(); // insertion order doubles as LRU order
 const inflight = new Map<string, Promise<RepoState>>();
+// Normal Pi graph requests are served from the durable bounded index. Sync is
+// the explicit opt-in that needs a resident graph for its baseline/diffusion
+// pipeline; direct core callers retain the historical resident behavior until
+// they opt out.
+const residentPreference = new Map<string, boolean>();
 // Each resident root holds a full fact store + graph; all heavyweight root
 // caches use ROOT_CACHE_LIMIT so one override cannot leave hidden retainers.
 const WALK_GAP_MS = envInt("FOVEA_WALK_GAP_MS", 4000, 500, 300_000);
@@ -85,11 +92,22 @@ const evictLru = (): void => {
     states.delete(oldest);
     inflight.delete(oldest);
     clearPersistTimer(oldest);
+    void releaseWorktreeLease(oldest);
   }
 };
 
 /** Warm state if present (does not block). */
 export const getState = (root: string): RepoState | undefined => touch(root);
+
+/**
+ * Select whether ordinary graph operations should prefer a resident full graph
+ * over the durable bounded SQLite index. Pi sets this only for intentional
+ * turn-sync; the default preserves the standalone core API's legacy behavior.
+ */
+export const setResidentPreference = (root: string, prefer: boolean): void => {
+  residentPreference.set(root, prefer);
+};
+export const prefersResident = (root: string): boolean => residentPreference.get(root) ?? true;
 
 /** Ongoing build/refresh for root, if any (does not block). */
 export const getInflight = (root: string): Promise<RepoState> | undefined => inflight.get(root);
@@ -99,6 +117,7 @@ export const evictState = (root: string): void => {
   states.delete(root);
   inflight.delete(root);
   clearPersistTimer(root);
+  void releaseWorktreeLease(root);
 };
 
 // All live fact passes serialize through one chain. Extraction-failure
@@ -177,9 +196,14 @@ const buildState = async (root: string): Promise<RepoState> => {
   // Cold start: persisted SQLite/JSONL metadata remembers nested boundaries,
   // so a restart restores coverage without a fresh edit.
   const files = await listFiles(root, routeRes, new Set(await readEnrolledBoundaries(root)));
-  const { store, report } = await factPass(() => loadFacts(root, files));
-  return assembleState(root, files, store, report, gitKind, probe?.head,
+  const { store, report } = await factPass(() => loadFacts(root, files, { persist: false }));
+  const state = await assembleState(root, files, store, report, gitKind, probe?.head,
     new Set(probe ? probe.changes.map((c) => c.path).filter((p) => p && !p.endsWith("/")) : []));
+  // A cold graph request is also the SQLite bootstrap point. Even when every
+  // fact was restored from JSONL (and therefore facts are not "dirty"), write
+  // the assembled graph so the next request can use bounded SQL reads.
+  await persistFacts(store, state.graph);
+  return state;
 };
 
 const refreshState = async (state: RepoState, hints: string[] = [], force = false): Promise<RepoState> => {
@@ -325,13 +349,17 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
     state.probedAt = Date.now();
     return state;
   }
-  const { report, stats } = await factPass(() =>
-    refreshFacts(state.root, store, files, [...new Set(changed)], [...new Set(deleted)]),
+  // A queued persistence captured an older graph. This refresh owns the next
+  // write and will pass its assembled graph directly instead.
+  clearPersistTimer(state.root);
+  const { report, stats, needsPersistence } = await factPass(() =>
+    refreshFacts(state.root, store, files, [...new Set(changed)], [...new Set(deleted)], { persist: false }),
   );
   const noDelta =
     !stats.reExtracted.length && !stats.deleted.length && !stats.added.length &&
     !stats.updated.length && !stats.rulesChanged && files.length === state.files.length;
   if (noDelta) {
+    if (needsPersistence) persistFactsSoon(store, state.graph);
     state.probedAt = Date.now();
     state.extraction = report; // reports are state-wide (taint/unreadable live in the store)
     state.files = files;
@@ -339,6 +367,7 @@ const refreshState = async (state: RepoState, hints: string[] = [], force = fals
   }
   const fresh = await assembleState(state.root, files, store, report, state.gitKind, state.head, state.dirty);
   if (checkout) fresh.checkout = true;
+  if (needsPersistence) await persistFacts(store, fresh.graph);
   states.set(state.root, fresh);
   return fresh;
 };

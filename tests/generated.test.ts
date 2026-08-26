@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { cachePathFor, isGeneratedSource, loadFacts } from "../src/core/build.js";
+import { isGeneratedSource, loadFacts } from "../src/core/build.js";
 
 const tmpRoots: string[] = [];
 const tmpRepo = (): string => {
@@ -18,7 +18,6 @@ const tmpRepo = (): string => {
 afterEach(() => {
   for (const dir of tmpRoots.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
-    rmSync(cachePathFor(dir), { force: true });
   }
 });
 

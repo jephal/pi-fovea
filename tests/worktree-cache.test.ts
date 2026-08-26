@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -52,6 +52,30 @@ describe("private worktree cache", () => {
     }
   });
 
+  it("keeps distinct subdirectory roots in one Git worktree in distinct cache identities", async () => {
+    const root = gitRepo();
+    const cacheHome = mkdtempSync(join(tmpdir(), "fovea-worktree-cache-subroots-home-"));
+    const left = join(root, "packages", "left");
+    const right = join(root, "packages", "right");
+    try {
+      // The roots only need to exist for Git's prefix-aware inspection.
+      mkdirSync(left, { recursive: true });
+      mkdirSync(right, { recursive: true });
+      const [leftIdentity, rightIdentity, leftCache, rightCache] = await Promise.all([
+        resolveWorktreeIdentity(left), resolveWorktreeIdentity(right),
+        ensureWorktreeCache(left, { cacheHome }), ensureWorktreeCache(right, { cacheHome }),
+      ]);
+      expect(leftIdentity.root).toBe(left);
+      expect(rightIdentity.root).toBe(right);
+      expect(leftIdentity.gitRoot).toBe(root);
+      expect(rightIdentity.gitRoot).toBe(root);
+      expect(leftCache.dir).not.toBe(rightCache.dir);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cacheHome, { recursive: true, force: true });
+    }
+  });
+
   it("creates and verifies a private, tagged cache on first use", async () => {
     const root = mkdtempSync(join(tmpdir(), "fovea-worktree-cache-root-"));
     const cacheHome = mkdtempSync(join(tmpdir(), "fovea-worktree-cache-home-"));
@@ -74,6 +98,20 @@ describe("private worktree cache", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(cacheHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlinked cache home rather than following it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fovea-worktree-cache-symlink-root-"));
+    const target = mkdtempSync(join(tmpdir(), "fovea-worktree-cache-symlink-target-"));
+    const home = join(tmpdir(), `fovea-worktree-cache-symlink-${Date.now()}-${Math.random()}`);
+    try {
+      symlinkSync(target, home, "dir");
+      await expect(ensureWorktreeCache(root, { cacheHome: home })).rejects.toThrow("cache home");
+    } finally {
+      unlinkSync(home);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(target, { recursive: true, force: true });
     }
   });
 

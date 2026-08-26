@@ -1,11 +1,14 @@
-import { existsSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { CACHE_VERSION, cachePathFor, loadFacts } from "../src/core/build.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CACHE_VERSION, cachePathFor, loadFacts, persistFacts, readEnrolledBoundaries } from "../src/core/build.js";
 import { loadSqliteSnapshot, querySqliteNeighborhood, querySqliteSeeds, saveSqliteSnapshot, sqliteAvailability } from "../src/core/sqlite-store.js";
-import { dwell, focus, impact } from "../src/core/ops.js";
+import { dwell, ensureState, evictState, focus, impact, setResidentPreference } from "../src/core/ops.js";
+import { hasAstGrep } from "../src/core/astgrep.js";
 import { resetSessions } from "../src/core/session.js";
 import { ensureWorktreeCache } from "../src/core/worktree-cache.js";
 import type { Graph } from "../src/core/types.js";
@@ -22,7 +25,6 @@ afterEach(async () => {
     const cache = await ensureWorktreeCache(root).catch(() => undefined);
     rmSync(root, { recursive: true, force: true });
     if (cache) rmSync(cache.dir, { recursive: true, force: true });
-    rmSync(cachePathFor(root), { force: true });
   }
 });
 
@@ -60,7 +62,11 @@ const lazyGraphFor = (): Graph => {
   return { nodes, edges, byName: new Map([["caller", [1]], ["subject", [3]]]), byFile, anchors: [], files: [...byFile.keys()].sort() };
 };
 
-const storeFor = (root: string, file = "a.ts", name = "answer") => ({
+const storeFor = (root: string, file = "a.ts", name = "answer") => {
+  const path = join(root, file);
+  if (!existsSync(path)) writeFileSync(path, `export function ${name}() {}\n`);
+  const info = statSync(path);
+  return {
   root,
   facts: new Map([[file, {
     sha1: "a".repeat(40),
@@ -71,7 +77,7 @@ const storeFor = (root: string, file = "a.ts", name = "answer") => ({
     anchors: [{ id: "GET /things", kind: "route", label: "GET /things", nodeId: `${name}@${file}`, file, line: 4 }],
     sigs: { "call:other": [1, 0] as [number, number] },
   }]]),
-  meta: new Map([[file, { size: 42, mtime: 123.5 }]]),
+  meta: new Map([[file, { size: info.size, mtime: info.mtimeMs }]]),
   tainted: new Set<string>(),
   failedSha: new Map<string, string>(),
   unreadable: new Set<string>(),
@@ -79,9 +85,34 @@ const storeFor = (root: string, file = "a.ts", name = "answer") => ({
   generated: new Set<string>(),
   rulesSha: "rules-v1",
   enrolled: new Set(["nested"]),
-});
+  savedAt: 0,
+  };
+};
 
 const sqliteOnly = async (): Promise<boolean> => await sqliteAvailability();
+
+const cacheSecrets = {
+  apiKey: "sk-proj-0123456789abcdefghijklmnop",
+  passwordUrl: "postgres://alice:correct-horse-battery-staple@db.example.test/app",
+  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJm b3ZlYS11c2VyIn0.signaturepart12345".replace(" ", ""),
+};
+const secretValues = Object.values(cacheSecrets);
+const expectRedacted = (value: string): void => {
+  for (const secret of secretValues) expect(value).not.toContain(secret);
+  expect(value).toContain("[REDACTED]");
+};
+
+const sensitiveStoreFor = (root: string) => {
+  const store = storeFor(root);
+  const facts = store.facts.get("a.ts")!;
+  facts.symbols[0]!.sig = `function answer(key = '${cacheSecrets.apiKey}', url = '${cacheSecrets.passwordUrl}', jwt = '${cacheSecrets.jwt}')`;
+  facts.literals = Object.values(cacheSecrets).map((text, index) => ({ file: "a.ts", text, line: index + 4 }));
+  facts.anchors[0]!.label = `diagnostic ${cacheSecrets.passwordUrl}`;
+  facts.sigs = { ...facts.sigs, [`call:${cacheSecrets.jwt}`]: [1, 0] };
+  const graph = graphFor("a.ts");
+  graph.nodes[1]!.sig = facts.symbols[0]!.sig;
+  return { store, graph };
+};
 
 describe("SQLite graph store", () => {
   it("auto-initializes a versioned normalized store and round-trips facts plus graph edges", async () => {
@@ -90,9 +121,13 @@ describe("SQLite graph store", () => {
     expect(await loadSqliteSnapshot(root, CACHE_VERSION)).toBeUndefined();
     const cache = await ensureWorktreeCache(root);
     expect(existsSync(cache.databasePath)).toBe(true);
+    expect(await cachePathFor(root)).toBe(join(cache.dir, "facts.jsonl"));
 
     const store = storeFor(root);
     expect(await saveSqliteSnapshot(store, graphFor("a.ts"), CACHE_VERSION)).toBe(true);
+    await persistFacts(store, graphFor("a.ts"));
+    // A successful SQLite persistence has no JSONL mirror at all.
+    expect(existsSync(await cachePathFor(root))).toBe(false);
     const loaded = await loadSqliteSnapshot(root, CACHE_VERSION);
     expect(loaded?.generation).toBe(1);
     expect(loaded?.rulesSha).toBe("rules-v1");
@@ -120,7 +155,80 @@ describe("SQLite graph store", () => {
     }
   });
 
-  it("rotates an obsolete semantic database and imports the valid JSONL fallback", async () => {
+  it("redacts secret values in SQLite rows and lazy structured details", async () => {
+    if (!await sqliteOnly()) return;
+    const root = rootAt();
+    const { store, graph } = sensitiveStoreFor(root);
+    expect(await saveSqliteSnapshot(store, graph, CACHE_VERSION)).toBe(true);
+
+    const cache = await ensureWorktreeCache(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(cache.databasePath, { readOnly: true });
+    try {
+      const raw = JSON.stringify({
+        literals: db.prepare("SELECT text FROM literals").all(),
+        symbols: db.prepare("SELECT name, sig FROM symbols").all(),
+        anchors: db.prepare("SELECT anchor_key, label, node_key FROM anchors").all(),
+        diagnostics: db.prepare("SELECT sigs_json FROM file_facts").all(),
+        nodes: db.prepare("SELECT node_key, name, sig FROM graph_nodes").all(),
+      });
+      expectRedacted(raw);
+    } finally {
+      db.close();
+    }
+
+    resetSessions();
+    const result = await focus(root, "answer", 512, { fresh: true });
+    expect(result.details.queryMode).toBe("sqlite-index");
+    expectRedacted(JSON.stringify(result.details));
+  });
+
+  it("redacts secret values in the private JSONL fallback", async () => {
+    const root = rootAt();
+    const { store, graph } = sensitiveStoreFor(root);
+    vi.stubEnv("FOVEA_SQLITE_DISABLE", "1");
+    try {
+      await persistFacts(store, graph);
+      const fallback = await cachePathFor(root);
+      expectRedacted(readFileSync(fallback, "utf8"));
+      expect(statSync(fallback).mode & 0o777).toBe(0o600);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not consult the historic predictable /tmp JSONL cache", async () => {
+    if (!await sqliteOnly()) return;
+    const root = rootAt();
+    const unsafe = join(tmpdir(), `pi-fovea-${createHash("sha1").update(root).digest("hex").slice(0, 16)}.json`);
+    try {
+      writeFileSync(unsafe, `${JSON.stringify({ fovea: CACHE_VERSION, root, rulesSha: "unsafe", enrolled: ["attacker-boundary"] })}\n`, { mode: 0o666 });
+      expect(await readEnrolledBoundaries(root)).toEqual([]);
+    } finally {
+      rmSync(unsafe, { force: true });
+    }
+  });
+
+  it("uses a mode-0600 private JSONL fallback only when SQLite is disabled", async () => {
+    const root = rootAt();
+    const file = join(root, "a.ts");
+    writeFileSync(file, "export const answer = 42;\n");
+    const info = statSync(file);
+    const facts = storeFor(root);
+    const fallback = await cachePathFor(root);
+    writeFileSync(fallback, `${JSON.stringify({ fovea: CACHE_VERSION, root, rulesSha: "rules-v1", enrolled: ["nested"] })}\n${JSON.stringify({ file: "a.ts", sha1: "a".repeat(40), size: info.size, mtime: info.mtimeMs, facts: (() => { const { sha1: _sha, ...rest } = facts.facts.get("a.ts")!; return rest; })() })}\n`, { mode: 0o600 });
+    vi.stubEnv("FOVEA_SQLITE_DISABLE", "1");
+    try {
+      const loaded = await loadFacts(root, ["a.ts"]);
+      expect(loaded.dirty).toEqual([]);
+      expect(loaded.store.facts.get("a.ts")?.calls[0]?.callee).toBe("other");
+      expect(statSync(fallback).mode & 0o777).toBe(0o600);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("discards an obsolete SQLite database rather than retaining a recovery copy", async () => {
     if (!await sqliteOnly()) return;
     const root = rootAt();
     const file = join(root, "a.ts");
@@ -129,37 +237,33 @@ describe("SQLite graph store", () => {
     const facts = storeFor(root);
     // A legacy cache is deliberately usable without ast-grep: matching stat
     // metadata makes this test prove the storage migration path, not parsing.
-    writeFileSync(cachePathFor(root), `${JSON.stringify({ fovea: CACHE_VERSION, root, rulesSha: "rules-v1", enrolled: ["nested"] })}\n${JSON.stringify({ file: "a.ts", sha1: "a".repeat(40), size: info.size, mtime: info.mtimeMs, facts: (() => { const { sha1: _sha, ...rest } = facts.facts.get("a.ts")!; return rest; })() })}\n`);
+    writeFileSync(await cachePathFor(root), `${JSON.stringify({ fovea: CACHE_VERSION, root, rulesSha: "rules-v1", enrolled: ["nested"] })}\n${JSON.stringify({ file: "a.ts", sha1: "a".repeat(40), size: info.size, mtime: info.mtimeMs, facts: (() => { const { sha1: _sha, ...rest } = facts.facts.get("a.ts")!; return rest; })() })}\n`, { mode: 0o600 });
     expect(await saveSqliteSnapshot(facts, graphFor("a.ts"), CACHE_VERSION - 1)).toBe(true);
 
     const loaded = await loadFacts(root, ["a.ts"]);
-    expect(loaded.dirty).toEqual([]);
-    // Migration is storage-only: all content-derived facts survive exactly.
-    // Anchors may legitimately be re-anchored when the active rules hash from
-    // this checkout replaces the synthetic legacy header hash.
-    const withoutAnchors = <T extends { anchors: unknown }>(record: T | undefined) => {
-      const { anchors: _anchors, ...rest } = record!;
-      return rest;
-    };
-    expect(withoutAnchors(loaded.store.facts.get("a.ts"))).toEqual(withoutAnchors(facts.facts.get("a.ts")));
-    expect((await loadSqliteSnapshot(root, CACHE_VERSION))?.facts.get("a.ts")).toEqual(loaded.store.facts.get("a.ts"));
+    expect(loaded.dirty).toEqual(["a.ts"]);
+    // SQLite recovered and is authoritative, so even a private fallback is
+    // ignored rather than importing stale compatibility facts.
+    expect(loaded.store.facts.get("a.ts")?.sha1).not.toBe("a".repeat(40));
+    const cache = await ensureWorktreeCache(root);
+    expect(readdirSync(cache.dir).some((name) => name.startsWith("fovea.sqlite.recovered-"))).toBe(false);
   });
 
-  it("recovers from a corrupt SQLite file without losing the JSONL warm cache", async () => {
+  it("does not read JSONL after SQLite successfully recovers corruption", async () => {
     if (!await sqliteOnly()) return;
     const root = rootAt();
     const file = join(root, "a.ts");
     writeFileSync(file, "export const answer = 42;\n");
     const info = statSync(file);
     const facts = storeFor(root);
-    writeFileSync(cachePathFor(root), `${JSON.stringify({ fovea: CACHE_VERSION, root, rulesSha: "rules-v1" })}\n${JSON.stringify({ file: "a.ts", sha1: "a".repeat(40), size: info.size, mtime: info.mtimeMs, facts: (() => { const { sha1: _sha, ...rest } = facts.facts.get("a.ts")!; return rest; })() })}\n`);
+    writeFileSync(await cachePathFor(root), `${JSON.stringify({ fovea: CACHE_VERSION, root, rulesSha: "rules-v1" })}\n${JSON.stringify({ file: "a.ts", sha1: "a".repeat(40), size: info.size, mtime: info.mtimeMs, facts: (() => { const { sha1: _sha, ...rest } = facts.facts.get("a.ts")!; return rest; })() })}\n`, { mode: 0o600 });
     const cache = await ensureWorktreeCache(root);
     writeFileSync(cache.databasePath, "this is not sqlite");
 
     const loaded = await loadFacts(root, ["a.ts"]);
-    expect(loaded.dirty).toEqual([]);
-    expect(loaded.store.facts.get("a.ts")?.calls[0]?.callee).toBe("other");
-    expect((await loadSqliteSnapshot(root, CACHE_VERSION))?.facts.size).toBe(1);
+    expect(loaded.dirty).toEqual(["a.ts"]);
+    expect(loaded.store.facts.get("a.ts")?.calls[0]?.callee).not.toBe("other");
+    expect((await loadSqliteSnapshot(root, CACHE_VERSION))?.facts.get("a.ts")?.sha1).not.toBe("a".repeat(40));
     expect(readdirSync(cache.dir).some((name) => name.startsWith("fovea.sqlite.recovered-"))).toBe(true);
   });
 
@@ -204,6 +308,80 @@ describe("SQLite graph store", () => {
     expect(callerNeighborhood?.graph.edges.some((edge) => edge.kind === "tests")).toBe(true);
   });
 
+  it("rejects lazy snapshots when the current file manifest gains or loses a file", async () => {
+    if (!await sqliteOnly()) return;
+    const root = rootAt();
+    const store = storeFor(root);
+    expect(await saveSqliteSnapshot(store, graphFor("a.ts"), CACHE_VERSION)).toBe(true);
+    expect((await querySqliteSeeds(root, CACHE_VERSION, "answer"))?.seeds).toContain("answer@a.ts");
+
+    const added = join(root, "b.ts");
+    writeFileSync(added, "export const b = 1;\n");
+    expect(await querySqliteSeeds(root, CACHE_VERSION, "answer")).toBeUndefined();
+
+    const a = store.facts.get("a.ts")!;
+    const info = statSync(added);
+    store.meta.set("b.ts", { size: info.size, mtime: info.mtimeMs });
+    store.facts.set("b.ts", { ...a, sha1: "b".repeat(40), symbols: [], imports: [], calls: [], literals: [], anchors: [] });
+    expect(await saveSqliteSnapshot(store, graphFor("a.ts"), CACHE_VERSION)).toBe(true);
+    expect((await querySqliteSeeds(root, CACHE_VERSION, "answer"))?.seeds).toContain("answer@a.ts");
+
+    rmSync(added);
+    expect(await querySqliteSeeds(root, CACHE_VERSION, "answer")).toBeUndefined();
+  });
+
+  it("bootstraps SQLite on first graph use, then uses bounded SQLite reads", async () => {
+    if (!await sqliteOnly() || !hasAstGrep()) return;
+    const root = rootAt();
+    writeFileSync(join(root, "a.ts"), "export function answer() {}\n");
+    setResidentPreference(root, false);
+    resetSessions();
+    try {
+      const first = await focus(root, "answer", 512);
+      expect(first.text).toContain("answer");
+      const cache = await ensureWorktreeCache(root);
+      expect(existsSync(cache.databasePath)).toBe(true);
+      expect((await loadSqliteSnapshot(root, CACHE_VERSION))?.facts.has("a.ts")).toBe(true);
+
+      const second = await focus(root, "answer", 512, { fresh: true });
+      expect(second.details.queryMode).toBe("sqlite-index");
+      expect(second.text).toContain("answer");
+    } finally {
+      setResidentPreference(root, true);
+      evictState(root);
+    }
+  });
+
+  it("falls back to a fresh graph for dirty added and deleted files", async () => {
+    if (!await sqliteOnly() || !hasAstGrep()) return;
+    const root = rootAt();
+    writeFileSync(join(root, "a.ts"), "export function answer() {}\n");
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    execFileSync("git", ["add", "a.ts"], { cwd: root });
+    execFileSync("git", ["-c", "user.name=Fovea Test", "-c", "user.email=fovea@example.invalid", "commit", "-qm", "initial"], { cwd: root });
+    setResidentPreference(root, false);
+    resetSessions();
+    try {
+      await focus(root, "answer", 512); // cold bootstrap and SQLite publish
+      writeFileSync(join(root, "added.ts"), "export function added() {}\n");
+      const added = await focus(root, "added", 512, { fresh: true });
+      expect(added.text).toContain("added");
+      expect(added.details.queryMode).toBe("resident-fallback");
+      expect(added.details.freshness).toContain("dirty worktree");
+
+      rmSync(join(root, "added.ts"));
+      // Keep the worktree dirty after deleting the untracked addition: SQLite
+      // must refresh, not reuse the snapshot that still contains added.ts.
+      writeFileSync(join(root, "a.ts"), "export function answer() { return 1; }\n");
+      const deleted = await focus(root, "added", 512, { fresh: true });
+      expect(deleted.text).toContain("no graph match");
+      expect(deleted.details.queryMode).toBe("resident-fallback");
+    } finally {
+      setResidentPreference(root, true);
+      evictState(root);
+    }
+  });
+
   it("serves focus, dwell, and impact from SQLite within hard token budgets", async () => {
     if (!await sqliteOnly()) return;
     const root = rootAt();
@@ -221,6 +399,29 @@ describe("SQLite graph store", () => {
     expect(cascade.tokens).toBeLessThanOrEqual(256);
     expect(cascade.details.queryMode).toBe("sqlite-index");
     expect(cascade.text).toContain("subject.ts");
+  });
+
+  it("prefers a fresher resident graph over an older matching SQLite snapshot", async () => {
+    if (!await sqliteOnly() || !hasAstGrep()) return;
+    const root = rootAt();
+    setResidentPreference(root, true); // mirrors intentional turn-sync retention
+    // Facts/manifest match the worktree, while the persisted graph is
+    // deliberately old. A resident build must render the fresh graph instead.
+    const store = storeFor(root, "a.ts", "fresh");
+    expect(await saveSqliteSnapshot(store, graphFor("a.ts", "old"), CACHE_VERSION)).toBe(true);
+    await ensureState(root);
+    try {
+      resetSessions();
+      const focused = await focus(root, "fresh", 512);
+      expect(focused.details.queryMode).not.toBe("sqlite-index");
+      expect(focused.text).toContain("fresh");
+      const widened = await dwell(root, 2, 512);
+      expect(widened.details.queryMode).not.toBe("sqlite-index");
+      const cascade = await impact(root, { files: ["a.ts"], includeUncommitted: false, budget: 512 });
+      expect(cascade.details.queryMode).not.toBe("sqlite-index");
+    } finally {
+      evictState(root);
+    }
   });
 
   it("updates changed file rows in place and persists skipped-file lifecycle states", async () => {

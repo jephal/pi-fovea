@@ -11,7 +11,7 @@ import { resolveAgentDir } from "./core/agent-dir.js";
 import { loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
-import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
+import { dwell, ensureStateBackground, evictState, focus, impact, setResidentPreference, sketch } from "./core/ops.js";
 import { observeSessionPaths, resetSessions } from "./core/session.js";
 import { gitOut } from "./core/git.js";
 import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
@@ -235,10 +235,17 @@ export default function fovea(pi: ExtensionAPI) {
     // baselines are session-local and must never cross that boundary.
     resetSessions();
     resetSyncBaselines();
-    if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.grepMode === "replace") registerGrepOverride();
-    // Kick indexing in the background — the very first prompt must never
-    // wait on hashing/ast-grep. Slow cold builds surface a ready notice so
-    // the freeze feels like progress instead of a hang.
+    const config = configFor(ctx.cwd, ctx.isProjectTrusted());
+    if (config.tools.grepMode === "replace") registerGrepOverride();
+    // The normal tool path is durable-SQLite first. Only intentional sync
+    // keeps an in-memory graph fresh; drop a prior session's non-sync state.
+    const retainResident = syncRuns(config);
+    setResidentPreference(ctx.cwd, retainResident);
+    if (!retainResident) evictState(ctx.cwd);
+    // Full graph prewarming is opt-in: normal session startup must not hash or
+    // extract a repository before a graph request. Sketch stays explicitly
+    // eager because its whole-repository silhouette requires that work.
+    if (process.env.FOVEA_EAGER_INDEX !== "1") return;
     try {
       const kick = ensureStateBackground(ctx.cwd);
       const t0 = Date.now();
@@ -255,7 +262,12 @@ export default function fovea(pi: ExtensionAPI) {
           // first prompt fast-paths instead of paying the snapshot on the
           // send path. A /new, /fork, or reload bumps the epoch and clears it.
           const pre = configFor(ctx.cwd, ctx.isProjectTrusted());
-          if (!syncRuns(pre)) return;
+          if (!syncRuns(pre)) {
+            // Eager indexing without sync is a bootstrap only; later graph
+            // operations still select the bounded SQLite snapshot.
+            evictState(ctx.cwd);
+            return;
+          }
           void sync(
             ctx.cwd,
             { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus, scope: pre.sync.scope, sessionId },

@@ -29,10 +29,10 @@ const memory = (): string => {
   return `rss ${(usage.rss / 1024 / 1024).toFixed(1)}MB, heap ${(usage.heapUsed / 1024 / 1024).toFixed(1)}MB`;
 };
 
-// Cold build. Purge only this root's inactive persistent cache, then remove
-// the JSONL compatibility mirror. This keeps cold/warm measurements honest.
+// Cold build. Purge only this root's inactive private persistent cache. This
+// removes SQLite and its private JSONL fallback together.
 await manageCache({ purge: true, root });
-try { unlinkSync(cachePathFor(root)); } catch {}
+try { unlinkSync(await cachePathFor(root)); } catch {}
 let t0 = performance.now();
 let state = await ensureState(root);
 const coldMs = performance.now() - t0;

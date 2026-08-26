@@ -3,13 +3,17 @@
 // node:sqlite (and any database failure) return undefined/false so JSONL can
 // remain the durable fallback.
 
-import { randomUUID } from "node:crypto";
-import { rename, rm, statfs } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { rename, rm, stat, statfs } from "node:fs/promises";
 import type { AnchorDraft } from "./anchors.js";
 import type { CallSite, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
+import { gitProbe } from "./git.js";
 import { ensureWorktreeCache } from "./worktree-cache.js";
+import { redactSensitiveCacheValue, redactSensitiveValue } from "./privacy.js";
 
-const SCHEMA_VERSION = 3;
+// v5 makes redaction a persistence invariant; older databases may contain
+// source credentials and are discarded rather than retained as recoveries.
+const SCHEMA_VERSION = 5;
 const META_SCHEMA = "schema_version";
 const META_SEMANTIC = "semantic_version";
 const META_ROOT = "root";
@@ -67,6 +71,9 @@ type DatabaseConstructor = new (path: string, options?: { enableForeignKeyConstr
 
 const sqliteSpecifier = "node:sqlite";
 const dynamicSqlite = async (): Promise<DatabaseConstructor | undefined> => {
+  // Explicit opt-out supports hosts that disable native SQLite; JSONL remains
+  // a private fallback in that case. FOVEA_NO_CACHE still disables all layers.
+  if (process.env.FOVEA_SQLITE_DISABLE === "1") return undefined;
   try {
     const mod = await import(sqliteSpecifier) as { DatabaseSync?: DatabaseConstructor };
     return mod.DatabaseSync;
@@ -76,6 +83,7 @@ const dynamicSqlite = async (): Promise<DatabaseConstructor | undefined> => {
 };
 
 const text = (value: unknown): string => typeof value === "string" ? value : "";
+const cachedText = (value: unknown): string => redactSensitiveValue(text(value));
 const number = (value: unknown): number => typeof value === "number" ? value : Number(value ?? 0);
 const bool = (value: unknown): boolean => Number(value ?? 0) !== 0;
 const parseJson = <T>(value: unknown, fallback: T): T => {
@@ -92,7 +100,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
   generation INTEGER NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   rules_sha TEXT NOT NULL,
-  enrolled_json TEXT NOT NULL
+  enrolled_json TEXT NOT NULL,
+  head TEXT NOT NULL,
+  manifest_sha TEXT NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY,
@@ -216,11 +226,11 @@ const configure = async (db: Database, path: string): Promise<void> => {
   }
 };
 
-const validDatabase = (db: Database, root: string, semanticVersion: number): "empty" | "valid" | "invalid" => {
+const validDatabase = (db: Database, root: string, semanticVersion: number): "empty" | "valid" | "obsolete" | "corrupt" => {
   const hasMetadata = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'metadata'").get();
   if (!hasMetadata) return "empty";
   const check = db.prepare("PRAGMA quick_check").get();
-  if (text(check?.quick_check ?? check?.integrity_check) !== "ok") return "invalid";
+  if (text(check?.quick_check ?? check?.integrity_check) !== "ok") return "corrupt";
   const schema = meta(db, META_SCHEMA);
   if (schema === undefined) return "empty";
   const physical = number(db.prepare("PRAGMA user_version").get()?.user_version);
@@ -229,7 +239,7 @@ const validDatabase = (db: Database, root: string, semanticVersion: number): "em
     && meta(db, META_SEMANTIC) === String(semanticVersion)
     && meta(db, META_ROOT) === root
     ? "valid"
-    : "invalid";
+    : "obsolete";
 };
 
 const initialize = (db: Database, root: string, semanticVersion: number): void => {
@@ -243,6 +253,11 @@ const initialize = (db: Database, root: string, semanticVersion: number): void =
 const rotateBroken = async (path: string): Promise<void> => {
   const rotated = `${path}.recovered-${Date.now()}-${randomUUID()}`;
   await rename(path, rotated).catch(async () => { await rm(path, { force: true }); });
+};
+
+/** Version-mismatched facts may predate cache redaction, so never preserve them. */
+const discardObsolete = async (path: string): Promise<void> => {
+  await Promise.all([path, `${path}-wal`, `${path}-shm`, `${path}-journal`].map((candidate) => rm(candidate, { force: true })));
 };
 
 interface Opened { db: Database; path: string; }
@@ -268,7 +283,8 @@ const open = async (root: string, semanticVersion: number): Promise<Opened | und
       }
       db.close();
       db = undefined;
-      await rotateBroken(cache.databasePath);
+      if (status === "obsolete") await discardObsolete(cache.databasePath);
+      else await rotateBroken(cache.databasePath);
     } catch (error) {
       try { db?.close(); } catch { /* fail soft */ }
       // Never rotate on a transient lock, permissions, or I/O error: JSONL
@@ -285,15 +301,26 @@ const open = async (root: string, semanticVersion: number): Promise<Opened | und
 
 const close = (db: Database): void => { try { db.close(); } catch { /* fail soft */ } };
 
-export const loadSqliteSnapshot = async (root: string, semanticVersion: number): Promise<SqliteSnapshot | undefined> => {
+export interface SqliteSnapshotResult {
+  /** The database opened and its read transaction completed successfully. */
+  available: boolean;
+  snapshot?: SqliteSnapshot;
+}
+
+/**
+ * Read a snapshot while distinguishing an empty working SQLite store from an
+ * unavailable or failed SQLite operation. JSONL fallback is permitted only in
+ * the latter case.
+ */
+export const loadSqliteSnapshotResult = async (root: string, semanticVersion: number): Promise<SqliteSnapshotResult> => {
   const opened = await open(root, semanticVersion);
-  if (!opened) return undefined;
+  if (!opened) return { available: false };
   const { db } = opened;
   try {
     const current = meta(db, META_CURRENT);
-    if (!current) return undefined;
+    if (!current) return { available: true };
     const snapshot = db.prepare("SELECT id, generation, rules_sha, enrolled_json FROM snapshots WHERE id = ?").get(Number(current));
-    if (!snapshot) return undefined;
+    if (!snapshot) return { available: true };
     const snapshotId = number(snapshot.id);
     const facts = new Map<string, SqliteFileFacts>();
     const fileIds = new Map<number, string>();
@@ -322,7 +349,7 @@ export const loadSqliteSnapshot = async (root: string, semanticVersion: number):
       if (state === "unreadable") { out.unreadable.add(file); continue; }
       if (state === "oversized") { out.oversized.add(file); continue; }
       if (state === "generated") out.generated.add(file);
-      facts.set(file, { sha1: text(row.sha1), symbols: [], imports: [], calls: [], literals: [], anchors: [], sigs: parseJson(row.sigs_json, undefined) });
+      facts.set(file, { sha1: text(row.sha1), symbols: [], imports: [], calls: [], literals: [], anchors: [], sigs: redactSensitiveCacheValue(parseJson(row.sigs_json, undefined)) });
     }
     const add = <T>(sql: string, into: (fact: SqliteFileFacts) => T[], make: (row: Record<string, unknown>, file: string) => T): void => {
       for (const row of db.prepare(sql).all(snapshotId)) {
@@ -330,23 +357,54 @@ export const loadSqliteSnapshot = async (root: string, semanticVersion: number):
         if (fact) into(fact).push(make(row, fileIds.get(number(row.file_id))!));
       }
     };
-    add<SymbolRec>("SELECT s.file_id, s.name, s.kind, s.line, s.line_approximate, s.sig, s.lang FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.snapshot_id = ?", (f) => f.symbols, (r, file) => ({ name: text(r.name), kind: text(r.kind) as SymbolRec["kind"], file, line: number(r.line), lineApproximate: bool(r.line_approximate) || undefined, sig: text(r.sig), lang: text(r.lang) }));
-    add<ImportSite>("SELECT i.file_id, i.spec, i.line FROM imports i JOIN files f ON f.id = i.file_id WHERE f.snapshot_id = ?", (f) => f.imports, (r, file) => ({ file, spec: text(r.spec), line: number(r.line) }));
-    add<CallSite>("SELECT c.file_id, c.callee, c.line FROM calls c JOIN files f ON f.id = c.file_id WHERE f.snapshot_id = ?", (f) => f.calls, (r, file) => ({ file, callee: text(r.callee), line: number(r.line) }));
-    add<LiteralSite>("SELECT l.file_id, l.text, l.line FROM literals l JOIN files f ON f.id = l.file_id WHERE f.snapshot_id = ?", (f) => f.literals, (r, file) => ({ file, text: text(r.text), line: number(r.line) }));
-    add<AnchorDraft>("SELECT a.file_id, a.anchor_key, a.kind, a.label, a.node_key, a.line, a.implicit FROM anchors a JOIN files f ON f.id = a.file_id WHERE f.snapshot_id = ?", (f) => f.anchors, (r, file) => ({ id: text(r.anchor_key), kind: text(r.kind), label: text(r.label), nodeId: text(r.node_key), file, line: number(r.line), implicit: bool(r.implicit) || undefined }));
-    return out;
+    add<SymbolRec>("SELECT s.file_id, s.name, s.kind, s.line, s.line_approximate, s.sig, s.lang FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.snapshot_id = ?", (f) => f.symbols, (r, file) => ({ name: cachedText(r.name), kind: text(r.kind) as SymbolRec["kind"], file, line: number(r.line), lineApproximate: bool(r.line_approximate) || undefined, sig: cachedText(r.sig), lang: text(r.lang) }));
+    add<ImportSite>("SELECT i.file_id, i.spec, i.line FROM imports i JOIN files f ON f.id = i.file_id WHERE f.snapshot_id = ?", (f) => f.imports, (r, file) => ({ file, spec: cachedText(r.spec), line: number(r.line) }));
+    add<CallSite>("SELECT c.file_id, c.callee, c.line FROM calls c JOIN files f ON f.id = c.file_id WHERE f.snapshot_id = ?", (f) => f.calls, (r, file) => ({ file, callee: cachedText(r.callee), line: number(r.line) }));
+    add<LiteralSite>("SELECT l.file_id, l.text, l.line FROM literals l JOIN files f ON f.id = l.file_id WHERE f.snapshot_id = ?", (f) => f.literals, (r, file) => ({ file, text: cachedText(r.text), line: number(r.line) }));
+    add<AnchorDraft>("SELECT a.file_id, a.anchor_key, a.kind, a.label, a.node_key, a.line, a.implicit FROM anchors a JOIN files f ON f.id = a.file_id WHERE f.snapshot_id = ?", (f) => f.anchors, (r, file) => ({ id: cachedText(r.anchor_key), kind: text(r.kind), label: cachedText(r.label), nodeId: cachedText(r.node_key), file, line: number(r.line), implicit: bool(r.implicit) || undefined }));
+    return { available: true, snapshot: out };
   } catch {
-    return undefined;
+    return { available: false };
   } finally {
     close(db);
   }
 };
 
+export const loadSqliteSnapshot = async (root: string, semanticVersion: number): Promise<SqliteSnapshot | undefined> =>
+  (await loadSqliteSnapshotResult(root, semanticVersion)).snapshot;
+
+const manifestHash = (meta: ReadonlyMap<string, { size: number; mtime: number }>): string =>
+  createHash("sha256")
+    .update([...meta.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([path, info]) => `${path}\0${info.size}\0${info.mtime}\n`)
+      .join(""))
+    .digest("hex");
+
+const currentFreshness = async (root: string, enrolled: string[]): Promise<{ head: string; manifest: string } | undefined> => {
+  const probe = await gitProbe(root);
+  // A dirty Git worktree has additions/deletions/content outside this stored
+  // snapshot. Do not guess which subset a bounded lazy read may safely use.
+  if (probe && (probe.changes.length || probe.relist)) return undefined;
+  // Keep the walker authoritative for both plain roots and configured source
+  // types. Dynamic imports avoid a build <-> SQLite initialization cycle.
+  const [{ listFiles }, { loadRepoRules }] = await Promise.all([
+    import("./build.js"), import("./anchors.js"),
+  ]);
+  const { fileRoutes } = await loadRepoRules(root);
+  const files = await listFiles(root, fileRoutes.map((route) => new RegExp(route.re)), new Set(enrolled));
+  const entries = await Promise.all(files.map(async (file) => {
+    const info = await stat(`${root}/${file}`).catch(() => undefined);
+    return [file, info?.isFile() ? { size: info.size, mtime: info.mtimeMs } : { size: 0, mtime: 0 }] as const;
+  }));
+  return { head: probe?.head ?? "", manifest: manifestHash(new Map(entries)) };
+};
+
 const graphNode = (db: Database, snapshotId: number, node: NodeRec): number => {
+  const safe = redactSensitiveCacheValue(node);
   db.prepare(`INSERT INTO graph_nodes(snapshot_id, node_key, name, kind, file, line, line_approximate, sig, lang)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(snapshotId, node.id, node.name, node.kind, node.file, node.line, node.lineApproximate ? 1 : 0, node.sig, node.lang);
-  return number(db.prepare("SELECT id FROM graph_nodes WHERE snapshot_id = ? AND node_key = ?").get(snapshotId, node.id)?.id);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(snapshotId, safe.id, safe.name, safe.kind, safe.file, safe.line, safe.lineApproximate ? 1 : 0, safe.sig, safe.lang);
+  return number(db.prepare("SELECT id FROM graph_nodes WHERE snapshot_id = ? AND node_key = ?").get(snapshotId, safe.id)?.id);
 };
 
 /**
@@ -360,25 +418,30 @@ export const saveSqliteSnapshot = async (store: SqliteFactStore, graph: Graph, s
   if (!opened) return false;
   const { db } = opened;
   try {
+    const freshness = await currentFreshness(store.root, [...store.enrolled]);
+    // Persistence is allowed for a dirty worktree, but lazy reads will reject
+    // it until clean. Its manifest remains a precise witness for plain roots.
+    const snapshotHead = freshness?.head ?? "";
+    const snapshotManifest = manifestHash(store.meta);
     db.exec("BEGIN IMMEDIATE");
     let snapshotId = number(meta(db, META_CURRENT));
     let oldRules = "";
     if (snapshotId) oldRules = text(db.prepare("SELECT rules_sha FROM snapshots WHERE id = ?").get(snapshotId)?.rules_sha);
     if (!snapshotId || !oldRules) {
       const generation = number(db.prepare("SELECT COALESCE(MAX(generation), 0) + 1 AS generation FROM snapshots").get()?.generation);
-      db.prepare("INSERT INTO snapshots(generation, created_at, rules_sha, enrolled_json) VALUES (?, ?, ?, ?)")
-        .run(generation, Date.now(), store.rulesSha, JSON.stringify([...store.enrolled].sort()));
+      db.prepare("INSERT INTO snapshots(generation, created_at, rules_sha, enrolled_json, head, manifest_sha) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(generation, Date.now(), store.rulesSha, JSON.stringify([...store.enrolled].sort()), snapshotHead, snapshotManifest);
       snapshotId = number(db.prepare("SELECT id FROM snapshots WHERE generation = ?").get(generation)?.id);
       setMeta(db, META_CURRENT, String(snapshotId));
     } else {
-      db.prepare("UPDATE snapshots SET created_at = ?, rules_sha = ?, enrolled_json = ? WHERE id = ?")
-        .run(Date.now(), store.rulesSha, JSON.stringify([...store.enrolled].sort()), snapshotId);
+      db.prepare("UPDATE snapshots SET created_at = ?, rules_sha = ?, enrolled_json = ?, head = ?, manifest_sha = ? WHERE id = ?")
+        .run(Date.now(), store.rulesSha, JSON.stringify([...store.enrolled].sort()), snapshotHead, snapshotManifest, snapshotId);
     }
     const rulesChanged = oldRules !== "" && oldRules !== store.rulesSha;
     const existing = new Map<string, Record<string, unknown>>();
     for (const row of db.prepare(`SELECT f.id, f.path, f.size, f.mtime, ff.sha1, ff.state, ff.sigs_json
       FROM files f JOIN file_facts ff ON ff.file_id = f.id WHERE f.snapshot_id = ?`).all(snapshotId)) existing.set(text(row.path), row);
-    const paths = new Set([...store.meta.keys(), ...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized]);
+    const paths = new Set([...store.meta.keys(), ...store.facts.keys(), ...store.failedSha.keys(), ...store.unreadable, ...store.oversized, ...store.generated]);
     const removeFile = db.prepare("DELETE FROM files WHERE id = ?");
     for (const [path, row] of existing) if (!paths.has(path)) removeFile.run(number(row.id));
 
@@ -405,7 +468,7 @@ export const saveSqliteSnapshot = async (store: SqliteFactStore, graph: Graph, s
           : store.oversized.has(path) ? "oversized"
             : store.generated.has(path) ? "generated" : "clean";
       const sha1 = store.failedSha.get(path) ?? facts?.sha1 ?? "";
-      const sigs = facts?.sigs ? JSON.stringify(facts.sigs) : null;
+      const sigs = facts?.sigs ? JSON.stringify(redactSensitiveCacheValue(facts.sigs)) : null;
       let row = existing.get(path);
       if (!row) {
         insertFile.run(snapshotId, path, metaRow.size, metaRow.mtime);
@@ -420,11 +483,11 @@ export const saveSqliteSnapshot = async (store: SqliteFactStore, graph: Graph, s
       else insertFact.run(fileId, sha1, state, sigs);
       deleteSymbols.run(fileId); deleteImports.run(fileId); deleteCalls.run(fileId); deleteLiterals.run(fileId); deleteAnchors.run(fileId);
       if (!facts || state === "failed" || state === "unreadable" || state === "oversized") continue;
-      for (const item of facts.symbols) symbol.run(fileId, item.name, item.kind, item.line, item.lineApproximate ? 1 : 0, item.sig, item.lang);
-      for (const item of facts.imports) imported.run(fileId, item.spec, item.line);
-      for (const item of facts.calls) called.run(fileId, item.callee, item.line);
-      for (const item of facts.literals) literal.run(fileId, item.text, item.line);
-      for (const item of facts.anchors) anchor.run(fileId, item.id, item.kind, item.label, item.nodeId, item.line, item.implicit ? 1 : 0);
+      for (const item of facts.symbols) symbol.run(fileId, redactSensitiveValue(item.name), item.kind, item.line, item.lineApproximate ? 1 : 0, redactSensitiveValue(item.sig), item.lang);
+      for (const item of facts.imports) imported.run(fileId, redactSensitiveValue(item.spec), item.line);
+      for (const item of facts.calls) called.run(fileId, redactSensitiveValue(item.callee), item.line);
+      for (const item of facts.literals) literal.run(fileId, redactSensitiveValue(item.text), item.line);
+      for (const item of facts.anchors) anchor.run(fileId, redactSensitiveValue(item.id), item.kind, redactSensitiveValue(item.label), redactSensitiveValue(item.nodeId), item.line, item.implicit ? 1 : 0);
     }
     db.prepare("DELETE FROM graph_nodes WHERE snapshot_id = ?").run(snapshotId);
     const nodeIds = new Map<string, number>();
@@ -450,6 +513,16 @@ export const saveSqliteSnapshot = async (store: SqliteFactStore, graph: Graph, s
 /** Used by tests and future lazy query callers without exposing a tool name. */
 export const sqliteAvailability = async (): Promise<boolean> => !!await dynamicSqlite();
 
+/**
+ * A dirty Git worktree is deliberately never read through a durable bounded
+ * snapshot. Callers must refresh the full graph instead; this keeps additions
+ * and deletions correct even when a snapshot was written moments earlier.
+ */
+export const sqliteLazyReadBlockedByDirtyWorktree = async (root: string): Promise<boolean> => {
+  const probe = await gitProbe(root);
+  return !!probe && (probe.changes.length > 0 || probe.relist);
+};
+
 // Lazy graph reads deliberately bypass loadSqliteSnapshot(): that warm-start
 // API reconstructs every fact row, while focus needs only its seeds and a
 // capped relationship frontier.
@@ -467,9 +540,9 @@ export interface SqliteNeighborhood {
 }
 
 const nodeFromRow = (row: Record<string, unknown>): NodeRec => ({
-  id: text(row.node_key), name: text(row.name), kind: text(row.kind) as NodeRec["kind"],
-  file: text(row.file), line: number(row.line), lineApproximate: bool(row.line_approximate) || undefined,
-  sig: text(row.sig), lang: text(row.lang),
+  id: cachedText(row.node_key), name: cachedText(row.name), kind: text(row.kind) as NodeRec["kind"],
+  file: cachedText(row.file), line: number(row.line), lineApproximate: bool(row.line_approximate) || undefined,
+  sig: cachedText(row.sig), lang: text(row.lang),
 });
 const scopeAllows = (node: NodeRec, scope: SqliteQueryScope): boolean => {
   const path = scope.path?.replace(/^@/, "").replace(/^\.\//, "").replace(/\/$/, "");
@@ -477,11 +550,21 @@ const scopeAllows = (node: NodeRec, scope: SqliteQueryScope): boolean => {
     && (!scope.language || node.lang.toLowerCase() === scope.language.toLowerCase())
     && (!scope.kind || node.kind === scope.kind);
 };
-const querySnapshot = (db: Database): { id: number; generation: number } | undefined => {
+const querySnapshot = (db: Database): { id: number; generation: number; head: string; manifest: string; enrolled: string[] } | undefined => {
   const current = number(meta(db, META_CURRENT));
   if (!current) return undefined;
-  const row = db.prepare("SELECT id, generation FROM snapshots WHERE id = ?").get(current);
-  return row ? { id: number(row.id), generation: number(row.generation) } : undefined;
+  const row = db.prepare("SELECT id, generation, head, manifest_sha, enrolled_json FROM snapshots WHERE id = ?").get(current);
+  return row ? {
+    id: number(row.id), generation: number(row.generation), head: text(row.head), manifest: text(row.manifest_sha),
+    enrolled: parseJson<string[]>(row.enrolled_json, []).filter((value): value is string => typeof value === "string"),
+  } : undefined;
+};
+
+const freshQuerySnapshot = async (db: Database, root: string): Promise<ReturnType<typeof querySnapshot>> => {
+  const snapshot = querySnapshot(db);
+  if (!snapshot || !snapshot.manifest) return undefined;
+  const current = await currentFreshness(root, snapshot.enrolled);
+  return current && current.head === snapshot.head && current.manifest === snapshot.manifest ? snapshot : undefined;
 };
 const placeholders = (n: number): string => Array.from({ length: n }, () => "?").join(",");
 const chunks = <T>(items: readonly T[], n = 96): T[][] => {
@@ -514,7 +597,7 @@ export const querySqliteSeeds = async (root: string, semanticVersion: number, qu
   const opened = await open(root, semanticVersion); if (!opened) return undefined;
   const { db } = opened;
   try {
-    const snapshot = querySnapshot(db); if (!snapshot) return undefined;
+    const snapshot = await freshQuerySnapshot(db, root); if (!snapshot) return undefined;
     const q = query.trim(); const lower = q.toLowerCase(); const rows = new Map<string, Record<string, unknown>>();
     const add = (found: Array<Record<string, unknown>>): void => { for (const row of found) rows.set(text(row.node_key), row); };
     const base = "id, node_key, name, kind, file, line, line_approximate, sig, lang";
@@ -556,7 +639,7 @@ export const querySqliteNeighborhood = async (root: string, semanticVersion: num
   const opened = await open(root, semanticVersion); if (!opened) return undefined;
   const { db } = opened;
   try {
-    const snapshot = querySnapshot(db); if (!snapshot) return undefined;
+    const snapshot = await freshQuerySnapshot(db, root); if (!snapshot) return undefined;
     const cap = Math.max(16, Math.min(1024, options.cap ?? 384)); const depth = Math.max(1, Math.min(8, options.depth ?? 2));
     const seedRows = db.prepare(`SELECT id, node_key FROM graph_nodes WHERE snapshot_id = ? AND node_key IN (${placeholders(seedKeys.length)}) ORDER BY node_key`).all(snapshot.id, ...seedKeys);
     if (!seedRows.length) return undefined;

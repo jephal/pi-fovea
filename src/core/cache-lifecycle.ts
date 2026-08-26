@@ -2,8 +2,7 @@
 // deliberately best-effort: uncertainty (a lease, SQLite sidecar, malformed
 // identity, or an unreadable directory) means keep the entry and report why.
 
-import { existsSync } from "node:fs";
-import { lstat, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { envInt } from "./asyncutil.js";
 import { cacheDisabled, cacheWorktreesDir, type WorktreeIdentity } from "./worktree-cache.js";
@@ -67,10 +66,11 @@ const recursiveBytes = async (path: string): Promise<number> => {
 
 const readIdentity = async (dir: string): Promise<WorktreeIdentity | undefined> => {
   try {
-    const parsed = JSON.parse(await readFile(join(dir, "identity.json"), "utf8")) as { v?: unknown; root?: unknown; gitDir?: unknown; commonGitDir?: unknown };
-    if (parsed.v !== 1 || typeof parsed.root !== "string") return undefined;
+    const parsed = JSON.parse(await readFile(join(dir, "identity.json"), "utf8")) as { v?: unknown; root?: unknown; gitRoot?: unknown; gitDir?: unknown; commonGitDir?: unknown };
+    if (parsed.v !== 2 || typeof parsed.root !== "string") return undefined;
     return {
       root: parsed.root,
+      ...(typeof parsed.gitRoot === "string" ? { gitRoot: parsed.gitRoot } : {}),
       ...(typeof parsed.gitDir === "string" ? { gitDir: parsed.gitDir } : {}),
       ...(typeof parsed.commonGitDir === "string" ? { commonGitDir: parsed.commonGitDir } : {}),
     };
@@ -79,7 +79,7 @@ const readIdentity = async (dir: string): Promise<WorktreeIdentity | undefined> 
 
 const missingWorktree = async (identity: WorktreeIdentity | undefined): Promise<boolean> => {
   if (!identity) return false; // malformed identity is protected, never guessed stale.
-  const paths = [identity.root, identity.gitDir, identity.commonGitDir].filter((p): p is string => !!p);
+  const paths = [identity.root, identity.gitRoot, identity.gitDir, identity.commonGitDir].filter((p): p is string => !!p);
   const checks = await Promise.all(paths.map((path) => lstat(path).then(() => true, () => false)));
   return checks.some((exists) => !exists);
 };
@@ -94,25 +94,37 @@ const leaseProtection = async (dir: string, now: number): Promise<string | undef
   return undefined;
 };
 
+const sidecarProtection = async (dir: string, now: number): Promise<string | undefined> => {
+  const sidecars = [join(dir, "fovea.sqlite-wal"), join(dir, "fovea.sqlite-shm")];
+  const mtimes = await Promise.all(sidecars.map((path) => stat(path).then((info) => info.mtimeMs, () => 0)));
+  // A sidecar is evidence of a recently active SQLite connection, not a
+  // permanent tombstone. Stale WAL/SHM files are safe to remove together with
+  // their private cache once all other protections have expired.
+  return Math.max(...mtimes) > 0 && now - Math.max(...mtimes) < LEASE_FRESH_MS
+    ? "recent SQLite WAL/SHM"
+    : undefined;
+};
+
+const inspectEntry = async (dir: string, now: number): Promise<CacheEntryDiagnostic | undefined> => {
+  let info;
+  try { info = await lstat(dir); } catch { return undefined; }
+  if (!info.isDirectory() || info.isSymbolicLink()) return undefined;
+  const identity = await readIdentity(dir);
+  const protectedReasons: string[] = [];
+  if (!identity) protectedReasons.push("invalid identity");
+  const lease = await leaseProtection(dir, now);
+  if (lease) protectedReasons.push(lease);
+  const sidecar = await sidecarProtection(dir, now);
+  if (sidecar) protectedReasons.push(sidecar);
+  const accessedAt = Math.max(info.mtimeMs, await stat(join(dir, "lease.json")).then((s) => s.mtimeMs, () => 0));
+  return { dir, identity, bytes: await recursiveBytes(dir), accessedAt, stale: await missingWorktree(identity), protected: protectedReasons };
+};
+
 const inspect = async (base: string, now: number): Promise<CacheEntryDiagnostic[]> => {
   let names: string[] = [];
   try { names = await readdir(base); } catch { return []; }
-  const entries: CacheEntryDiagnostic[] = [];
-  for (const name of names.sort()) {
-    const dir = join(base, name);
-    let info;
-    try { info = await lstat(dir); } catch { continue; }
-    if (!info.isDirectory() || info.isSymbolicLink()) continue;
-    const identity = await readIdentity(dir);
-    const protectedReasons: string[] = [];
-    if (!identity) protectedReasons.push("invalid identity");
-    const lease = await leaseProtection(dir, now);
-    if (lease) protectedReasons.push(lease);
-    if (existsSync(join(dir, "fovea.sqlite-wal")) || existsSync(join(dir, "fovea.sqlite-shm"))) protectedReasons.push("SQLite WAL/SHM present");
-    const accessedAt = Math.max(info.mtimeMs, await stat(join(dir, "lease.json")).then((s) => s.mtimeMs, () => 0));
-    entries.push({ dir, identity, bytes: await recursiveBytes(dir), accessedAt, stale: await missingWorktree(identity), protected: protectedReasons });
-  }
-  return entries;
+  const entries = await Promise.all(names.sort().map((name) => inspectEntry(join(base, name), now)));
+  return entries.filter((entry): entry is CacheEntryDiagnostic => !!entry);
 };
 
 // Keep lifecycle bookkeeping beside (not inside) worktree entries so every
@@ -123,7 +135,11 @@ const lastCleanup = async (base: string): Promise<number> => {
   try { return Number((JSON.parse(await readFile(markerPath(base), "utf8")) as { at?: unknown }).at) || 0; } catch { return 0; }
 };
 const markCleanup = async (base: string, now: number): Promise<void> => {
-  await writeFile(markerPath(base), JSON.stringify({ at: now }) + "\n", { mode: 0o600 }).catch(() => undefined);
+  const path = markerPath(base);
+  // `mode` is creation-only: repair a pre-existing marker too.
+  await writeFile(path, JSON.stringify({ at: now }) + "\n", { mode: 0o600 })
+    .then(() => chmod(path, 0o600))
+    .catch(() => undefined);
 };
 
 /** Inspect, dry-run, purge, or perform throttled stale/size cleanup. */
@@ -163,8 +179,9 @@ export const manageCache = async (options: CacheCleanupOptions = {}): Promise<Ca
   if (options.dryRun) return out;
   if (!options.purge && now - await lastCleanup(base) < CLEANUP_GAP_MS) return { ...out, throttled: true };
   for (const entry of candidates) {
-    // Re-check the directory and SQLite sidecars immediately before mutation.
-    const fresh = (await inspect(base, now)).find((item) => item.dir === entry.dir);
+    // Re-check this candidate only. Re-scanning the entire cache here made a
+    // deletion pass quadratic in the number of entries.
+    const fresh = await inspectEntry(entry.dir, now);
     if (!fresh || fresh.protected.length || !fresh.identity) {
       out.skipped.push({ dir: entry.dir, reason: fresh?.protected.join(", ") || "entry changed during cleanup" });
       continue;
