@@ -4,17 +4,20 @@
 // incremental across sessions.
 
 import { readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import { loadFoveaConfig, type FoveaConfig } from "./core/config.js";
 import { hasAstGrep } from "./core/astgrep.js";
 import { ROOT_CACHE_LIMIT } from "./core/asyncutil.js";
-import { dwell, ensureStateBackground, focus, impact, sketch } from "./core/ops.js";
+import { dwell, ensureStateBackground, evictState, focus, impact, setResidentPreference, sketch } from "./core/ops.js";
 import { observeSessionPaths, resetSessions } from "./core/session.js";
+import { gitOut } from "./core/git.js";
 import { captureMutation, finishMutation, type MutationCapture } from "./core/provenance.js";
 import { resetSyncBaselines, sync, warmSync } from "./core/sync.js";
 import type { NodeKind } from "./core/types.js";
+import { manageCache } from "./core/cache-lifecycle.js";
 
 const PACKAGE_VERSION = (() => {
   try {
@@ -78,6 +81,20 @@ const NODE_KINDS = new Set<NodeKind>([
 ]);
 const focusKind = (value: string | undefined): NodeKind | undefined =>
   value && NODE_KINDS.has(value as NodeKind) ? value as NodeKind : undefined;
+
+// The agent-facing extension may inspect the active workspace, but should not
+// turn an LLM-provided root argument into an arbitrary filesystem reader.
+// Nested repositories remain usable; parents and unrelated absolute paths do
+// not. The standalone CLI intentionally keeps its explicit root behavior.
+const workspaceRoot = (cwd: string, requested?: string): string => {
+  const base = resolve(cwd);
+  const root = resolve(base, requested ?? ".");
+  const rel = relative(base, root);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`fovea: root must be the current workspace or one of its descendants: ${requested ?? "."}`);
+  }
+  return root;
+};
 
 export default function fovea(pi: ExtensionAPI) {
   // Per-root config cache; invalidated by settings saves (/fovea settings).
@@ -218,10 +235,17 @@ export default function fovea(pi: ExtensionAPI) {
     // baselines are session-local and must never cross that boundary.
     resetSessions();
     resetSyncBaselines();
-    if (configFor(ctx.cwd, ctx.isProjectTrusted()).tools.grepMode === "replace") registerGrepOverride();
-    // Kick indexing in the background — the very first prompt must never
-    // wait on hashing/ast-grep. Slow cold builds surface a ready notice so
-    // the freeze feels like progress instead of a hang.
+    const config = configFor(ctx.cwd, ctx.isProjectTrusted());
+    if (config.tools.grepMode === "replace") registerGrepOverride();
+    // The normal tool path is durable-SQLite first. Only intentional sync
+    // keeps an in-memory graph fresh; drop a prior session's non-sync state.
+    const retainResident = syncRuns(config);
+    setResidentPreference(ctx.cwd, retainResident);
+    if (!retainResident) evictState(ctx.cwd);
+    // Full graph prewarming is opt-in: normal session startup must not hash or
+    // extract a repository before a graph request. Sketch stays explicitly
+    // eager because its whole-repository silhouette requires that work.
+    if (process.env.FOVEA_EAGER_INDEX !== "1") return;
     try {
       const kick = ensureStateBackground(ctx.cwd);
       const t0 = Date.now();
@@ -238,6 +262,12 @@ export default function fovea(pi: ExtensionAPI) {
           // first prompt fast-paths instead of paying the snapshot on the
           // send path. A /new, /fork, or reload bumps the epoch and clears it.
           const pre = configFor(ctx.cwd, ctx.isProjectTrusted());
+          if (!syncRuns(pre)) {
+            // Eager indexing without sync is a bootstrap only; later graph
+            // operations still select the bounded SQLite snapshot.
+            evictState(ctx.cwd);
+            return;
+          }
           void sync(
             ctx.cwd,
             { files: [], budget: pre.sync.budget, steerThreshold: pre.sync.steerThreshold, pushFocus: pre.sync.pushFocus, scope: pre.sync.scope, sessionId },
@@ -297,6 +327,7 @@ export default function fovea(pi: ExtensionAPI) {
     turnFiles = [];
   });
   pi.on("tool_execution_start", async (event, ctx) => {
+    if (!syncRuns(configFor(ctx.cwd, ctx.isProjectTrusted()))) return;
     const args = event.args as { path?: unknown };
     if (ATTENTION_PATH_TOOLS.has(event.toolName) && typeof args.path === "string") {
       observeSessionPaths(ctx.cwd, [args.path]);
@@ -310,6 +341,7 @@ export default function fovea(pi: ExtensionAPI) {
   // Warm once the file is actually on disk (tool_execution_start fires during
   // preflight, before the write lands); the debounce also coalesces bursts.
   pi.on("tool_execution_end", async (event, ctx) => {
+    if (!syncRuns(configFor(ctx.cwd, ctx.isProjectTrusted()))) return;
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const capture = pendingMutations.get(event.toolCallId);
     pendingMutations.delete(event.toolCallId);
@@ -404,7 +436,7 @@ export default function fovea(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({ root: RootParam, maxTokens: BudgetParam }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea sketch cancelled");
         onUpdate?.({ content: [text("Surveying production architecture…")], details: { phase: "sketch" } });
@@ -439,7 +471,7 @@ export default function fovea(pi: ExtensionAPI) {
       maxTokens: BudgetParam,
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea focus cancelled");
         onUpdate?.({ content: [text("Resolving focused repository context…")], details: { phase: "focus" } });
@@ -474,7 +506,7 @@ export default function fovea(pi: ExtensionAPI) {
       maxTokens: BudgetParam,
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea dwell cancelled");
         onUpdate?.({ content: [text("Widening the current graph context…")], details: { phase: "diffuse" } });
@@ -502,7 +534,7 @@ export default function fovea(pi: ExtensionAPI) {
       maxTokens: BudgetParam,
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      const root = params.root ?? ctx.cwd;
+      const root = workspaceRoot(ctx.cwd, params.root);
       try {
         if (signal?.aborted) throw new Error("Fovea impact cancelled");
         onUpdate?.({ content: [text("Tracing likely change impact…")], details: { phase: "impact" } });
@@ -524,13 +556,13 @@ export default function fovea(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("fovea", {
-    description: "pi-fovea status, settings, reset, and reload",
+    description: "pi-fovea status, cache diagnostics, settings, reset, and reload",
     getArgumentCompletions: (prefix) =>
-      ["status", "settings", "reset", "reload"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
+      ["status", "cache", "cache dry-run", "cache purge", "settings", "reset", "reload"].filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/)[0] || "status";
-      if (!["status", "settings", "reset", "reload"].includes(sub)) {
-        ctx.ui.notify("Usage: /fovea status | settings | reset | reload", "warning");
+      if (!["status", "cache", "settings", "reset", "reload"].includes(sub)) {
+        ctx.ui.notify("Usage: /fovea status | cache [dry-run|purge] | settings | reset | reload", "warning");
         return;
       }
       if (sub === "reload") {
@@ -545,6 +577,22 @@ export default function fovea(pi: ExtensionAPI) {
         ctx.ui.notify("Fovea focus history and sync baseline reset.", "info");
         return;
       }
+      if (sub === "cache") {
+        const action = args.trim().split(/\s+/)[1] ?? "status";
+        if (!["status", "dry-run", "purge"].includes(action)) {
+          ctx.ui.notify("Usage: /fovea cache [dry-run|purge]", "warning");
+          return;
+        }
+        const result = await manageCache({ dryRun: action === "dry-run", purge: action === "purge", root: action === "purge" ? ctx.cwd : undefined });
+        ctx.ui.notify(
+          result.enabled
+            ? `fovea cache ${action}: ${result.entries.length} entries · ${result.totalBytes} bytes · ${result.candidates.length} candidates` +
+              `${result.deleted.length ? ` · deleted ${result.deleted.length}` : ""}${result.skipped.length ? ` · skipped ${result.skipped.length}` : ""}${result.throttled ? " · throttled" : ""}`
+            : "fovea cache disabled by FOVEA_NO_CACHE",
+          "info",
+        );
+        return;
+      }
       if (sub === "settings") {
         const { openFoveaSettings } = await import("./ui/settings.js");
         const result = await openFoveaSettings(ctx, { onConfigApplied: () => configs.clear() });
@@ -557,14 +605,13 @@ export default function fovea(pi: ExtensionAPI) {
       try {
         const [state, tracked, astGrep] = await Promise.all([
           sketch(ctx.cwd, 256),
-          pi.exec("git", ["-C", ctx.cwd, "ls-files"], { timeout: 15_000 })
-            .catch(() => ({ code: -1, stdout: "" })),
+          gitOut(ctx.cwd, ["ls-files"], { timeout: 15_000 }),
           pi.exec(process.env.FOVEA_AST_GREP ?? "ast-grep", ["--version"], { timeout: 15_000 })
             .catch(() => ({ code: -1, stdout: "" })),
         ]);
         const indexed = Number(state.details.files ?? 0);
-        const trackedCount = tracked.code === 0
-          ? tracked.stdout.split("\n").filter(Boolean).length
+        const trackedCount = tracked !== undefined
+          ? tracked.split("\n").filter(Boolean).length
           : undefined;
         const coverage = trackedCount === undefined ? `${indexed} indexed files` : `${indexed}/${trackedCount} tracked files indexed`;
         const failedCount = Number(state.details.extractionFailures ?? 0);

@@ -10,7 +10,6 @@ import extension from "../src/index.js";
 import { resetSessions } from "../src/core/session.js";
 import { captureMutation, finishMutation, provenancePathFor } from "../src/core/provenance.js";
 import { hasAstGrep } from "../src/core/astgrep.js";
-import { cachePathFor } from "../src/core/build.js";
 import { ensureState, evictState, getInflight, getState } from "../src/core/ops.js";
 import { DEFAULT_FOVEA_CONFIG } from "../src/core/config.js";
 import { resetSyncBaselines, warmCacheHas } from "../src/core/sync.js";
@@ -101,6 +100,11 @@ const enableGrep = async () => {
   return { root, ...loaded };
 };
 
+const enableProjectSync = (root: string, mode: "enabled" | "hidden" = "enabled"): void => {
+  mkdirSync(path.join(root, ".pi"), { recursive: true });
+  writeFileSync(path.join(root, ".pi", "fovea.json"), JSON.stringify({ sync: { mode } }));
+};
+
 describe("extension entry", () => {
   it("registers four graph tools and /fovea before session startup", () => {
     const { tools, commands } = load();
@@ -112,10 +116,23 @@ describe("extension entry", () => {
     expect(tools.has("grep")).toBe(false);
     expect(commands.has("fovea")).toBe(true);
     expect(commands.get("fovea")!.getArgumentCompletions?.("").map((item) => item.value)).toEqual([
-      "status", "settings", "reset", "reload",
+      "status", "cache", "cache dry-run", "cache purge", "settings", "reset", "reload",
     ]);
-    expect(DEFAULT_FOVEA_CONFIG.tools.grepMode).toBe("augment");
+    expect(DEFAULT_FOVEA_CONFIG.sync.mode).toBe("disabled");
+    expect(DEFAULT_FOVEA_CONFIG.tools.grepMode).toBe("off");
     expect(DEFAULT_FOVEA_CONFIG.tools.grepAugmentBudget).toBe(512);
+  });
+
+  it("rejects graph roots outside the active workspace", async () => {
+    const { tools } = load();
+    const focusTool = tools.get("fovea_focus")!;
+    await expect(focusTool.execute(
+      "outside-root",
+      { query: "secret", root: ".." },
+      new AbortController().signal,
+      undefined,
+      fakeCtx(FIXTURE),
+    )).rejects.toThrow(/current workspace or one of its descendants/);
   });
 
   it("reloads extension source through /fovea reload", async () => {
@@ -163,7 +180,6 @@ describe("extension entry", () => {
       vi.unstubAllEnvs();
       evictState(root);
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 
@@ -221,8 +237,8 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(message).toMatch(/pi-fovea \d+\.\d+\.\d+/);
     expect(message).toContain("tracked files indexed");
     expect(message).toContain("production anchors");
-    expect(message).toContain("sync enabled");
-    expect(message).toContain("grep augment");
+    expect(message).toContain("sync disabled");
+    expect(message).toContain("grep off");
     expect(message).toContain("ast-grep");
   });
 
@@ -320,6 +336,9 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
 
   it("co-existence: native grep results gain a Fovea graph section for symbol queries", async () => {
     resetSessions();
+    const agentDirRoot = mkdtempSync(path.join(tmpdir(), "pi-fovea-augment-global-"));
+    writeFileSync(path.join(agentDirRoot, "fovea.json"), JSON.stringify({ tools: { grepMode: "augment" } }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDirRoot);
     const loaded = load();
     const [patch] = await loaded.emit("tool_result", {
       type: "tool_result",
@@ -357,6 +376,8 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       isError: false,
     }, fakeCtx(FIXTURE));
     expect((scopedPatch as { content: Array<{ text: string }> }).content).toHaveLength(2);
+    vi.unstubAllEnvs();
+    rmSync(agentDirRoot, { recursive: true, force: true });
   });
 
   it("skips augmentation for regex patterns, errors, non-grep tools, and off/replace modes", async () => {
@@ -426,10 +447,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root); // session_start pre-warm equivalent
       await loaded.emit("before_agent_start", { prompt: "first" }, ctx);
@@ -464,10 +486,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root);
       await loaded.emit("before_agent_start", { prompt: "first" }, ctx);
@@ -514,8 +537,9 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root);
       await loaded.emit("session_start", { reason: "startup" }, ctx);
@@ -537,7 +561,6 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     } finally {
       evictState(root);
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 
@@ -546,10 +569,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root); // session_start pre-warm equivalent
       await loaded.emit("before_agent_start", { prompt: "change the route" }, ctx); // establish pre-edit baseline
@@ -585,10 +609,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root, false, "session-a");
+    const ctx = fakeCtx(root, true, "session-a");
     const main = path.join(root, "server/main.go");
     try {
       await ensureState(root);
@@ -683,6 +708,7 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       expect(before.filter((result) => result !== undefined)).toEqual([]);
       expect(loaded.messages).toHaveLength(0);
       expect(getState(root)).toBeUndefined();
+      expect(existsSync(provenancePathFor(root, "test-session"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -697,10 +723,11 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     cpSync(FIXTURE, root, { recursive: true });
     execSync("git init -qb main && git add -A", { cwd: root });
     execSync('git -c user.name=t -c user.email=t@t commit -qm init', { cwd: root });
+    enableProjectSync(root);
     resetSessions();
     resetSyncBaselines();
     const loaded = load();
-    const ctx = fakeCtx(root);
+    const ctx = fakeCtx(root, true);
     try {
       await ensureState(root);
       await loaded.emit("before_agent_start", { prompt: "add a route" }, ctx);
@@ -747,27 +774,30 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
     expect(result.content[0]!.text).toContain("web/api.ts");
   });
 
-  it("kicks a background index at session start without ever blocking the prompt", async () => {
+  it("does not prewarm at session start unless FOVEA_EAGER_INDEX=1", async () => {
     const loaded = load();
     const root = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-"));
     try {
       writeFileSync(path.join(root, "probe.ts"), "export const probe = 1;\n");
       evictState(root);
-      // session_start returns promptly and the build runs out-of-band.
+      await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
+      expect(getInflight(root)).toBeUndefined();
+      expect(getState(root)).toBeUndefined();
+
+      vi.stubEnv("FOVEA_EAGER_INDEX", "1");
       await loaded.emit("session_start", { reason: "new" }, fakeCtx(root, true));
       const pending = getInflight(root);
       expect(pending).toBeDefined();
-      const state = await pending!;
-      expect(getState(root)?.version).toBe(state.version);
-      // The fact cache materializes for the next session's warm start.
-      expect(existsSync(cachePathFor(root))).toBe(true);
-      // ast-grep missing: the gate short-circuits before kicking anything.
+      await pending!;
+      // Non-sync eager indexing is only a bootstrap; future graph calls use
+      // the durable bounded path rather than retaining the full graph.
+      expect(getState(root)).toBeUndefined();
+
+      // Availability is still deferred to the explicit eager background job.
       const other = mkdtempSync(path.join(tmpdir(), "pi-fovea-pre-missing-"));
       try {
         vi.stubEnv("FOVEA_AST_GREP", "/fovea-test/nonexistent-sg");
         await loaded.emit("session_start", { reason: "new" }, fakeCtx(other, true));
-        // Availability is probed asynchronously too: session start still
-        // returns first, then the background build rejects without state.
         const unavailable = getInflight(other);
         expect(unavailable).toBeDefined();
         await expect(unavailable).rejects.toThrow(/ast-grep/);
@@ -781,7 +811,6 @@ describe.skipIf(!hasAstGrep())("extension execution", () => {
       vi.unstubAllEnvs();
       evictState(root);
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 });

@@ -90,7 +90,7 @@ describe("Fovea settings", () => {
       expect(result).toEqual({ grepRegistrationChanged: false });
       expect(requestRender).toHaveBeenCalledOnce();
       expect(JSON.parse(readFileSync(path.join(agentDir, "fovea.json"), "utf8"))).toMatchObject({
-        sync: { mode: "hidden" },
+        sync: { mode: "enabled" },
       });
       expect(existsSync(path.join(cwd, ".pi", "fovea.json"))).toBe(false);
     } finally {

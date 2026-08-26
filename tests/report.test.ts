@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AST_GREP_CHUNK, hasAstGrep } from "../src/core/astgrep.js";
-import { cachePathFor, listFiles, loadFacts } from "../src/core/build.js";
+import { listFiles, loadFacts } from "../src/core/build.js";
 import { sketch } from "../src/core/ops.js";
 import { resetSessions } from "../src/core/session.js";
 
@@ -25,7 +25,6 @@ const copyFixture = (): { root: string; cleanup: () => void } => {
     root,
     cleanup: () => {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     },
   };
 };
@@ -78,6 +77,22 @@ describe("bounded discovery", () => {
     }
   });
 
+  it("skips credential-bearing files before extraction", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fovea-sensitive-"));
+    try {
+      writeFileSync(join(root, ".env"), "DATABASE_URL=postgres://user:password@example.invalid/db\n");
+      writeFileSync(join(root, ".env.example"), "DATABASE_URL=postgres://example\n");
+      writeFileSync(join(root, "credentials.json"), '{"token":"should-not-enter-the-graph"}\n');
+      writeFileSync(join(root, "tls.pem"), "-----BEGIN PRIVATE KEY-----\nsecret\n");
+      writeFileSync(join(root, "safe.ts"), "export function SafeGraphInput() {}\n");
+      expect(await listFiles(root)).toEqual(["safe.ts"]);
+      const { store } = await loadFacts(root, await listFiles(root));
+      expect([...store.facts.keys()]).toEqual(["safe.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("skips Cargo package caches during umbrella walks", async () => {
     // ~/.cargo/registry/src and ~/.cargo/git/checkouts hold vendored crate
     // copies (e.g. aws-lc-sys' generated BoringSSL tables), the same class of
@@ -106,7 +121,6 @@ describe("bounded discovery", () => {
       expect(store.facts.has("generated.ts")).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 });
@@ -169,7 +183,6 @@ describe("consolidated extraction scheduling", () => {
       expect(invocations.filter((line) => line.startsWith("outline "))).toHaveLength(4);
     } finally {
       rmSync(root, { recursive: true, force: true });
-      rmSync(cachePathFor(root), { force: true });
     }
   });
 });

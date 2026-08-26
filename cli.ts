@@ -7,6 +7,7 @@
 //   fovea impact [root] [--files a,b] [--symbols x,y] [--base ref] [--no-uncommitted] [budget]
 //   fovea anchors [root] [filter]             (every feature anchor, sorted)
 //   fovea rules [root]                        (tier-3 discovered shape hypotheses)
+//   fovea cache status|dry-run|purge [root]   (private persistent cache lifecycle)
 //
 // The CLI is stateless across invocations (dwell needs a prior focus in the
 // same process — combine ops inside pi, where sessions persist); stdout is
@@ -16,6 +17,7 @@ import { statSync } from "node:fs";
 import { ensureState, sketch, focus, dwell, impact } from "./src/core/ops.js";
 import { aggregateFiles, posterior, promote } from "./src/core/discover.js";
 import { DEFAULT_PACK } from "./src/core/anchors.js";
+import { manageCache } from "./src/core/cache-lifecycle.js";
 
 const [, , cmd = "status", ...argv] = process.argv;
 
@@ -54,7 +56,31 @@ const rootAt = (i: number): string => {
 
 try {
   let out = "";
-  if (cmd === "status") {
+  if (cmd === "cache") {
+    const action = pos[0] ?? "status";
+    if (!["status", "dry-run", "purge"].includes(action)) {
+      console.error("fovea cache status|dry-run|purge [root]"); process.exit(2);
+    }
+    const root = rootAt(1);
+    const result = await manageCache({
+      dryRun: action === "dry-run",
+      purge: action === "purge",
+      // Purge is deliberately scoped to the current/root argument; automatic
+      // cleanup handles global stale entries without a destructive all-cache CLI.
+      root: action === "purge" ? root : undefined,
+    });
+    const protectedCount = result.entries.filter((entry) => entry.protected.length).length;
+    out = result.enabled
+      ? `cache ${action}: ${result.entries.length} entries, ${result.totalBytes} bytes, ${result.candidates.length} candidates` +
+        `${protectedCount ? `, ${protectedCount} protected` : ""}` +
+        `${result.throttled ? ", cleanup throttled" : ""}` +
+        `${result.deleted.length ? `, deleted ${result.deleted.length}` : ""}` +
+        `${result.skipped.length ? `, skipped ${result.skipped.length}` : ""}` +
+        `\nbase: ${result.base ?? "(not created)"}` +
+        (result.candidates.length ? `\ncandidates:\n${result.candidates.join("\n")}` : "") +
+        (result.skipped.length ? `\nskipped:\n${result.skipped.map((s) => `${s.dir}: ${s.reason}`).join("\n")}` : "")
+      : "cache disabled by FOVEA_NO_CACHE";
+  } else if (cmd === "status") {
     const s = await sketch(rootAt(0), 256);
     const testAnchors = Number(s.details.testAnchors ?? 0);
     const failed = Number(s.details.extractionFailures ?? 0);
@@ -105,23 +131,9 @@ try {
     const st = await ensureState(root);
     const sigs = aggregateFiles(Object.fromEntries(Object.entries(st.facts).map(([k, v]) => [k, v.sigs])));
     const promoted = promote(sigs, DEFAULT_PACK);
-    if (flags.has("adopt") && promoted.length) {
-      const { mkdirSync, writeFileSync, readFileSync } = await import("node:fs");
-      const { join } = await import("node:path");
-      mkdirSync(join(root, ".fovea"), { recursive: true });
-      const rulesFile = join(root, ".fovea", "rules.json");
-      let existing = { rules: [] as unknown[] };
-      try { existing = JSON.parse(readFileSync(rulesFile, "utf8")); } catch { /* new */ }
-      const stamp = promoted.map((r) => ({
-        id: r.id.slice("implicit:".length),
-        langs: r.langs,
-        pattern: r.patterns[0],
-        methods: r.methods,
-        kind: r.kind,
-      }));
-      existing.rules = [...existing.rules, ...stamp];
-      writeFileSync(rulesFile, JSON.stringify(existing, null, 2) + "\n");
-      out = `wrote ${stamp.length} discovered rule(s) to .fovea/rules.json`;
+    if (flags.has("adopt")) {
+      console.error("fovea rules --adopt is disabled in the agent-safe fork; write project rules explicitly instead.");
+      process.exit(2);
     } else if (flags.has("sigs")) {
       out = sigs.filter((s) => s.pathN > 0)
         .sort((a, b) => posterior(b.pathN, b.n) - posterior(a.pathN, a.n))

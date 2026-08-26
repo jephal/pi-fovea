@@ -7,6 +7,33 @@ import { ROOT_CACHE_LIMIT, spawnGate } from "./asyncutil.js";
 
 const GIT_TIMEOUT = 15_000;
 
+// Git inspection is read-only and must not inherit a caller's alternate
+// repository/config setup. Keep normal user environment (PATH, HOME, locale),
+// but remove Git knobs that can redirect the command or execute helpers.
+export const safeGitEnv = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  // This includes GIT_CONFIG_PARAMETERS, which Git uses to propagate `-c`
+  // values into child processes and could otherwise bypass our safe overrides.
+  for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
+  // Do not refresh/lock the index; command-line config defeats repository or
+  // global fsmonitor, hooks, and external-diff configuration for every call.
+  env.GIT_OPTIONAL_LOCKS = "0";
+  return env;
+};
+
+const SAFE_GIT_CONFIG = [
+  "-c", "core.fsmonitor=false",
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "diff.external=",
+  "-c", "diff.trustExitCode=false",
+] as const;
+
+/** Diff-family commands can otherwise opt into repository textconv drivers. */
+export const safeGitArgs = (args: readonly string[]): string[] =>
+  args[0] === "diff" || args[0] === "log"
+    ? [args[0], "--no-ext-diff", "--no-textconv", ...args.slice(1)]
+    : [...args];
+
 /** Run git, returning stdout or undefined on any failure (not a repo, timeout). */
 export const gitOut = async (
   root: string,
@@ -18,11 +45,12 @@ export const gitOut = async (
       new Promise<string | undefined>((resolve) => {
         execFile(
           "git",
-          ["-C", root, ...args],
+          [...SAFE_GIT_CONFIG, "-C", root, ...safeGitArgs(args)],
           {
             encoding: "utf8",
             timeout: opts.timeout ?? GIT_TIMEOUT,
             maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024,
+            env: safeGitEnv(),
           },
           (error, stdout) => {
             if (error) {

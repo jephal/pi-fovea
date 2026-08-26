@@ -26,11 +26,11 @@ const setup = (stored: unknown) => {
 };
 
 describe("fovea config", () => {
-  it("defaults sync to visible and every budget knob to 512", () => {
-    expect(DEFAULT_FOVEA_CONFIG.sync).toMatchObject({ mode: "enabled", scope: "session", budget: 512 });
+  it("defaults to explicit graph tools without sync or grep interception", () => {
+    expect(DEFAULT_FOVEA_CONFIG.sync).toMatchObject({ mode: "disabled", scope: "session", budget: 512 });
     expect(DEFAULT_FOVEA_CONFIG.tools).toMatchObject({
       defaultBudget: 512,
-      grepMode: "augment",
+      grepMode: "off",
       grepAugmentBudget: 512,
     });
   });
@@ -103,9 +103,9 @@ describe("fovea config", () => {
     });
     try {
       const config = loadFoveaConfig({ cwd, agentDir, projectTrusted: false });
-      expect(config.sync.mode).toBe("enabled");
+      expect(config.sync.mode).toBe("disabled");
       expect(config.sync.scope).toBe("session");
-      expect(config.tools.grepMode).toBe("augment");
+      expect(config.tools.grepMode).toBe("off");
       expect(config.tools.grepAugmentBudget).toBe(8192);
     } finally {
       rmSync(root, { recursive: true, force: true });

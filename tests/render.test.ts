@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { revealFoveated, revealGroups, tokenEstimate, type GroupLine } from "../src/core/render.js";
+import { privateOverflowPath } from "../src/core/privacy.js";
 import { buildCsr, heatAt } from "../src/core/heat.js";
 import type { Graph, NodeRec } from "../src/core/types.js";
 
@@ -242,6 +243,19 @@ describe("overflow artifacts", () => {
     const artifact = readFileSync(path, "utf8");
     expect(artifact).toContain("helper9");
     expect(fit.text).not.toContain("helper9");
+  });
+
+  it("redacts accidental inline credentials in output and private artifacts", () => {
+    const g = fanGraph(90);
+    g.nodes[0] = { ...g.nodes[0]!, sig: "const api_key=super-secret-value-123456" };
+    const csr = buildCsr(g);
+    const seed = new Float64Array(g.nodes.length); seed[0] = 1;
+    const path = privateOverflowPath("pi-fovea-redaction-test.txt");
+    const fit = revealFoveated(g, heatAt(csr, seed, 2), { header: "token=super-secret-value-123456", budget: 300, overflowTo: path });
+    const artifact = readFileSync(path, "utf8");
+    expect(fit.text).toContain("[REDACTED]");
+    expect(fit.text).not.toContain("super-secret-value-123456");
+    expect(artifact).not.toContain("super-secret-value-123456");
   });
 
   it("leaves non-overflowing fits and footer wording alone", () => {

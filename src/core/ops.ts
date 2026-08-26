@@ -4,8 +4,7 @@
 // time and returns the delta, impact seeds from changed files.
 
 import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { posix } from "node:path";
 import { prFiles, uncommittedFiles } from "./git.js";
 import { chebyshevVectors, chooseOrder, heatField } from "./heat.js";
 import { formatNodeLocation, revealFoveated, revealGroups, tokenEstimate, type GroupLine, type RevealedNode } from "./render.js";
@@ -15,9 +14,12 @@ import { classifyLiteral, normalizeLiteral } from "./join.js";
 import { isTestFile } from "./extract.js";
 import { effectiveWeight, type CoChangeHistory } from "./cochange.js";
 import type { Graph, NodeKind, NodeRec } from "./types.js";
-import { ensureState } from "./state.js";
+import { ensureState, getState, prefersResident } from "./state.js";
+import { CACHE_VERSION } from "./build.js";
+import { querySqliteNeighborhood, querySqliteSeeds, sqliteLazyReadBlockedByDirtyWorktree, type SqliteNeighborhood, type SqliteSeedResult } from "./sqlite-store.js";
+import { privateOverflowPath } from "./privacy.js";
 import type { RepoState } from "./state.js";
-export { ensureState, ensureStateBackground, evictState, getInflight, getState } from "./state.js";
+export { ensureState, ensureStateBackground, evictState, getInflight, getState, setResidentPreference, prefersResident } from "./state.js";
 export type { RepoState } from "./state.js";
 
 export interface OpResult {
@@ -45,6 +47,34 @@ const extractionDetails = (state: RepoState): Record<string, unknown> => ({
   extractionOversized: state.extraction.oversized,
   extractionGenerated: state.extraction.generated,
 });
+
+const lazyExtractionSuffix = (extraction: SqliteSeedResult["extraction"]): string => {
+  const parts: string[] = [];
+  if (extraction.failed.length) parts.push(`!${extraction.failed.length} files failed extraction`);
+  if (extraction.unreadable.length) parts.push(`!${extraction.unreadable.length} files unreadable`);
+  if (extraction.oversized.length) parts.push(`!${extraction.oversized.length} files over size cap`);
+  if (extraction.generated.length) parts.push(`!${extraction.generated.length} generated files skipped`);
+  return parts.length ? ` · ${parts.join(", ")}` : "";
+};
+const lazyExtractionDetails = (extraction: SqliteSeedResult["extraction"]): Record<string, unknown> => ({
+  extractionFailures: extraction.failed.length,
+  extractionFailedFiles: extraction.failed.slice(0, 20),
+  extractionUnreadable: extraction.unreadable,
+  extractionOversized: extraction.oversized,
+  extractionGenerated: extraction.generated,
+});
+const lazyScopeIds = (neighborhood: SqliteNeighborhood, options: FocusOptions): Set<string> | undefined =>
+  options.path || options.language || options.kind
+    ? new Set(neighborhood.graph.nodes.filter((node) => matchesFocusScope(node, options)).map((node) => node.id))
+    : undefined;
+
+// SQLite snapshots are immutable and bounded, but Git porcelain may describe
+// additions/deletions that snapshot queries cannot safely infer. In that case
+// use a freshly refreshed full state and say why rather than serve stale rows.
+const dirtyFallbackSuffix = (dirty: boolean): string =>
+  dirty ? " · fresh graph fallback (dirty worktree; SQLite bounded reads disabled)" : "";
+const dirtyFallbackDetails = (dirty: boolean): Record<string, unknown> =>
+  dirty ? { queryMode: "resident-fallback", freshness: "dirty worktree; SQLite bounded reads disabled" } : {};
 
 // Seed resolution.
 
@@ -307,13 +337,15 @@ const clampBudget = (b: number | undefined, dflt: number): number =>
 // list spills to a stable per-invocation tmp file whose path the footer names,
 // mirroring pi's bash output-accumulator so agents can read/grep the rest.
 const overflowArtifact = (op: string, key: string): string =>
-  join(tmpdir(), `pi-fovea-${op}-${createHash("sha1").update(key).digest("hex").slice(0, 8)}.txt`);
+  privateOverflowPath(`pi-fovea-${op}-${createHash("sha1").update(key).digest("hex").slice(0, 8)}.txt`);
 
 export const isTestScope = (file: string): boolean =>
   isTestFile(file) || /(^|\/)(tests?|__tests__|fixtures?)(\/|$)/i.test(file);
 
 
 export const sketch = async (root: string, budget?: number): Promise<OpResult> => {
+  // Sketch intentionally assembles the full graph: its contract is a
+  // repository-wide silhouette, unlike focus/dwell/impact's bounded path.
   const state = await ensureState(root);
   const g = state.graph;
   const B = clampBudget(budget, 512);
@@ -462,11 +494,56 @@ export const focus = async (
   ensured?: RepoState,
 ): Promise<OpResult> => {
   // ensured lets verdict renderers reuse the exact state a warm/inline compute
-  // already built, so an embed never triggers its own probe/rebuild.
-  const state = ensured ?? (await ensureState(root));
-  const g = state.graph;
+  // already built, so an embed never triggers its own probe/rebuild. Ordinary
+  // focused calls prefer SQLite: seed lookup + bounded frontier avoids global
+  // graph/fact hydration. An unavailable/stale DB falls through unchanged.
   const session = getSession(root);
   const B = clampBudget(budget, 512);
+  // Turn sync deliberately retains a resident graph because it needs a fresh
+  // baseline. Ordinary Pi sessions instead prefer the bounded durable index
+  // after their first cold bootstrap.
+  let state = ensured ?? (prefersResident(root) && getState(root) ? await ensureState(root) : undefined);
+  const dirtyWorktree = !state && await sqliteLazyReadBlockedByDirtyWorktree(root);
+  if (dirtyWorktree) state = await ensureState(root);
+  const lazySeeds = state ? undefined : await querySqliteSeeds(root, CACHE_VERSION, query, options);
+  if (lazySeeds) {
+    const { seeds: seedKeys, note, suggestions } = lazySeeds;
+    if (!seedKeys.length) {
+      const renderMiss = (count: number): string => [
+        ...(lazySeeds.extraction.failed.length ? [`! ${lazySeeds.extraction.failed.length} files failed extraction; matches may be incomplete.`] : []),
+        `fovea focus "${query}": ${note}.`,
+        ...(count ? ["Nearby symbols:", ...suggestions.slice(0, count).map((s) => `  ? ${s.name} — ${s.file}${s.line > 0 ? `:${s.line}` : ""} — ${s.sig}`)] : []),
+        suggestions.length ? "Retry fovea_focus with one of these names, a route path (/api/...), or a file path." : "Try a symbol name, a route path (/api/...), or a file path. Run fovea_sketch for the map silhouette first.",
+      ].join("\n");
+      let shown = suggestions.length; let text = renderMiss(shown);
+      while (shown > 0 && tokenEstimate(text) > B) text = renderMiss(--shown);
+      return { text, tokens: tokenEstimate(text), details: { seeds: 0, suggestions: suggestions.slice(0, shown), scope: { path: options.path, language: options.language, kind: options.kind }, queryMode: "sqlite-index", ...lazyExtractionDetails(lazySeeds.extraction) } };
+    }
+    const scopeKey = [options.path ?? "", options.language?.toLowerCase() ?? "", options.kind ?? ""].join("|");
+    const key = `sqlite:${lazySeeds.generation}:${[...seedKeys].sort().join(",")}:${scopeKey}`;
+    if (options.fresh || session.focusKey !== key) {
+      session.t = FOCUS_T0; session.disclosed.clear(); session.focusKey = key;
+      session.scope = { path: options.path, language: options.language, kind: options.kind };
+    }
+    const neighborhood = await querySqliteNeighborhood(root, CACHE_VERSION, seedKeys, { depth: Math.ceil(session.t), cap: 384 });
+    // Snapshot turnover or a transient lock is safe: preserve the old eager
+    // path rather than returning a partial graph as a confident answer.
+    if (neighborhood) {
+      session.seeds = neighborhood.seeds; session.seedNote = note;
+      session.lazy = { seeds: [...seedKeys], generation: neighborhood.generation, files: neighborhood.files, uncertain: true };
+      const fit = revealFoveated(neighborhood.graph, neighborhood.field, {
+        header: `fovea focus "${query}" · ${note}${lazyExtractionSuffix(neighborhood.extraction)}`,
+        include: lazyScopeIds(neighborhood, options), disclosed: session.disclosed, seeds: neighborhood.seeds,
+        repeatNucleus: true, budget: B, overflowTo: overflowArtifact("focus", `${root}|${query}`),
+      });
+      for (const id of fit.revealedIds) session.disclosed.add(id);
+      observeSessionPaths(root, fit.revealed.map((node) => node.file));
+      return { text: fit.text, tokens: fit.tokens, details: { seeds: neighborhood.seeds.length, lit: fit.litTotal, shown: fit.shown, suppressed: fit.suppressed, t: session.t, scope: { path: options.path, language: options.language, kind: options.kind }, nodes: fit.revealed, suggestedReads: suggestedReads(fit.revealed), queryMode: "sqlite-index", confidence: "bounded", uncertainty: "rank beyond capped structural neighborhood omitted", ...lazyExtractionDetails(neighborhood.extraction) } };
+    }
+  }
+  state ??= await ensureState(root);
+  const g = state.graph;
+  session.lazy = undefined;
   const { seeds, note, suggestions } = resolveSeeds(state, query, options);
   if (!seeds.length) {
     const renderMiss = (count: number): string => {
@@ -481,7 +558,7 @@ export const focus = async (
         ...(state.extraction.failed.length
           ? [`! ${state.extraction.failed.length} files failed extraction; matches may be incomplete.`]
           : []),
-        `fovea focus "${query}": ${note}.`,
+        `fovea focus "${query}": ${note}.${dirtyFallbackSuffix(dirtyWorktree)}`,
         ...(nearby.length ? ["Nearby symbols:", ...nearby] : []),
         guidance,
       ].join("\n");
@@ -503,6 +580,7 @@ export const focus = async (
         })),
         scope: { path: options.path, language: options.language, kind: options.kind },
         ...extractionDetails(state),
+        ...dirtyFallbackDetails(dirtyWorktree),
       },
     };
   }
@@ -526,7 +604,7 @@ export const focus = async (
     ? new Set(g.nodes.filter((node) => matchesFocusScope(node, options)).map((node) => node.id))
     : undefined;
   const fit = revealFoveated(g, field, {
-    header: `fovea focus "${query}" · ${note}${extractionSuffix(state)}`,
+    header: `fovea focus "${query}" · ${note}${extractionSuffix(state)}${dirtyFallbackSuffix(dirtyWorktree)}`,
     include: scopedIds,
     disclosed: session.disclosed,
     seeds,
@@ -549,15 +627,46 @@ export const focus = async (
       nodes: fit.revealed,
       suggestedReads: suggestedReads(fit.revealed),
       ...extractionDetails(state),
+      ...dirtyFallbackDetails(dirtyWorktree),
     },
   };
 };
 
 export const dwell = async (root: string, factor?: number, budget?: number): Promise<OpResult> => {
-  const state = await ensureState(root);
-  const g = state.graph;
   const session = getSession(root);
   const B = clampBudget(budget, 512);
+  // A sync-retained generation is more recent than the lazy snapshot that
+  // seeded this session. Dirty worktrees also force a fresh full fallback.
+  let state = prefersResident(root) && getState(root) ? await ensureState(root) : undefined;
+  const dirtyWorktree = !state && await sqliteLazyReadBlockedByDirtyWorktree(root);
+  if (dirtyWorktree) state = await ensureState(root);
+  if (state && session.lazy?.seeds.length) {
+    const byId = new Map(state.graph.nodes.map((node, index) => [node.id, index]));
+    session.seeds = session.lazy.seeds.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
+    session.lazy = undefined;
+  }
+  if (session.lazy?.seeds.length) {
+    const from = session.t; const to = Math.min(64, from * Math.max(1.2, factor ?? 2));
+    const neighborhood = await querySqliteNeighborhood(root, CACHE_VERSION, session.lazy.seeds, { depth: Math.ceil(to), cap: 512 });
+    if (neighborhood) {
+      session.t = to; session.seeds = neighborhood.seeds;
+      const scope = session.scope ?? {};
+      const fit = revealFoveated(neighborhood.graph, neighborhood.field, {
+        header: `fovea dwell · context widened ${Number((to / from).toFixed(1))}× · new results`,
+        include: lazyScopeIds(neighborhood, scope), disclosed: session.disclosed, seeds: neighborhood.seeds,
+        budget: B, overflowTo: overflowArtifact("dwell", root),
+      });
+      for (const id of fit.revealedIds) session.disclosed.add(id);
+      observeSessionPaths(root, fit.revealed.map((node) => node.file));
+      return { text: fit.text, tokens: fit.tokens, details: { from, to, lit: fit.litTotal, shown: fit.shown, suppressed: fit.suppressed, scope, nodes: fit.revealed, suggestedReads: suggestedReads(fit.revealed), queryMode: "sqlite-index", confidence: "bounded", uncertainty: "rank beyond capped structural neighborhood omitted", ...lazyExtractionDetails(neighborhood.extraction) } };
+    }
+    // The snapshot may have been replaced between focus and dwell. Do not use
+    // stale numeric seed indices in the eager graph; reset to the documented
+    // no-focus guidance instead.
+    session.seeds = []; session.lazy = undefined;
+  }
+  state ??= await ensureState(root);
+  const g = state.graph;
   if (!session.seeds.length) {
     return {
       text: "fovea dwell: no focus yet. Call fovea_focus with a symbol or route first; dwell then deepens that field.",
@@ -580,7 +689,7 @@ export const dwell = async (root: string, factor?: number, budget?: number): Pro
     ? new Set(g.nodes.filter((node) => matchesFocusScope(node, scope)).map((node) => node.id))
     : undefined;
   const fit = revealFoveated(g, field, {
-    header: `fovea dwell · context widened ${Number((to / from).toFixed(1))}× · new results`,
+    header: `fovea dwell · context widened ${Number((to / from).toFixed(1))}× · new results${dirtyFallbackSuffix(dirtyWorktree)}`,
     include: scopedIds,
     disclosed: session.disclosed,
     seeds: session.seeds,
@@ -602,6 +711,7 @@ export const dwell = async (root: string, factor?: number, budget?: number): Pro
       nodes: fit.revealed,
       suggestedReads: suggestedReads(fit.revealed),
       ...extractionDetails(state),
+      ...dirtyFallbackDetails(dirtyWorktree),
     },
   };
 };
@@ -620,13 +730,68 @@ export interface ImpactArgs {
 const COCHANGE_REASON = "co-change history";
 
 export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState): Promise<OpResult> => {
-  const state = ensured ?? (await ensureState(root));
-  const g = state.graph;
   const B = clampBudget(args.budget, 512);
   const files = new Set<string>(args.files ?? []);
   if (args.base) for (const f of await prFiles(root, args.base)) files.add(f);
   if (args.includeUncommitted !== false && !args.base) for (const f of await uncommittedFiles(root)) files.add(f);
 
+  // File/symbol impact uses the same indexed seeds and bounded BFS as focus.
+  // Co-change history is intentionally not loaded here: it is a whole-history
+  // feature, so this result declares bounded confidence instead of hydrating a
+  // global graph merely to add a speculative ranking layer.
+  // Sync is the only normal Pi mode that intentionally retains a fresh graph.
+  // Otherwise use SQLite unless Git reports drift that requires a full refresh.
+  let resident = ensured ?? (prefersResident(root) && getState(root) ? await ensureState(root) : undefined);
+  const dirtyWorktree = !resident && await sqliteLazyReadBlockedByDirtyWorktree(root);
+  if (dirtyWorktree) resident = await ensureState(root);
+  if (!resident) {
+    const seedKeys = new Set<string>(); let sqlite = true;
+    for (const file of files) {
+      const resolved = await querySqliteSeeds(root, CACHE_VERSION, file);
+      if (!resolved) { sqlite = false; break; }
+      for (const key of resolved.seeds) seedKeys.add(key);
+    }
+    for (const symbol of args.symbols ?? []) {
+      const resolved = await querySqliteSeeds(root, CACHE_VERSION, symbol);
+      if (!resolved) { sqlite = false; break; }
+      for (const key of resolved.seeds) seedKeys.add(key);
+    }
+    if (sqlite) {
+      if (!seedKeys.size) return { text: "fovea impact: no seed files (repo clean or paths unknown). Pass files: [...] or symbols: [...] for a what-if cascade.", tokens: 0, details: { seeds: 0, queryMode: "sqlite-index" } };
+      const neighborhood = await querySqliteNeighborhood(root, CACHE_VERSION, [...seedKeys], { depth: 4, cap: 768 });
+      if (neighborhood) {
+        const g = neighborhood.graph; const seedIds = new Set(neighborhood.seeds.map((i) => g.nodes[i]!.id));
+        const seedFiles = new Set(neighborhood.seeds.map((i) => g.nodes[i]!.file));
+        const reason = (kind: Graph["edges"][number]["kind"]): string | undefined => (new Map<Graph["edges"][number]["kind"], string>([["invokes", "call dependency"], ["imports", "import dependency"], ["tests", "test dependency"], ["inherits", "inheritance"], ["join", "shared literal"], ["anchors", "shared route"]])).get(kind);
+        const reasons = new Map<string, Set<string>>();
+        for (const edge of g.edges) {
+          const a = g.nodes[edge.a]!; const b = g.nodes[edge.b]!; const label = reason(edge.kind);
+          if (!label || a.file === b.file) continue;
+          if (seedFiles.has(a.file) && !seedFiles.has(b.file)) (reasons.get(b.file) ?? reasons.set(b.file, new Set()).get(b.file)!).add(label);
+          if (seedFiles.has(b.file) && !seedFiles.has(a.file)) (reasons.get(a.file) ?? reasons.set(a.file, new Set()).get(a.file)!).add(label);
+        }
+        const mass = new Map<string, number>(); const top = new Map<string, Array<[number, string]>>(); const anchors: GroupLine[] = [];
+        g.nodes.forEach((node, i) => {
+          if (seedIds.has(node.id) || seedFiles.has(node.file)) return;
+          const heat = neighborhood.field[i] ?? 0; if (heat <= 1e-6) return;
+          if (node.kind === "anchor") { anchors.push({ label: `⚑ ${node.name}`, mass: heat, detail: `${node.file}:${node.line}` }); return; }
+          mass.set(node.file, (mass.get(node.file) ?? 0) + heat);
+          if (node.kind !== "file") (top.get(node.file) ?? top.set(node.file, []).get(node.file)!).push([heat, node.name]);
+        });
+        const entries = [...mass.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+        const groups = [...anchors, ...entries.map(([file, value]) => {
+          const symbols = (top.get(file) ?? []).sort((a, b) => b[0] - a[0] || a[1].localeCompare(b[1])).slice(0, 3).map(([, name]) => name).join(", ");
+          const via = [...(reasons.get(file) ?? new Set(["bounded graph path"]))].sort();
+          return { label: file, mass: value, detail: `via ${via.join(", ")}${symbols ? ` · top: ${symbols}` : ""}` };
+        })];
+        const seedNames = [...seedFiles].sort().slice(0, 5).join(", ");
+        const fit = revealGroups(groups, { header: `fovea impact · changed: ${seedNames}${seedFiles.size > 5 ? ", …" : ""} · likely review order${lazyExtractionSuffix(neighborhood.extraction)}`, budget: B, overflowTo: overflowArtifact("impact", `${root}|${[...files].join(",")}`) });
+        return { text: fit.text, tokens: fit.tokens, details: { seeds: neighborhood.seeds.length, historyPartners: 0, warmed: groups.length, truncated: fit.truncated, warmedAnchors: anchors.map((item) => item.label.replace(/^⚑\s*/, "")), warmedFiles: entries.map(([file]) => file), warmedMass: Object.fromEntries(entries.map(([file, value]) => [file, Number(value.toFixed(6))])), warmedReasons: Object.fromEntries(entries.map(([file]) => [file, [...(reasons.get(file) ?? new Set(["bounded graph path"]))].sort()])), warmedNodes: {}, queryMode: "sqlite-index", confidence: "bounded", uncertainty: "co-change history and paths beyond the capped structural neighborhood omitted", ...lazyExtractionDetails(neighborhood.extraction) } };
+      }
+    }
+  }
+  const state = resident ?? await ensureState(root);
+  const g = state.graph;
   const seedSet = new Set<number>();
   for (const rel of files) {
     const arr = g.byFile.get(rel) ?? g.byFile.get(posix.normalize(rel)) ?? [];
@@ -639,7 +804,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
     return {
       text: "fovea impact: no seed files (repo clean or paths unknown). Pass files: [...] or symbols: [...] for a what-if cascade.",
       tokens: 0,
-      details: { seeds: 0 },
+      details: { seeds: 0, ...dirtyFallbackDetails(dirtyWorktree) },
     };
   }
   const seeds = [...seedSet];
@@ -810,7 +975,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
   const groups: GroupLine[] = [...anchorHits, ...fileGroups];
   const seedNames = seeds.slice(0, 5).map((i) => g.nodes[i]!.file).join(", ");
   const fit = revealGroups(groups, {
-    header: `fovea impact · changed: ${seedNames}${seeds.length > 5 ? ", …" : ""} · likely review order`,
+    header: `fovea impact · changed: ${seedNames}${seeds.length > 5 ? ", …" : ""} · likely review order${dirtyFallbackSuffix(dirtyWorktree)}`,
     budget: B,
     overflowTo: overflowArtifact("impact", `${root}|${(args.files ?? []).join(",")}`),
   });
@@ -823,6 +988,7 @@ export const impact = async (root: string, args: ImpactArgs, ensured?: RepoState
       warmed: groups.length,
       truncated: fit.truncated,
       ...extractionDetails(state),
+      ...dirtyFallbackDetails(dirtyWorktree),
       // Structured form for consumers (turn-sync): warmed anchors, files,
       // and the strongest direct evidence channel without text re-parsing.
       warmedAnchors: anchorHits.map((h) => h.label.replace(/^⚑\s*/, "")),

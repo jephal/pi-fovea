@@ -4,7 +4,7 @@
 
 **A foveated repo-mapping extension for [Pi](https://github.com/earendil-works/pi-coding-agent)**
 
-_See the whole repo on every prompt, sharp where you work and cheap everywhere else._
+_Give agents the whole repo's shape, then only the relevant context._
 
 <p>
   <img src="https://raw.githubusercontent.com/monotykamary/pi-fovea/main/media/cover.svg" alt="pi-fovea: a code graph seen through a fovea, hot at the center and collapsed at the rim" width="1100">
@@ -17,20 +17,18 @@ _See the whole repo on every prompt, sharp where you work and cheap everywhere e
 
 </div>
 
-pi-fovea gives the model a map of your repo on every prompt. The repo compiles
-once into a cross-language graph of code. Symbols, files, and route anchors
-share one network. Your question becomes an interest vector that diffuses
-through the graph as heat. The renderer caps the field inside a token budget.
-Near the question you get exact source locations and full signatures. One hop
-out you get typed relationships. Past that the repo collapses to a skeleton.
+This agent-safe fork gives the model a compact, query-driven map of your repo.
+The repo compiles into a cross-language graph of code. Symbols, files, and
+route anchors share one network. The model's question becomes an interest
+vector that diffuses through the graph as heat. The renderer caps the field
+inside a token budget. Near the question the model gets exact source locations
+and full signatures. One hop out it gets typed relationships. Past that the
+repo collapses to a skeleton.
 
-When a session starts, Fovea records a baseline of the repo. If files
-changed while Pi was idle, those changes enter context before the first model
-call. Fovea checks the repo again after each assistant turn. Detection uses
-file content hashes. An edit from a Pi tool, fabric_exec, bash, a subagent,
-or an editor looks the same to Fovea. Edits that touch only comments or
-formatting stay silent. A meaningful change arrives as a **steer**. When the
-agent is about to stop, Fovea starts the next turn itself.
+Graph tools are explicit. Continuous turn sync and grep interception are
+disabled by default, so loading the package does not create extra model turns
+or alter Pi's native file/search tools. Sensitive credential-bearing files are
+excluded before extraction and cache persistence.
 
 ## Where fovea fits in shipping a feature
 
@@ -67,7 +65,7 @@ match returns the nearest symbols plus their locations. Direct graph edges
 carry labels such as caller, callee, route, shared literal, and co-change.
 Symbols that merely share a file stay collapsed.
 
-The **Hybrid grep** toggle is on by default. `grep({ pattern: "CreateUser" })`,
+The **Hybrid grep** toggle is off by default in this fork. `grep({ pattern: "CreateUser" })`,
 `grep({ pattern: "Controller.create" })`, and route paths travel through the
 graph. Calls that carry text-search options or obvious regexes go to Pi's
 native grep. A graph miss falls back to native text. A graph error, such as a
@@ -146,11 +144,38 @@ npm i -g pi-fovea      # or: pnpm add -g pi-fovea, bun add -g pi-fovea
 
 From a checkout, `pnpm fovea` runs the live source via `tsx`, and `pnpm run build:cli` rebuilds `dist/cli.mjs` (the `prepack` hook keeps the published bundle in sync).
 
+## Agent-safe defaults
+
+This fork is intended to help agents navigate code, not to provide a human
+code browser. It defaults to explicit graph tools only:
+
+- `sync.mode: "disabled"` — no proactive model messages or extra turns;
+- `tools.grepMode: "off"` — Pi's native grep/read/edit tools are untouched;
+- credential-bearing files (`.env*`, auth/credential/secret/token manifests,
+  private-key files, and package auth files) are excluded before extraction;
+- graph roots supplied through Pi tools must be the current workspace or a
+  descendant; the standalone CLI retains its explicit-root behavior;
+- the CLI's `rules --adopt` repository-writing operation is disabled.
+
+Private per-worktree SQLite snapshots and the compatibility `facts.jsonl`
+fallback live outside the repository in
+`$FOVEA_CACHE_DIR/pi-fovea/worktrees` (or `$XDG_CACHE_HOME`, then `~/.cache`).
+The separate co-change/provenance caches remain transient `0600` artifacts and
+are disabled with `FOVEA_NO_CACHE`. Overflow artifacts use a `0700` private
+subdirectory and `0600` files.
+The runtime has no HTTP client or telemetry path. It invokes
+only the fixed `git` executable and the explicitly configured `ast-grep`
+executable, both without a shell. Enable sync or hybrid grep only through an
+explicit trusted configuration change.
+
 ## Large workspaces and startup
 
-Indexing runs in the background at `session_start`. Your first prompt never
-waits for ast-grep, hashing, or graph assembly. A cold sync hook reports the
-progress. Later calls reuse the same shared build.
+Normal startup does not index the repository. The first graph request creates
+the private per-worktree database and performs the initial full bootstrap; no
+per-worktree setup command is required. Later clean-worktree focus, dwell, and
+impact requests reuse the snapshot through bounded SQLite queries. Set
+`FOVEA_EAGER_INDEX=1` only when you explicitly want a background bootstrap at
+`session_start`; it is off by default for shared machines.
 
 A non-Git umbrella directory treats each nested `.git` directory or worktree
 marker as a closed project boundary — until you work in it. The first edit
@@ -165,9 +190,9 @@ index coverage only: with the default session-local sync scope, a sibling projec
 can join the umbrella graph and cache without steering conversations that never
 entered it. Every fovea_* tool still accepts a `root` for a full, immediate map
 of one project. `FOVEA_MAX_FILES` caps the merged listing either way.
-Cold runs stay bounded through streamed JSONL cache I/O, 64-file extraction
-batches, adaptive ast-grep chunk splitting, and a two-root resident LRU. The
-limits accept environment overrides:
+Cold runs stay bounded through transactional SQLite writes (with a private
+JSONL fallback), 64-file extraction batches, adaptive ast-grep chunk splitting,
+and a two-root resident LRU. The limits accept environment overrides:
 
 | Variable | Default | Meaning |
 | --- | :---: | --- |
@@ -178,14 +203,63 @@ limits accept environment overrides:
 | `FOVEA_MEMORY_HALF_LIFE_HOURS` | `48` | wall-clock half-life of the per-node sync memory (charged cascade warmth) |
 | `FOVEA_IO_CONCURRENCY` | `32` | concurrent file stat/read operations |
 | `FOVEA_MAX_SUBMODULE_DEPTH` | `4` | recursion cap for nested submodules |
+| `FOVEA_CACHE_DIR` | XDG cache home / `~/.cache` | absolute cache home; Fovea creates its private `pi-fovea/worktrees` namespace beneath it |
+| `FOVEA_NO_CACHE` | unset | any truthy value disables SQLite, JSONL, and co-change persistence for the process |
+| `FOVEA_CACHE_TTL_DAYS` | `30` | age after which an inactive cache can be reclaimed |
+| `FOVEA_CACHE_MAX_BYTES` | `536870912` | total private worktree-cache budget before oldest eligible entries are reclaimed |
+| `FOVEA_CACHE_CLEANUP_GAP_MS` | `21600000` | minimum gap between automatic cleanup scans |
 
 Files over the size cap keep their place in the model's view of the repo.
 Failed extractions do the same. You find both in `/fovea status` and in tool
 details.
 
+### Cache lifecycle and privacy
+
+On a cold root, Fovea creates a private `0700` per-worktree directory and
+records the physical root plus Git worktree metadata. Automatic cleanup runs
+best-effort and is throttled (six hours by default). It reclaims only an old,
+missing, or pruned-worktree entry, and only when it has no live process lease.
+Any malformed identity, unreadable entry, or active lease is **kept**, not
+guessed away. A recent `fovea.sqlite-wal` / `-shm` sidecar also protects an
+entry; stale sidecars may be reclaimed together with the cache. The size budget
+chooses the oldest otherwise eligible entries; it never forces deletion of a
+protected cache.
+
+Inspect without mutation with `fovea cache status` or `fovea cache dry-run`.
+`fovea cache purge <root>` and `/fovea cache purge` explicitly target only that
+root; they retain the same lease and WAL/SHM protections. `/fovea cache` and
+`/fovea cache dry-run` show the in-session diagnostic summary. Set
+`FOVEA_NO_CACHE=1` for ephemeral/CI runs, or set an absolute
+`FOVEA_CACHE_DIR=/secure/cache/home` to select the cache home. A cache failure
+is always an optimization failure: graph construction proceeds from source.
+
+Sensitive filenames are excluded before extraction. As a second boundary,
+model-facing renders and overflow artifacts redact common inline API keys,
+tokens, passwords, private-key blocks, and JWT-shaped values. This is a guard
+rail rather than permission to index secrets.
+
+### Lazy SQLite queries
+
+When Node provides `node:sqlite` and the current indexed snapshot is available,
+after the one-time bootstrap, cold or evicted `fovea_focus`, `fovea_dwell`, and
+file/symbol-seeded `fovea_impact` do not hydrate the repository graph. They use indexed
+symbol/anchor/literal/file seeds and a capped weighted breadth-first read of
+incident relationships. The result keeps typed edge labels and deterministic
+ordering; its details identify `queryMode: "sqlite-index"`, bounded confidence,
+and any omitted long-path or co-change evidence. A dirty, locked, unavailable, or replaced snapshot falls back to a fresh eager
+in-memory graph, preserving correctness and small-repository compatibility. A resident impact state deliberately keeps its
+existing full-history co-change ranking rather than discarding that evidence.
+
+`fovea_sketch` deliberately remains a whole-repository operation: its
+production-first ranking and basin silhouette require global conductance. Index
+construction/refresh likewise still builds the full derived graph before it
+atomically publishes the SQLite snapshot. The trade-off is a little per-query
+SQLite open/planning latency in exchange for avoiding unrelated facts, nodes,
+and edges in focused-operation memory.
+
 ## Turn sync
 
-Continuous sync is enabled and visible by default. Before an agent starts,
+Continuous sync is disabled by default in this fork. When explicitly enabled,
 Fovea establishes its baseline or injects relevant drift ahead of the first
 model call. After every assistant turn it compares symbols, calls, imports,
 literals, and anchors again. Content hashes keep the unchanged fast path cheap.
@@ -254,19 +328,20 @@ effective while its global default is being edited.
 
 | Key | Default | Meaning |
 | --- | :-----: | ------- |
-| `sync.mode` | `"enabled"` | `"enabled"` shows model-visible sync messages, `"hidden"` keeps them model-visible but out of the transcript, and `"disabled"` turns sync off. Legacy `sync.enabled` booleans still parse. |
+| `sync.mode` | `"disabled"` | `"enabled"` shows model-visible sync messages, `"hidden"` keeps them model-visible but out of the transcript, and `"disabled"` turns sync off. Legacy `sync.enabled` booleans still parse. |
 | `sync.scope` | `"session"` | `"session"` steers only for top-level directories/root files this conversation entered while indexing the whole root; `"repository"` restores root-wide steering. |
 | `sync.budget` | `512` | token cap for proactive steering context |
 | `sync.ackClean` | `false` | toast after clean structural turns |
 | `sync.steerThreshold` | `0.15` | total surprise (channel-weighted heat above the session sync memory) that justifies proactive model steering |
 | `sync.pushFocus` | `true` | embed a budgeted focus preview of the top drift target in red syncs |
 | `tools.defaultBudget` | `512` | fallback maxTokens for the fovea_* tools |
-| `tools.grepMode` | `"augment"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
+| `tools.grepMode` | `"off"` | `"augment"\u0020keeps native grep and appends a Fovea graph section to symbol-query results (works with `pi.grep` inside fabric_exec too); `"replace"` keeps the legacy takeover where bare symbol queries navigate the graph instead of returning lines; `"off"` is native grep only. The legacy boolean `tools.replaceGrep` still parses (`true`\u2192`"replace"`, `false`\u2192`"off"`) and loses to an explicit `grepMode`. |
 | `tools.grepAugmentBudget` | `512` | token cap for the appended graph section |
 
 Budgets cap the rendered view, not the map: whenever sketch, focus, dwell, or
-impact truncate results for budget, the full list spills to
-`$TMPDIR/pi-fovea-<op>-<hash>.txt` and the footer names the path — read or grep
+impact truncate results for budget, the full list spills to a private
+`$TMPDIR/pi-fovea-overflow/pi-fovea-<op>-<hash>.txt` artifact (`0700` directory,
+`0600` file) and the footer names the path — read or grep
 the file for the remainder. `fovea_dwell` remains the semantic widen.
 
 ## How routes are found
@@ -300,7 +375,7 @@ hub, that hub upgrades to first-class.
 fovea anchors <root> --discovered   # the △ hypothesis hubs only
 fovea rules <root>                  # promoted rules with evidence
 fovea rules <root> --sigs           # every path-touching signature, by precision
-fovea rules <root> --adopt          # persist promotions into .fovea/rules.json
+# `--adopt` is disabled in the agent-safe fork; write project rules explicitly.
 ```
 
 `.fovea/rules.json` pins community or project rules in the repo:
@@ -386,11 +461,13 @@ pnpm run bench        # rate–distortion bench against ../pi-fabric
 ```
 
 pi loads the extension straight from `src/` through jiti, so nothing needs
-building. Per-repo JSONL caches live in `$TMPDIR`, guarded by per-file content
-sha1 values and stat manifests. Cache I/O streams. Only dirty files re-run
-ast-grep. Failed extractions keep fact-free hash markers that stay visible
-across launches. Those files skip the retry on each start. Bump `CACHE_VERSION`
-in `src/core/build.ts` whenever extractor semantics change.
+building. The SQLite snapshot is the private per-worktree primary cache; the
+compatibility `facts.jsonl` fallback lives beside it and is used only when
+SQLite is unavailable or fails. Cache rows are guarded by per-file content SHA-1
+values and stat manifests. Only dirty files re-run ast-grep. Failed extractions
+keep fact-free hash markers that stay visible across launches. Those files skip
+the retry on each start. Bump `CACHE_VERSION` in `src/core/build.ts` whenever
+extractor semantics change.
 
 ## Acknowledgments
 
