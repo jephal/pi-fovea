@@ -157,10 +157,12 @@ code browser. It defaults to explicit graph tools only:
   descendant; the standalone CLI retains its explicit-root behavior;
 - the CLI's `rules --adopt` repository-writing operation is disabled.
 
-The compatibility JSONL and co-change caches live under `$TMPDIR`; private
-per-worktree SQLite snapshots live outside the repository in
+Private per-worktree SQLite snapshots and the compatibility `facts.jsonl`
+fallback live outside the repository in
 `$FOVEA_CACHE_DIR/pi-fovea/worktrees` (or `$XDG_CACHE_HOME`, then `~/.cache`).
-Overflow artifacts use a `0700` private temp subdirectory and `0600` files.
+The separate co-change/provenance caches remain transient `0600` artifacts and
+are disabled with `FOVEA_NO_CACHE`. Overflow artifacts use a `0700` private
+subdirectory and `0600` files.
 The runtime has no HTTP client or telemetry path. It invokes
 only the fixed `git` executable and the explicitly configured `ast-grep`
 executable, both without a shell. Enable sync or hybrid grep only through an
@@ -168,9 +170,12 @@ explicit trusted configuration change.
 
 ## Large workspaces and startup
 
-Indexing runs in the background at `session_start`. Your first prompt never
-waits for ast-grep, hashing, or graph assembly. A cold sync hook reports the
-progress. Later calls reuse the same shared build.
+Normal startup does not index the repository. The first graph request creates
+the private per-worktree database and performs the initial full bootstrap; no
+per-worktree setup command is required. Later clean-worktree focus, dwell, and
+impact requests reuse the snapshot through bounded SQLite queries. Set
+`FOVEA_EAGER_INDEX=1` only when you explicitly want a background bootstrap at
+`session_start`; it is off by default for shared machines.
 
 A non-Git umbrella directory treats each nested `.git` directory or worktree
 marker as a closed project boundary — until you work in it. The first edit
@@ -185,9 +190,9 @@ index coverage only: with the default session-local sync scope, a sibling projec
 can join the umbrella graph and cache without steering conversations that never
 entered it. Every fovea_* tool still accepts a `root` for a full, immediate map
 of one project. `FOVEA_MAX_FILES` caps the merged listing either way.
-Cold runs stay bounded through streamed JSONL cache I/O, 64-file extraction
-batches, adaptive ast-grep chunk splitting, and a two-root resident LRU. The
-limits accept environment overrides:
+Cold runs stay bounded through transactional SQLite writes (with a private
+JSONL fallback), 64-file extraction batches, adaptive ast-grep chunk splitting,
+and a two-root resident LRU. The limits accept environment overrides:
 
 | Variable | Default | Meaning |
 | --- | :---: | --- |
@@ -214,9 +219,11 @@ On a cold root, Fovea creates a private `0700` per-worktree directory and
 records the physical root plus Git worktree metadata. Automatic cleanup runs
 best-effort and is throttled (six hours by default). It reclaims only an old,
 missing, or pruned-worktree entry, and only when it has no live process lease.
-Any malformed identity, unreadable entry, active lease, or `fovea.sqlite-wal` /
-`-shm` sidecar is **kept**, not guessed away. The size budget chooses the oldest
-otherwise eligible entries; it never forces deletion of a protected cache.
+Any malformed identity, unreadable entry, or active lease is **kept**, not
+guessed away. A recent `fovea.sqlite-wal` / `-shm` sidecar also protects an
+entry; stale sidecars may be reclaimed together with the cache. The size budget
+chooses the oldest otherwise eligible entries; it never forces deletion of a
+protected cache.
 
 Inspect without mutation with `fovea cache status` or `fovea cache dry-run`.
 `fovea cache purge <root>` and `/fovea cache purge` explicitly target only that
@@ -234,14 +241,13 @@ rail rather than permission to index secrets.
 ### Lazy SQLite queries
 
 When Node provides `node:sqlite` and the current indexed snapshot is available,
-cold or evicted `fovea_focus`, `fovea_dwell`, and file/symbol-seeded
-`fovea_impact` do not hydrate the repository graph. They use indexed
+after the one-time bootstrap, cold or evicted `fovea_focus`, `fovea_dwell`, and
+file/symbol-seeded `fovea_impact` do not hydrate the repository graph. They use indexed
 symbol/anchor/literal/file seeds and a capped weighted breadth-first read of
 incident relationships. The result keeps typed edge labels and deterministic
 ordering; its details identify `queryMode: "sqlite-index"`, bounded confidence,
-and any omitted long-path or co-change evidence. A locked, unavailable, or
-replaced snapshot falls back to the eager in-memory graph, preserving
-small-repository compatibility. A resident impact state deliberately keeps its
+and any omitted long-path or co-change evidence. A dirty, locked, unavailable, or replaced snapshot falls back to a fresh eager
+in-memory graph, preserving correctness and small-repository compatibility. A resident impact state deliberately keeps its
 existing full-history co-change ranking rather than discarding that evidence.
 
 `fovea_sketch` deliberately remains a whole-repository operation: its
@@ -455,12 +461,13 @@ pnpm run bench        # rate–distortion bench against ../pi-fabric
 ```
 
 pi loads the extension straight from `src/` through jiti, so nothing needs
-building. The SQLite snapshot is a private per-worktree cache; the compatibility
-per-repo JSONL cache lives in `$TMPDIR`, guarded by per-file content
-sha1 values and stat manifests. Cache I/O streams. Only dirty files re-run
-ast-grep. Failed extractions keep fact-free hash markers that stay visible
-across launches. Those files skip the retry on each start. Bump `CACHE_VERSION`
-in `src/core/build.ts` whenever extractor semantics change.
+building. The SQLite snapshot is the private per-worktree primary cache; the
+compatibility `facts.jsonl` fallback lives beside it and is used only when
+SQLite is unavailable or fails. Cache rows are guarded by per-file content SHA-1
+values and stat manifests. Only dirty files re-run ast-grep. Failed extractions
+keep fact-free hash markers that stay visible across launches. Those files skip
+the retry on each start. Bump `CACHE_VERSION` in `src/core/build.ts` whenever
+extractor semantics change.
 
 ## Acknowledgments
 

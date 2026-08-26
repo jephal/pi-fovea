@@ -12,17 +12,20 @@ the extension from `src/` via jiti, so a green check means the change is live.
 
 ## Cache invalidation
 
-Three durable cache layers exist: private per-worktree SQLite snapshots under
-`$FOVEA_CACHE_DIR/pi-fovea/worktrees` (or XDG/`~/.cache`), compatibility
-per-file JSONL facts (`$TMPDIR/pi-fovea-*.json`, keyed by content sha1 +
-`CACHE_VERSION` + rules hash), and co-change pairs
-(`$TMPDIR/pi-fovea-cochange-*.json`, keyed by HEAD + tracked-file set).
+The primary durable cache is a private per-worktree SQLite snapshot under
+`$FOVEA_CACHE_DIR/pi-fovea/worktrees` (or XDG/`~/.cache`). A private
+per-worktree `facts.jsonl` file is used only as a compatibility fallback when
+SQLite is unavailable or fails. The separate co-change and provenance caches
+remain transient `0600` artifacts, keyed by HEAD/tracked-file set or session
+owner as appropriate.
 
 SQLite lifecycle cleanup lives in `src/core/cache-lifecycle.ts`: it is
-throttled, protects active leases and WAL/SHM sidecars, and treats bad identity
-metadata as keep-not-delete. Preserve those properties when changing it. Test
-both dry-run and mutation paths. `FOVEA_NO_CACHE` disables every durable layer;
-`FOVEA_CACHE_DIR` is a cache *home*, never a repo-relative output path.
+throttled, protects active leases and recent WAL/SHM sidecars, and treats bad
+identity metadata as keep-not-delete. Preserve those properties when changing
+it. Test both dry-run and mutation paths. `FOVEA_NO_CACHE` disables every
+durable layer; `FOVEA_CACHE_DIR` is a cache *home*, never a repo-relative output
+path. First graph use creates the cache automatically; startup prewarming is
+opt-in via `FOVEA_EAGER_INDEX=1`.
 
 Facts (symbols/imports/calls/literals per file) are content-hash cached. If you
 change *extractor semantics* (what a parser emits for unchanged file content),

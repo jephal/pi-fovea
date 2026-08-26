@@ -16,6 +16,8 @@ This agent-safe fork maintains a cross-language code graph of the working reposi
 
 All four accept `maxTokens` (256–16000). Budget is roughly 4 chars per token.
 
+On first use in a worktree, Fovea bootstraps the private SQLite snapshot automatically. On later clean-worktree calls, focus, dwell, and impact use bounded SQLite neighborhoods; `fovea_sketch` remains eager. Relevant dirty files trigger a fresh fallback so the model never receives a stale graph. `queryMode: "sqlite-index"` identifies the lazy path.
+
 ## Working rules
 
 - **Do not bulk-read to discover structure.** Focus first, then read its suggested ranges. Native grep semantics remain available whenever grep receives path/glob/literal/context/limit options or an obvious regex; unresolved graph queries fall back to native text.
@@ -43,7 +45,7 @@ When writing or editing code **inside a `fabric_exec` program**, the fovea tools
 
 The same engine runs headlessly as the `fovea` binary (repo root scan, plus JSON and TSV modes). Prefer the in-session tools unless you need scripting or a second opinion outside the extension's session state. `fovea cache status` inspects private persistent-cache health, `fovea cache dry-run` lists conservative cleanup candidates without mutation, and `fovea cache purge <root>` explicitly targets one inactive root. `/fovea cache [dry-run|purge]` exposes the matching in-session diagnostics.
 
-`FOVEA_NO_CACHE=1` disables durable SQLite, JSONL, and co-change caches for ephemeral runs. `FOVEA_CACHE_DIR` selects an absolute cache home (Fovea appends its private namespace); do not point it inside the repository. Cleanup is throttled and skips a live lease, malformed identity, or SQLite WAL/SHM sidecar rather than deleting an ambiguous entry.
+`FOVEA_NO_CACHE=1` disables durable SQLite, JSONL, and co-change caches for ephemeral runs. `FOVEA_CACHE_DIR` selects an absolute cache home (Fovea appends its private namespace); do not point it inside the repository. The first graph request creates the private per-worktree SQLite cache automatically; set `FOVEA_EAGER_INDEX=1` only to prewarm at startup. Cleanup is throttled and skips a live lease, malformed identity, or recent SQLite WAL/SHM sidecar rather than deleting an ambiguous entry.
 
 ## Settings
 

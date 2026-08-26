@@ -352,6 +352,35 @@ describe("SQLite graph store", () => {
     }
   });
 
+  it("keeps SQLite lazy reads for unsupported artifacts but refreshes supported source changes", async () => {
+    if (!await sqliteOnly() || !hasAstGrep()) return;
+    const root = rootAt();
+    writeFileSync(join(root, "a.ts"), "export function answer() {}\n");
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    execFileSync("git", ["add", "a.ts"], { cwd: root });
+    execFileSync("git", ["-c", "user.name=Fovea Test", "-c", "user.email=fovea@example.invalid", "commit", "-qm", "initial"], { cwd: root });
+    setResidentPreference(root, false);
+    resetSessions();
+    try {
+      await focus(root, "answer", 512); // cold bootstrap and SQLite publish
+      writeFileSync(join(root, ".a.ts.swp"), "editor recovery artifact\n");
+
+      // Both the lazy-read dirty gate and snapshot freshness validation must
+      // ignore an unsupported untracked editor artifact.
+      const ignored = await focus(root, "answer", 512, { fresh: true });
+      expect(ignored.details.queryMode).toBe("sqlite-index");
+
+      writeFileSync(join(root, "a.ts"), "export function refreshed() {}\n");
+      const refreshed = await focus(root, "refreshed", 512, { fresh: true });
+      expect(refreshed.text).toContain("refreshed");
+      expect(refreshed.details.queryMode).toBe("resident-fallback");
+      expect(refreshed.details.freshness).toContain("dirty worktree");
+    } finally {
+      setResidentPreference(root, true);
+      evictState(root);
+    }
+  });
+
   it("falls back to a fresh graph for dirty added and deleted files", async () => {
     if (!await sqliteOnly() || !hasAstGrep()) return;
     const root = rootAt();

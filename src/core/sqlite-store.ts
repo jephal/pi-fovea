@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { rename, rm, stat, statfs } from "node:fs/promises";
 import type { AnchorDraft } from "./anchors.js";
 import type { CallSite, Graph, ImportSite, LiteralSite, NodeRec, SymbolRec } from "./types.js";
-import { gitProbe } from "./git.js";
+import { gitProbe, type GitProbe } from "./git.js";
 import { ensureWorktreeCache } from "./worktree-cache.js";
 import { redactSensitiveCacheValue, redactSensitiveValue } from "./privacy.js";
 
@@ -381,11 +381,37 @@ const manifestHash = (meta: ReadonlyMap<string, { size: number; mtime: number }>
       .join(""))
     .digest("hex");
 
+// Git porcelain includes every untracked editor artifact, while the graph
+// snapshot only represents files accepted by the supported-file/rule filter.
+// Keep unknown directories conservative: porcelain collapses their contents,
+// so they may contain supported files that have not been enumerated yet.
+const supportedDirtyWorktree = async (root: string, probe: GitProbe | undefined): Promise<boolean> => {
+  if (!probe || probe.relist) return !!probe?.relist;
+  if (!probe.changes.length) return false;
+  if (probe.changes.some((change) => change.path.endsWith("/"))) return true;
+  // Reuse the graph builder's complete code/config/route convention filter;
+  // this includes repository-defined file-route extensions rather than baking
+  // a separate extension list into SQLite freshness checks.
+  const [{ filterSupported }, { loadRepoRules }] = await Promise.all([
+    import("./build.js"), import("./anchors.js"),
+  ]);
+  const { fileRoutes } = await loadRepoRules(root);
+  const routeRes = fileRoutes.map((route) => new RegExp(route.re));
+  if (filterSupported(probe.changes.map((change) => change.path), routeRes).length) return true;
+  // Gitlinks and embedded repositories are reported as a directory path
+  // without a trailing slash. Their inner changes cannot be classified here.
+  const directories = await Promise.all(probe.changes.map(async (change) =>
+    (await stat(`${root}/${change.path}`).catch(() => undefined))?.isDirectory() ?? false,
+  ));
+  return directories.some(Boolean);
+};
+
 const currentFreshness = async (root: string, enrolled: string[]): Promise<{ head: string; manifest: string } | undefined> => {
   const probe = await gitProbe(root);
-  // A dirty Git worktree has additions/deletions/content outside this stored
-  // snapshot. Do not guess which subset a bounded lazy read may safely use.
-  if (probe && (probe.changes.length || probe.relist)) return undefined;
+  // Only dirty paths the graph could index (or an unclassifiable collapsed
+  // directory) invalidate a bounded snapshot; unrelated editor artifacts do
+  // not alter the manifest and remain eligible for a lazy read.
+  if (await supportedDirtyWorktree(root, probe)) return undefined;
   // Keep the walker authoritative for both plain roots and configured source
   // types. Dynamic imports avoid a build <-> SQLite initialization cycle.
   const [{ listFiles }, { loadRepoRules }] = await Promise.all([
@@ -514,14 +540,12 @@ export const saveSqliteSnapshot = async (store: SqliteFactStore, graph: Graph, s
 export const sqliteAvailability = async (): Promise<boolean> => !!await dynamicSqlite();
 
 /**
- * A dirty Git worktree is deliberately never read through a durable bounded
- * snapshot. Callers must refresh the full graph instead; this keeps additions
- * and deletions correct even when a snapshot was written moments earlier.
+ * Dirty supported files and unclassifiable collapsed directories are never
+ * read through a durable bounded snapshot. Unsupported editor artifacts do
+ * not participate in the graph manifest, so they leave lazy reads available.
  */
-export const sqliteLazyReadBlockedByDirtyWorktree = async (root: string): Promise<boolean> => {
-  const probe = await gitProbe(root);
-  return !!probe && (probe.changes.length > 0 || probe.relist);
-};
+export const sqliteLazyReadBlockedByDirtyWorktree = async (root: string): Promise<boolean> =>
+  supportedDirtyWorktree(root, await gitProbe(root));
 
 // Lazy graph reads deliberately bypass loadSqliteSnapshot(): that warm-start
 // API reconstructs every fact row, while focus needs only its seeds and a
